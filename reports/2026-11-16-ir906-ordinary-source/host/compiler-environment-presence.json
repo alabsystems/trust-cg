@@ -1,0 +1,32 @@
+{
+  "RUSTC": {
+    "present": false
+  },
+  "CARGO_BUILD_RUSTC": {
+    "present": false
+  },
+  "RUSTFLAGS": {
+    "present": false
+  },
+  "CARGO_ENCODED_RUSTFLAGS": {
+    "present": false
+  },
+  "CARGO_BUILD_TARGET": {
+    "present": false
+  },
+  "CARGO_TARGET_DIR": {
+    "present": false
+  },
+  "CARGO_HOME": {
+    "present": false
+  },
+  "RUSTC_WRAPPER": {
+    "present": false
+  },
+  "RUSTC_WORKSPACE_WRAPPER": {
+    "present": false
+  },
+  "CARGO_BUILD_JOBS": {
+    "present": false
+  }
+}

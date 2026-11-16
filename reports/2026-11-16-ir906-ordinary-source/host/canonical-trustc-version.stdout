@@ -1,0 +1,8 @@
+rustc 1.101.0-dev (5062eed55 2026-11-15) (trustc 0.14.0+g5062eed55)
+binary: trustc
+commit-hash: 5062eed55c0bc9df8a79eba1368d88ffde76c741
+commit-date: 2026-11-15
+host: aarch64-apple-darwin
+release: 1.101.0-dev
+trust: 0.14.0+g5062eed55
+LLVM version: 23.1.5

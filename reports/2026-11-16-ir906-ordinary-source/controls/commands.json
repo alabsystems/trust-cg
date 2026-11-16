@@ -1,0 +1,13 @@
+[
+  {
+    "argv": [
+      "python3",
+      "scripts/check_documentation.py",
+      "--check"
+    ],
+    "exit_status": 0,
+    "wall_seconds": 0.095814083,
+    "stdout": "documentation.stdout.txt",
+    "stderr": "documentation.stderr.txt"
+  }
+]
