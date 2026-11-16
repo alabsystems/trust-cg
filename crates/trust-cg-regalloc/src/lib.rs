@@ -284,6 +284,13 @@ pub struct AllocConfig {
     /// normalization + kill-at-def / pass-through merges). The empty default
     /// reproduces the historical behavior; the AArch64 constructors opt in.
     pub coalesce_tuning: coalesce::CoalesceTuning,
+    /// Greedy only: when picking a free register for an interval that has no
+    /// usable hint, first skip every register that is the FIRST hint of
+    /// another, still unassigned interval overlapping this one (see
+    /// [`GreedyAllocator::set_avoid_claimed_hint_regs`]). `false` reproduces
+    /// the historical first-free order; the x86-64 pipeline turns it on with
+    /// its ABI copy hints.
+    pub avoid_claimed_hint_regs: bool,
 }
 
 impl AllocConfig {
@@ -302,6 +309,7 @@ impl AllocConfig {
             hints: BTreeMap::new(),
             callee_saved_regs: aarch64_callee_saved_regs(),
             coalesce_tuning: coalesce::CoalesceTuning::aarch64(),
+            avoid_claimed_hint_regs: false,
         }
     }
 
@@ -319,6 +327,7 @@ impl AllocConfig {
             hints: BTreeMap::new(),
             callee_saved_regs: aarch64_callee_saved_regs(),
             coalesce_tuning: coalesce::CoalesceTuning::aarch64(),
+            avoid_claimed_hint_regs: false,
         }
     }
 
@@ -353,6 +362,7 @@ impl AllocConfig {
             hints: BTreeMap::new(),
             callee_saved_regs: BTreeSet::new(),
             coalesce_tuning: coalesce::CoalesceTuning::default(),
+            avoid_claimed_hint_regs: false,
         }
     }
 }
@@ -1147,6 +1157,7 @@ fn allocate_core(
                 );
                 allocator.set_hint_exempt(hint_exempt);
                 allocator.set_call_operand_exempt(dying_call_operands.clone());
+                allocator.set_avoid_claimed_hint_regs(config.avoid_claimed_hint_regs);
                 let result = if config.enable_splitting {
                     allocator.allocate_with_splitting(func)?
                 } else {
@@ -3350,6 +3361,7 @@ mod tests {
             hints: BTreeMap::new(),
             callee_saved_regs: Default::default(),
             coalesce_tuning: Default::default(),
+            avoid_claimed_hint_regs: false,
         }
     }
 
@@ -3368,6 +3380,7 @@ mod tests {
             hints: BTreeMap::new(),
             callee_saved_regs: Default::default(),
             coalesce_tuning: Default::default(),
+            avoid_claimed_hint_regs: false,
         }
     }
 
@@ -3386,6 +3399,7 @@ mod tests {
             hints: BTreeMap::new(),
             callee_saved_regs: Default::default(),
             coalesce_tuning: Default::default(),
+            avoid_claimed_hint_regs: false,
         }
     }
 
@@ -3944,6 +3958,7 @@ mod tests {
             hints: BTreeMap::new(),
             callee_saved_regs: Default::default(),
             coalesce_tuning: Default::default(),
+            avoid_claimed_hint_regs: false,
         };
         let result = allocate(&mut func, &config).expect("allocation failed");
         assert!(result.spills.is_empty());
@@ -4184,6 +4199,7 @@ mod tests {
             hints: BTreeMap::new(),
             callee_saved_regs: Default::default(),
             coalesce_tuning: Default::default(),
+            avoid_claimed_hint_regs: false,
         };
 
         let result = allocate(&mut func, &config).expect("allocation failed");
@@ -5248,6 +5264,7 @@ mod tests {
                 hints: BTreeMap::new(),
                 callee_saved_regs: Default::default(),
                 coalesce_tuning: Default::default(),
+                avoid_claimed_hint_regs: false,
             }
         }
 

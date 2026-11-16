@@ -1,6 +1,8 @@
 """Fail-closed qualification and publication controls; no native tools/network."""
 import copy
+from contextlib import redirect_stderr
 import importlib.util
+import io
 import json
 from pathlib import Path
 import subprocess
@@ -17,9 +19,11 @@ q = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(q)
 SOURCE, ROOT, AY, CLEAN = (c * 40 for c in "abcd")
 RECEIPT = "reports/2026-11-07-cohort-input/README.md"
+IR_CURRENT, IR_TARGET = q.pin.IR_VERSION_MIGRATION
+CLEAN_CURRENT, CLEAN_TARGET = q.pin.CLEAN_VERSION_MIGRATION
 
 
-def report():
+def report(ir_version=IR_TARGET):
     cells = []
     for shape in ("V16I8", "V8I16", "V4I32", "V2I64"):
         for op in ("Ne", "Sge", "Slt", "Sle", "Ugt", "Uge", "Ult", "Ule"):
@@ -29,7 +33,7 @@ def report():
                                              "unproved_steps": "0", "unsat_admission": "strict-proof"}})
     return {"schema": "trust-cg.x86-icmp-certificates.v2", "exit": 0,
             "findings": [], "missing": [], "queries": {"source": "regenerated"},
-            "trust_ir_rev": ROOT, "trust_ir_build": f"0.14.0+g{ROOT[:12]}.local", "ay_rev": AY,
+            "trust_ir_rev": ROOT, "trust_ir_build": f"{ir_version}+g{ROOT[:12]}.local", "ay_rev": AY,
             "certificate_cells": 32, "instruction_model_cells": 8, "fail_closed_cells": 0,
             "cells": cells, "rule": {"ay": {"rev": AY}, "clean": {"rev": CLEAN}},
             "ay": {"rev": AY, "sha256": "e" * 64, "certifying_bytes": True},
@@ -39,7 +43,7 @@ def report():
 class ReportTests(unittest.TestCase):
     def test_complete_source_bound_report_accepts_observed_clean_build(self):
         # Historical byte-list membership is informative, not a source substitution.
-        q.validate_report(report(), ROOT, AY)
+        q.validate_report(report(), ROOT, AY, IR_TARGET)
 
     def test_incomplete_or_unbound_reports_refuse(self):
         mutations = [
@@ -49,7 +53,8 @@ class ReportTests(unittest.TestCase):
             lambda r: r.update(missing=[{"code": "tool"}]),
             lambda r: r.update(queries={"source": "supplied"}),
             lambda r: r.update(trust_ir_rev=SOURCE),
-            lambda r: r.update(trust_ir_build="0.14.0+gwrong.local"),
+            lambda r: r.update(trust_ir_build=f"{IR_TARGET}+gwrong.local"),
+            lambda r: r.update(trust_ir_build=f"{IR_CURRENT}+g{ROOT[:12]}.local"),
             lambda r: r.update(ay_rev=SOURCE),
             lambda r: r.update(schema="future"),
             lambda r: r.update(certificate_cells=True),
@@ -72,7 +77,7 @@ class ReportTests(unittest.TestCase):
                 value = report()
                 mutate(value)
                 with self.assertRaises(q.Refusal):
-                    q.validate_report(value, ROOT, AY)
+                    q.validate_report(value, ROOT, AY, IR_TARGET)
 
     def test_main_attest_and_unsafe_refs_refuse(self):
         for ref in ("refs/heads/main", "refs/attest/x", "refs/tags/x", "refs/heads/feat/a/../main",
@@ -80,6 +85,40 @@ class ReportTests(unittest.TestCase):
             with self.subTest(ref=ref), self.assertRaises(q.Refusal):
                 q.validate_ref(ref)
         self.assertEqual(q.validate_ref("refs/heads/feat/cohort"), "refs/heads/feat/cohort")
+
+    def test_receipt_names_selected_versions_and_all_eight_guards(self):
+        args = SimpleNamespace(source_head=SOURCE, root_revision=ROOT, ay_revision=AY,
+                               selected_ir_version=IR_TARGET,
+                               selected_clean_version=CLEAN_TARGET)
+        text = q.receipt_text(args, True, "certificates", [], report())
+        self.assertIn(f"TrustIR: `{ROOT}` (`{IR_TARGET}`)", text)
+        self.assertIn(f"Clean packages: `{CLEAN_TARGET}`", text)
+        self.assertIn("All eight maintained pin guards passed", text)
+
+
+class VersionSelectionTests(unittest.TestCase):
+    @staticmethod
+    def arguments():
+        return [ROOT, "--ay-revision", AY, "--source-head", SOURCE,
+                "--publication-ref", "refs/heads/qualification/cohort",
+                "--targo", "/selected/targo", "--ay-source", "/source/ay",
+                "--clean-source", "/source/clean", "--evidence-dir", "/evidence"]
+
+    def test_reviewed_versions_reach_the_canonical_pin_owner(self):
+        args = q.parse_args([*self.arguments(), "--ir-version", IR_TARGET,
+                             "--clean-version", CLEAN_TARGET])
+        self.assertEqual(q.pin_owner_command(args), [
+            sys.executable, "scripts/bump_trust_ir_pin.py", ROOT,
+            "--ay-revision", AY, "--targo", "/selected/targo",
+            "--ir-version", IR_TARGET, "--clean-version", CLEAN_TARGET])
+
+    def test_unsupported_versions_refuse_at_the_cli_boundary(self):
+        for option, version in (("--ir-version", "0.16.0"),
+                                ("--clean-version", "0.9.3")):
+            with self.subTest(option=option), redirect_stderr(io.StringIO()), \
+                    self.assertRaises(SystemExit) as refused:
+                q.parse_args([*self.arguments(), option, version])
+            self.assertEqual(refused.exception.code, 2)
 
 
 class PublicationTests(unittest.TestCase):

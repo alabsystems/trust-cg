@@ -5949,7 +5949,8 @@ fn compiler_abi_value_for_trust_ir_type(
         | trust_ir::Ty::Set(_, _)
         | trust_ir::Ty::Sequence(_)
         | trust_ir::Ty::Record(_)
-        | trust_ir::Ty::Closure(_) => {
+        | trust_ir::Ty::Closure(_)
+        | trust_ir::Ty::FnItem(_) => {
             return Err(format!(
                 "unsupported exported ABI value {ty:?} for target {}; aggregates, vectors, f16/i128, fat pointers, and non-scalar shapes require an explicit target ABI classifier",
                 target_spec.triple()

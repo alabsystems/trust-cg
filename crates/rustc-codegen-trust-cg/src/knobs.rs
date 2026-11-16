@@ -41,9 +41,13 @@
 //!    solver on, unwind modelling on, no traces. So a backend that never
 //!    reaches `install` — a non-rustc embedding, or a compiler too old to carry
 //!    the option — runs the fully checked lane and claims nothing extra.
-//! 3. **The knobs never widen what is admitted.** They select traces, opt-outs
-//!    and resource budgets. None of them admits a MIR shape the default lane
-//!    would refuse.
+//! 3. **The knobs never widen what is admitted, with one named exception.**
+//!    They select traces, opt-outs and resource budgets, and none of those
+//!    admits a MIR shape the default lane would refuse. The exception is
+//!    `box-deref-named-premise`, which is an opt-IN: it lets the lane compile
+//!    a Box deref the compiler's own fail-closed check admitted, under a
+//!    disclosed named assumption (`box_deref_disclosure`). Absent, the lane
+//!    refuses every Box deref, so the default of rule 2 is unchanged.
 //! 4. **A value is READ, never merely counted as present.** Each knob declares
 //!    a [`Shape`], the grammar is checked once at parse where a bad value is
 //!    `fatal`, and the stored value is canonical. This is the fix for a
@@ -177,6 +181,8 @@ declare_knobs! {
         "do not pre-hash the solver binary identity on a detached thread (A/B only; verdicts are identical)";
     NO_REPLAY_PREFETCH = "no-replay-prefetch", "TCG_NO_REPLAY_PREFETCH", Shape::Boolean,
         "neither read nor write this compile's certificate replay hint, so no stored certificate is replayed (and no resident solver started) before lowering asks for it (A/B only; every replay is the same full check either way and verdicts are identical)";
+    BOX_DEREF_NAMED_PREMISE = "box-deref-named-premise", "TCG_BOX_DEREF_NAMED_PREMISE", Shape::Boolean,
+        "ADMITS MORE, unlike every other knob: compile `Inst::BoxDeref` under trust-ir's named-premise floor (roots param_by_value and alloc_postcondition) instead of refusing it, and print what was assumed as `[TCG-BOX-DEREF-FACT]` / `[TCG-BOX-DEREF-ASSUMED]` lines on stderr. The instruction is only ever emitted for a cast the compiler's own fail-closed Box fact check admitted, which needs a compiler that exports those facts and a session whose verifier ran; the object then rests on a NAMED ASSUMPTION, not on a proof. A proof-emitting compile refuses the instruction regardless, so this needs `no-proof-certs`. DEFAULT OFF: every Box deref is refused with [TCG-BOX-DEREF]";
     DISABLE_UNWIND = "disable-unwind", "TCG_DISABLE_UNWIND", Shape::Boolean,
         "refuse crates that need unwind tables instead of modelling the cleanup edges";
     NO_VC_DIAMOND = "no-vc-diamond", "TCG_NO_VC_DIAMOND", Shape::Boolean,
@@ -253,8 +259,28 @@ declare_knobs! {
         "disable x86 scalar replacement of non-escaped stack slots (DEFAULT ON at O2/O3). Env-only until 2026-11-03";
     X86_ROWREG_PACKED_MUL = "x86-rowreg-packed-mul", "TCG_X86_ROWREG_PACKED_MUL", Shape::Boolean,
         "use the packed PMULUDQ lo64 compose for the row-register tier's products instead of scalar IMUL + GPR<->XMM round trips. LLVM's p4_matmul is 36 PMULUDQ / 2 IMUL in 272 instructions where this backend's default is 36 IMUL / 12 PMULUDQ in 468, so the packed route is what LLVM does on this program";
+    X86_RA_ABI_COPY_HINTS = "x86-ra-abi-copy-hints", "TCG_X86_RA_ABI_COPY_HINTS", Shape::Boolean,
+        "accepted for compatibility; the x86-64 ABI copy hints (`mov v, %rdi` at entry and `mov %rax, v` before a return stated to the allocator as copies with an explicit physical operand) are the DEFAULT together with `no-proof-certs` since 2026-11-15 (they were opt-in after a p7_sieve O2 regression, since traced to the array-fill helper's loop position and removed by relocating contained loops). Withheld with proof certificates on. `no-x86-ra-abi-copy-hints` turns them off";
+    NO_X86_RA_ABI_COPY_HINTS = "no-x86-ra-abi-copy-hints", "TCG_NO_X86_RA_ABI_COPY_HINTS", Shape::Boolean,
+        "keep the x86-64 ABI register copies opaque to the register allocator (they are stated as copies by default together with `no-proof-certs`)";
+    NO_X86_RA_CALLER_SAVED_FIRST = "no-x86-ra-caller-saved-first", "TCG_NO_X86_RA_CALLER_SAVED_FIRST", Shape::Boolean,
+        "restore the historical x86-64 GPR allocation order (RBX fourth) instead of trying every caller-saved register before any callee-saved one. DEFAULT ON only together with `no-proof-certs` (since 2026-11-15); withheld with proof certificates on. The pool's membership is unchanged";
+    TRACE_X86_RA = "trace-x86-ra", "TCG_TRACE_X86_RA", Shape::Boolean,
+        "for every function the x86-64 full allocator allocates, print its allocator-input instructions, each live interval after coalescing with its spill weight, extent, use and definition counts and its register or SPILL, each block's position span, loop depth and call count, and the conditional-call split's counts (diagnostics; no codegen effect)";
+    NO_X86_RA_COLD_CALL_WEIGHT = "no-x86-ra-cold-call-weight", "TCG_NO_X86_RA_COLD_CALL_WEIGHT", Shape::Boolean,
+        "count the blocks of a loop's cold call region one loop level deeper again in the x86-64 spill weights. DEFAULT ON only together with `no-proof-certs` (since 2026-11-15); withheld with proof certificates on. A cold call region is the region of one arm of an in-loop two-way branch that holds a call while the other arm's region holds none (`Vec::push`'s grow path); weighting it one level shallower stops a value used only there from outbidding a value the loop uses every iteration for a callee-saved register. It changes no instruction, only which value gets a register";
+    NO_X86_RA_CALL_SPLIT = "no-x86-ra-call-split", "TCG_NO_X86_RA_CALL_SPLIT", Shape::Boolean,
+        "do not split the GPR values live across a CONDITIONAL in-loop call (a call some iteration of its innermost loop skips) around that call. DEFAULT ON only together with `no-proof-certs` (since 2026-11-15); withheld with proof certificates on. The split copies each such value into a temporary right before the call and back right after its result reads, so the value crosses no call on the paths that skip it and the save and restore are paid on the call's path only";
     NO_X86_ROWREG_MEMORY_RMW = "no-x86-rowreg-memory-rmw", "TCG_NO_X86_ROWREG_MEMORY_RMW", Shape::Boolean,
         "disable the row-register tier's IN-MEMORY route and restore the XMM-accumulator route. The in-memory route is the default ONLY together with `no-proof-certs` (since 2026-11-14); with proof certificates on the XMM route is kept whatever this knob says, because the in-memory route has not been run under proof gating. The in-memory route updates the c row element by element (`mov`, `imul`, `add [mem], reg`) in the source loop's own order; on p4_matmul it measured 33.7 ms against 63.2 ms for the XMM scalar-IMUL route on an AMD Ryzen host (LLVM: 66.3 ms at O2, 32.4 ms at O3). `x86-rowreg-packed-mul` names an XMM route and therefore also selects one";
+    X86_ROWREG_GPR_ACCUMULATORS = "x86-rowreg-gpr-accumulators", "TCG_X86_ROWREG_GPR_ACCUMULATORS", Shape::Uint,
+        "how many c-row elements the row-register tier's IN-MEMORY route keeps in GPR accumulators across the k loop (loaded once before it, stored once after it); the rest are updated in memory. DEFAULT 4 (since 2026-11-15; 3 to 5 measured best on p4_matmul, 8 and more spill); 0 restores the all-in-memory body. The in-memory route is used only together with `no-proof-certs`, so this is too. LLVM -O3 holds part of p4_matmul's row the same way";
+    NO_X86_SELECT_FLAG_FUSION = "no-x86-select-flag-fusion", "TCG_NO_X86_SELECT_FLAG_FUSION", Shape::Boolean,
+        "keep a select's materialized boolean (`setcc; movzx; movzx; and 1; test; cmovne`) instead of letting the conditional move read the comparison's flags directly (`cmp; cmovcc`). DEFAULT ON only together with `no-proof-certs` (since 2026-11-15); withheld with proof certificates on. Measured cause: h4_vec_dropper's Vec::push grow path, two such selects on the path to the allocator call (1.098 to 1.039 of LLVM by a hand edit of the linked binary with both loops pinned, layout control 1.095)";
+    NO_X86_SUMQ_REGISTER_SEED = "no-x86-sumq-register-seed", "TCG_NO_X86_SUMQ_REGISTER_SEED", Shape::Boolean,
+        "seed the heap i64 sum tier's two XMM accumulators through stored lanes of a stack slot again (two 8-byte stores, two 16-byte loads that the store buffer cannot forward) instead of `movq` from the zero register. DEFAULT ON only together with `no-proof-certs` (since 2026-11-15); withheld with proof certificates on. Measured on h4_vec_dropper: 1.100 to 1.083 of LLVM by a hand edit of the linked binary";
+    NO_X86_LOOP_ALIGN_RELOCATE_CONTAINED = "no-x86-loop-align-relocate-contained", "TCG_NO_X86_LOOP_ALIGN_RELOCATE_CONTAINED", Shape::Boolean,
+        "keep the x86 loop-head aligner's G6 rule (never move a loop whose body already lies inside one 64-byte line). DEFAULT: contained loops are aligned too, only together with `no-proof-certs` (since 2026-11-15); withheld with proof certificates on. Measured: p7_sieve's array-fill loop is ~1.5 % of the program slower inside a line than at its start, and the ABI copy hints moved it there";
     NO_X86_XORSHIFT_DEMANDED_BITS = "no-x86-xorshift-demanded-bits", "TCG_NO_X86_XORSHIFT_DEMANDED_BITS", Shape::Boolean,
         "DISABLE the xorshift demanded-bits rewrite (DEFAULT ON since 2026-10-01: b1_mispredict 1.0959 -> 1.0260, ~60x its noise floor, all 18 programs MATCH, library/core at O3 unchanged). The rewrite lets a consumer that reads only bits [0,k) of `x ^ (x << k)` read `x` instead: shifting left by k cannot change bits below k, so the two agree there and the dependency chain feeding that consumer loses one shift-and-xor. The capability EXISTS in this repo as the AArch64 `xorshift_demanded_bits` (default-ON, credited -9ms of b1's 29ms gap there and independently reproduced at -11ms) and had NO x86 twin -- `x86_loop_top.rs` carried a comment naming it as missing. A direct port fires on nothing: AArch64's producer is one shift-fused `EorRRLsl` with both sources equal, while x86's is the PAIR `ShlRI`+`XorRR` whose operands do NOT match syntactically (b1's measured stream shifts v25 and xors v24, with `MovRR` copies between), and x86 ISel vregs are not SSA so single-def-ness must be checked where SSA gave the AArch64 twin it for free. This is a LATENCY lever, not an instruction-count one: it resolves b1's 50%-mispredicting branch one ALU op earlier";
     TRACE_X86_XORSHIFT_DEMANDED_BITS = "trace-x86-xorshift-demanded-bits", "TCG_X86_XORSHIFT_DB_TRACE", Shape::Boolean,

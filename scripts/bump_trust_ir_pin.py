@@ -4,6 +4,8 @@
 Usage: python3 scripts/bump_trust_ir_pin.py <40-hex-TrustIR-revision> \
            --targo /absolute/path/to/targo [--ay-revision <40-hex-AY-revision>] \
            [--ay-version 0.28.0] \
+           [--ir-version 0.15.0] \
+           [--clean-version 0.9.2] \
            [--admit-ir-package <trust-ir-NAME> ...] [--admit-ay-package <ay-NAME> ...] \
            [--admit-dropped-package <NAME> ...] \
            [--admit-registry-package <nix@0.29.0|cfg_aliases@0.2.1|cfg_aliases@0.2.2|wait-timeout@0.2.1> ...]
@@ -45,7 +47,15 @@ own run, and the vendored fixture tree through the end of the transaction.
 Only source moves within the existing package cohort are supported. Adding or
 removing packages, changing third-party resolution, or changing package
 versions requires a separately reviewed migration, not an automatic resolver
-expansion. The reviewed `--ay-version 0.28.0` migration requires an explicit
+expansion. The reviewed `--ir-version 0.15.0` migration admits only the
+0.14.0 to 0.15.0 TrustIR version move, authenticated at the requested immutable
+target, with the same package roster and source-qualified external graph.
+It retains all eight mandatory Rust guards and the original rollback contract.
+The reviewed `--clean-version 0.9.2` migration admits only the 0.9.1 to 0.9.2
+Clean version move co-owned by that immutable TrustIR target. It rewrites only
+the direct Clean requirements and source-qualified Clean cohort identities;
+the package roster, third-party graph, eight guards and rollback stay exact.
+The reviewed `--ay-version 0.28.0` migration requires an explicit
 AY revision, immutable TrustIR/Clean co-ownership at the selected version,
 the same package roster and complete source-qualified non-AY graph checks.
 AY0.28's actual required ay-sys macOS policy dependency retains its independent
@@ -92,6 +102,19 @@ tree and blob is hash-checked back to that identity; no index, build artifact
 or cached verdict is read. Missing/refused Agh operations have no direct Git,
 anonymous or offline fallback and cannot install a pin. All Rust guards remain
 mandatory for either source transport.
+
+Before publishing a mutually dependent certificate rule, an explicit
+--stage-qualification-ir-source /absolute/repo with --qualification-receipt
+/absolute/receipt.json stages the SAME manifest/lock transaction against an
+immutable local IR commit. This is untrusted candidate source DATA, not remote
+authority: Clean and AY still require normal authenticated source, the complete
+selected IR tree and commit ancestry must exist, and every consumed object is
+hash-checked. Its resolver commands are offline: provision missing candidate
+objects through the maintained explicit local source-DATA transport first.
+This mode exits 3 after locked graph checks, without the eight
+Rust guards, adoption or publication. Its receipt retains original bytes for
+restoration. Restore those bytes and run the ordinary transaction after the IR
+commit is published; this mode never turns a local object into published input.
 """
 
 from __future__ import annotations
@@ -111,6 +134,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 import ay_exec_policy_owner as exec_policy
 import ay_registry_source_owner as registry_owner
 # Prefer the standard parser. Maintenance must not require installing another
@@ -180,6 +204,8 @@ VENDORED_FIXTURES = "tests/fixtures/trust_ir_binary_container"
 CACHE_NAME = "COMPILE_ARTIFACT_DEFAULT_TRUST_IR_IDENTITY"
 AY_CACHE_NAME = "COMPILE_ARTIFACT_DEFAULT_AY_IDENTITY"
 AY_VERSION_MIGRATION = ("0.27.0", "0.28.0")
+CLEAN_VERSION_MIGRATION = ("0.9.1", "0.9.2")
+IR_VERSION_MIGRATION = ("0.14.0", "0.15.0")
 SHA = re.compile(r"[0-9a-f]{40}\Z")
 
 
@@ -359,6 +385,15 @@ def resource_fds(env: dict[str, str]) -> tuple[int, ...]:
                  "TRUST_CPU_IMPLICIT_FD"):
         if name in env:
             add(env[name], name)
+    fixed_name = "TRUST_FIXED_ADMISSION_FD_V1"
+    if fixed_name in env:
+        if env[fixed_name] == "requires-live-ancestor-v1":
+            # The native nested owner deliberately advertises no direct FD.
+            # Preserve its opaque locator; Targo authenticates the ancestor.
+            require(bool(env.get("TRUST_FIXED_CLAIM_HANDOFF_V1")),
+                    "inherited resources: fixed marker needs its original ancestor advertisement")
+        else:
+            add(env[fixed_name], fixed_name)
     for name in ("ATERM_WORKLOAD_CPU_FDS_V1", "BUILD_SLOT_FENCE_FDS"):
         if name in env:
             words = env[name].split(",")
@@ -390,10 +425,14 @@ def resource_fds(env: dict[str, str]) -> tuple[int, ...]:
 class Commands:
     """Explicit subprocess lanes, with interrupted children stopped before rollback."""
 
-    def __init__(self, root: Path, targo: Path, source_caches: dict[str, Path] | None = None):
+    def __init__(self, root: Path, targo: Path, source_caches: dict[str, Path] | None = None,
+                 *, guard_admission: str = "native-worker"):
         self.root = root
         self.targo = targo
         self.source_caches = source_caches or {}
+        require(guard_admission in {"ordinary", "native-worker", "original-fixed-v1"},
+                "unknown guard admission interface")
+        self.guard_admission = guard_admission
         self.git = shutil.which("git")
         self.agh = shutil.which("agh")
         require(self.git is not None, "Git is required; no authority was changed")
@@ -401,9 +440,12 @@ class Commands:
     def run(self, argv: list[str], *, cwd: Path, capture: bool = False,
             git: bool = False, allowed: tuple[int, ...] = (0,),
             discard_stdout: bool = False, binary: bool = False, raw: bool = False,
-            capture_status: bool = False) -> str | bytes | tuple[int, str | bytes, str | bytes]:
+            capture_status: bool = False,
+            env: dict[str, str] | None = None) -> str | bytes | tuple[int, str | bytes, str | bytes]:
         binary = binary or raw
         environment = dict(os.environ)
+        if env is not None:
+            environment.update(env)
         if git:
             # Ambient Git routing must not substitute a sibling object database,
             # index, replacement object or injected configuration for the target.
@@ -491,9 +533,16 @@ class Commands:
 
     def _test_guard_transport(self, args: list[str]) -> str:
         """Select a serial interface, never reinterpret a modern admission refusal."""
+        if self.guard_admission == "ordinary":
+            # Deliberately selected before discovery, never after a native
+            # refusal. Normal Targo execution retains its own admission.
+            return "ordinary"
         configured = [*args[:2], "--config", "build.test-jobs=1", *args[2:]]
+        fixed = self.guard_admission == "original-fixed-v1"
+        probe = ([str(self.targo), "--resource-capabilities", "--fixed-admission-v1"]
+                 if fixed else [str(self.targo), "--resource-capabilities", "--", *configured])
         response = self.run(
-            [str(self.targo), "--resource-capabilities", "--", *configured],
+            probe,
             cwd=self.root, capture=True, allowed=(0, 1, 2),
             capture_status=True,
         )
@@ -503,6 +552,8 @@ class Commands:
         require(type(code) is int and isinstance(text, str) and isinstance(diagnostics, str)
                 and len(text) + len(diagnostics) <= 65536,
                 "Targo capability response is malformed")
+        if fixed:
+            require(code == 0, "original fixed discovery refused; no other interface retry")
         if code != 0:
             # The held older Trust frontend has no native test-graph protocol.
             # Only its exact unknown-option response selects the legacy interface;
@@ -522,6 +573,14 @@ class Commands:
             capability = json.loads(text)
         except (ValueError, TypeError) as error:
             raise Refusal(f"Targo capability JSON refused: {error}") from error
+        if fixed:
+            require(isinstance(capability, dict)
+                    and type(capability.get("version")) is int
+                    and capability == {"version": 1, "fixed_admission": "original-fixed-v1"},
+                    "Targo does not advertise the selected original fixed interface")
+            # Discovery is not admission or SDK readiness. Actual execution
+            # retains/authenticates the original fixed owner and its GNU bridge.
+            return "original-fixed"
         # Invocation-discovery v2 and configured-cohort v3 both advertise
         # Targo-owned test budgets. Select that CLI; actual execution still
         # authenticates CPU/fd/cohort custody and may refuse. A v2 reply is
@@ -538,10 +597,15 @@ class Commands:
                 "Rust guards require the unverified test lane without manual libtest arguments")
         try:
             transport = self._test_guard_transport(args)
-            require(transport in {"native", "legacy"}, "unknown Targo test transport")
+            require(transport in {"ordinary", "native", "legacy", "original-fixed"}, "unknown Targo test transport")
             configured = ([*args[:2], "--config", "build.test-jobs=1", *args[2:]]
-                          if transport == "native" else [*args, "--", "--test-threads=1"])
-            output = self.run([str(self.targo), *configured], cwd=self.root, capture=True)
+                          if transport in {"ordinary", "native", "original-fixed"}
+                          else [*args, "--", "--test-threads=1"])
+            # Match TY's explicit ordinary contract: the same configured
+            # command, with libtest bounded directly and parent CPU/fd policy
+            # inherited unchanged. This grants no worker or SDK readiness.
+            execution = {"env": {"RUST_TEST_THREADS": "1"}} if transport == "ordinary" else {}
+            output = self.run([str(self.targo), *configured], cwd=self.root, capture=True, **execution)
         except UnicodeError as error:
             raise Refusal(f"Rust guard transcript could not be decoded: {error}") from error
         try:
@@ -704,6 +768,43 @@ class Authority:
         return value
 
 
+class QualificationIrSource(Authority):
+    """Immutable local IR DATA only; deliberately no remote-authority operation."""
+
+    def __init__(self, commands: Commands, directory: Path, source_repo: Path, revision: str):
+        require(source_repo.is_absolute() and source_repo.is_dir(),
+                "qualification IR source needs an existing absolute repository")
+        self.commands = commands
+        self.directory = directory
+        self.revision = exact_sha(revision)
+        self.repository = IR_URL.removeprefix("https://github.com/").removesuffix(".git")
+        directory.mkdir()
+        commands.git_run(["init", "--bare", "--quiet", "--template=", "--object-format=sha1"],
+                         cwd=directory)
+        objects = commands.git_run(["-C", str(source_repo), "rev-parse", "--path-format=absolute",
+                                    "--git-path", "objects"], cwd=directory).strip()
+        require(Path(objects).is_absolute() and Path(objects).is_dir()
+                and not any(c in objects for c in "\r\n\0"),
+                "invalid qualification IR object directory")
+        (directory / "objects/info/alternates").write_text(objects + "\n")
+        commit = self.verified_object("commit", revision)
+        tree = re.match(rb"tree ([0-9a-f]{40})\n", commit)
+        require(tree is not None, "qualification IR commit has no canonical root tree")
+        self.cached_tree = tree[1].decode("ascii")
+        self.require_complete_source()
+
+    def require_complete_source(self) -> None:
+        # Selected source is required, not all unrelated historical blobs.
+        # Traversing commits separately still refuses missing ancestry metadata.
+        self.commands.git_run(["rev-list", "--count", self.revision], cwd=self.directory)
+        objects = self.commands.git_run(
+            ["rev-list", "--objects", "--no-object-names", "--missing=print", self.cached_tree],
+            cwd=self.directory).splitlines()
+        require(bool(objects) and all(SHA.fullmatch(oid) is not None for oid in objects),
+                "qualification IR selected source closure is incomplete")
+        self.verified_object("tree", self.cached_tree)
+
+
 def packages(data: bytes, label: str) -> list[dict]:
     rows = document(data, label).get("package")
     require(isinstance(rows, list) and bool(rows) and all(isinstance(row, dict) for row in rows),
@@ -821,6 +922,8 @@ def current(root: Path, files: dict[str, Snapshot]) -> Current:
         dep = dependency(verify, False, name, VERIFY)
         require(pin(dep, CLEAN_URL, f"{VERIFY}: {name}") == clean,
                 f"{VERIFY}: {name} disagrees with the locked Clean authority")
+        require("version" not in dep or dep["version"] in set(all_clean.values()),
+                f"{VERIFY}: {name} version disagrees with the locked Clean authority")
         require(dep.get("optional") is True,
                 f"{VERIFY}: {name} must remain optional")
     require(dependency(verify, False, "clean-olean", VERIFY).get("default-features") is False,
@@ -861,6 +964,32 @@ class Target:
     # Newly admitted AY package -> the existing AY cohort packages whose
     # immutable target manifests require it (see admit_ay_packages).
     admitted_ay: dict[str, frozenset[str]] = field(default_factory=dict)
+    qualification_ir_tree: str | None = None
+    clean_version: str | None = None
+
+
+def selected_clean_version(state: Current, requested: str | None) -> str:
+    versions = set(state.clean_packages.values())
+    require(len(versions) == 1, "current Clean package versions disagree")
+    current_version = next(iter(versions))
+    if requested is None:
+        return current_version
+    require(requested == current_version or
+            (current_version, requested) == CLEAN_VERSION_MIGRATION,
+            "unsupported Clean package-version migration")
+    return requested
+
+
+def selected_ir_version(state: Current, requested: str | None) -> str:
+    versions = set(state.ir_packages.values())
+    require(len(versions) == 1, "current TrustIR package versions disagree")
+    current_version = next(iter(versions))
+    if requested is None:
+        return current_version
+    require(requested == current_version or
+            (current_version, requested) == IR_VERSION_MIGRATION,
+            "unsupported TrustIR package-version migration")
+    return requested
 
 
 def mentions_ay(alias: str, dep) -> bool:
@@ -891,7 +1020,8 @@ def dependency_tables(doc: dict):
             yield container is doc, section, table
 
 
-def admit_ir_packages(ir: Authority, state: Current, names: tuple[str, ...]) -> dict[str, frozenset[str]]:
+def admit_ir_packages(ir: Authority, state: Current, names: tuple[str, ...], *,
+                      ir_version: str | None = None) -> dict[str, frozenset[str]]:
     """Admit explicitly NAMED new TrustIR workspace crates, bound to the fetched target.
 
     A name joins the cohort only when the immutable target (1) lists
@@ -903,9 +1033,7 @@ def admit_ir_packages(ir: Authority, state: Current, names: tuple[str, ...]) -> 
     require(len(set(names)) == len(names), "duplicate --admit-ir-package name")
     if not names:
         return {}
-    versions = set(state.ir_packages.values())
-    require(len(versions) == 1, "TrustIR cohort version is split")
-    version = next(iter(versions))
+    version = selected_ir_version(state, ir_version)
     workspace = ir.read("Cargo.toml").get("workspace", {})
     require(isinstance(workspace, dict), "malformed target TrustIR workspace")
     members = workspace.get("members", [])
@@ -1001,18 +1129,25 @@ def selected_ay_version(state: Current, requested: str | None) -> str:
 def target_cohort(commands: Commands, directory: Path, state: Current, revision: str,
                   ay_revision: str | None = None, admit: tuple[str, ...] = (),
                   admit_ay: tuple[str, ...] = (), ay_version: str | None = None,
-                  admit_registry: tuple[str, ...] = ()) -> Target:
+                  admit_registry: tuple[str, ...] = (),
+                  qualification_ir_source: Path | None = None,
+                  clean_version: str | None = None, *,
+                  ir_version: str | None = None) -> Target:
     require(ay_version is None or ay_revision is not None,
             "--ay-version requires an explicit --ay-revision")
     ay_version = selected_ay_version(state, ay_version)
+    clean_version = selected_clean_version(state, clean_version)
+    selected_ir = selected_ir_version(state, ir_version)
     ay_revision = state.ay if ay_revision is None else exact_sha(ay_revision)
     require(not admit_registry or ay_revision != state.ay,
             "named registry source admission requires an explicit AY move")
-    ir = Authority(commands, directory / "trust-ir", IR_URL, revision)
+    ir = (Authority(commands, directory / "trust-ir", IR_URL, revision)
+          if qualification_ir_source is None else
+          QualificationIrSource(commands, directory / "trust-ir", qualification_ir_source, revision))
     ir_workspace = ir.read("Cargo.toml").get("workspace", {}).get("package", {})
-    versions = set(state.ir_packages.values())
-    require(versions == {ir_workspace.get("version")}, "TrustIR package version move is unsupported")
-    admitted = admit_ir_packages(ir, state, tuple(admit))
+    require(selected_ir == ir_workspace.get("version"),
+            "TrustIR package version move is unsupported without matching explicit selection")
+    admitted = admit_ir_packages(ir, state, tuple(admit), ir_version=ir_version)
     clean_revisions = set()
     for relative in ["crates/trust-ir/Cargo.toml", "crates/trust-ir-build/Cargo.toml"]:
         manifest = ir.read(relative)
@@ -1022,14 +1157,14 @@ def target_cohort(commands: Commands, directory: Path, state: Current, revision:
                     require(name in {"clean-kernel", "clean-mathverse", "clean-olean", "clean-verify"},
                             f"unsupported TrustIR-owned Clean dependency: {name}")
                     clean_revisions.add(pin(dep, CLEAN_URL, f"{relative}: {name}"))
-                    require(dep.get("version") in set(state.clean_packages.values()),
-                            f"{relative}: Clean version move is unsupported")
+                    require(dep.get("version") == clean_version,
+                            f"{relative}: Clean version differs from explicit selection")
     require(len(clean_revisions) == 1, "target TrustIR must own exactly one Clean revision")
     clean_revision = next(iter(clean_revisions))
     clean = Authority(commands, directory / "clean", CLEAN_URL, clean_revision)
     clean_root = clean.read("Cargo.toml").get("workspace", {})
-    require(set(state.clean_packages.values()) == {clean_root.get("package", {}).get("version")},
-            "Clean package version move is unsupported")
+    require(clean_root.get("package", {}).get("version") == clean_version,
+            "Clean package version move is unsupported without matching explicit selection")
     ay_dependencies(clean_root.get("dependencies", {}),
                     {"ay", "ay-core", "ay-dpll", "ay-proof", "ay-frontend", "ay-translate", "ay-lean-bridge"},
                     ay_revision, ay_version, "target Clean")
@@ -1048,14 +1183,19 @@ def target_cohort(commands: Commands, directory: Path, state: Current, revision:
                                        clean_authority=clean, clean_revision=clean_revision)
     # Every admitted package is checked against a manifest in the fetched object,
     # not inferred from a same-named sibling or from package-version coincidence.
-    for authority, expected in [(ir, state.ir_packages), (clean, state.clean_packages)]:
+    for authority, expected in [(ir, dict.fromkeys(state.ir_packages, selected_ir)),
+                                (clean, dict.fromkeys(state.clean_packages, clean_version))]:
         for name, version in expected.items():
             package = authority.read(f"crates/{name}/Cargo.toml").get("package", {})
             require(package.get("name") == name, f"target does not define admitted package {name}")
             require(package.get("version") in (version, {"workspace": True}),
                     f"{name}: target package version is unsupported")
+    if isinstance(ir, QualificationIrSource):
+        ir.require_complete_source()
     return Target(clean_revision, ay_target, admitted,
-                  admit_ay_packages(ay_target, state, tuple(admit_ay)))
+                  admit_ay_packages(ay_target, state, tuple(admit_ay)),
+                  ir.cached_tree if qualification_ir_source is not None else None,
+                  clean_version)
 
 
 def unused_vendor_declaration(authority: Authority, excludes: list[str], package: str,
@@ -1266,9 +1406,17 @@ def validate_ay_target(authority: Authority, state: Current,
 
 def rewritten(files: dict[str, Snapshot], old: str, new: str,
               old_ay: str, new_ay: str, old_clean: str, new_clean: str,
-              old_ay_version: str | None = None, new_ay_version: str | None = None) -> dict[str, bytes]:
+              old_ay_version: str | None = None, new_ay_version: str | None = None, *,
+              old_clean_version: str | None = None,
+              new_clean_version: str | None = None,
+              old_ir_version: str | None = None,
+              new_ir_version: str | None = None) -> dict[str, bytes]:
     require((old_ay_version is None) == (new_ay_version is None),
             "AY version rewrite requires both old and new identities")
+    require((old_clean_version is None) == (new_clean_version is None),
+            "Clean version rewrite requires both old and new identities")
+    require((old_ir_version is None) == (new_ir_version is None),
+            "TrustIR version rewrite requires both old and new identities")
     result = {}
     for relative, names in [(MANIFESTS[0], ("trust-ir", "trust-ir-build", "trust-ir-conformance")),
                             (MANIFESTS[1], ("trust-ir", "trust-ir-build")), (REGALLOC, ("ay-pb", "ay-sat")),
@@ -1283,10 +1431,23 @@ def rewritten(files: dict[str, Snapshot], old: str, new: str,
             line = lines[0]
             updated, count = re.subn(rf'\brev\s*=\s*"{previous}"', f'rev = "{following}"', line[0])
             require(count == 1, f"{relative}: ambiguous {name} revision")
+            if (relative in MANIFESTS and old_ir_version is not None
+                    and old_ir_version != new_ir_version):
+                parsed = document(("[dependencies]\n" + updated + "\n").encode(), relative)
+                if "version" in parsed["dependencies"][name]:
+                    updated, count = re.subn(rf'\bversion\s*=\s*"{re.escape(old_ir_version)}"',
+                                             f'version = "{new_ir_version}"', updated)
+                    require(count == 1, f"{relative}: ambiguous {name} TrustIR version")
             if relative == REGALLOC and old_ay_version is not None:
                 updated, count = re.subn(rf'\bversion\s*=\s*"{re.escape(old_ay_version)}"',
                                          f'version = "{new_ay_version}"', updated)
                 require(count == 1, f"{relative}: ambiguous {name} version")
+            if relative == VERIFY and old_clean_version is not None:
+                parsed = document(("[dependencies]\n" + updated + "\n").encode(), relative)
+                if "version" in parsed["dependencies"][name]:
+                    updated, count = re.subn(rf'\bversion\s*=\s*"{re.escape(old_clean_version)}"',
+                                             f'version = "{new_clean_version}"', updated)
+                    require(count == 1, f"{relative}: ambiguous {name} Clean version")
             text = text[:line.start()] + updated + text[line.end():]
         result[relative] = text.encode()
     text = files[CACHE].data.decode()
@@ -1357,7 +1518,9 @@ def validate_graph(before: bytes, after: bytes, label: str, state: Current,
                    ir: str, clean: str, ay: str, authority: AyTarget | None = None,
                    admitted: dict[str, frozenset[str]] | None = None,
                    admitted_ay: dict[str, frozenset[str]] | None = None,
-                   dropped: frozenset[str] = frozenset()) -> frozenset[str]:
+                   dropped: frozenset[str] = frozenset(), *,
+                   clean_version: str | None = None,
+                   ir_version: str | None = None) -> frozenset[str]:
     admitted = admitted or {}
     admitted_ay = admitted_ay or {}
     old_rows, new_rows = packages(before, label), packages(after, label)
@@ -1371,12 +1534,14 @@ def validate_graph(before: bytes, after: bytes, label: str, state: Current,
     # resolved; every requirer is some lock's cohort member, so each admission
     # lands in at least one lock.
     gained = {name for name, required_by in admitted.items() if required_by & old_ir.keys()}
-    version = next(iter(set(old_ir.values())))
-    expected = {**old_ir, **{name: version for name in gained}}
+    ir_cohort_version = selected_ir_version(state, ir_version)
+    expected = dict.fromkeys({*old_ir, *gained}, ir_cohort_version)
     require(cohort(new_rows, "trust-ir", IR_URL, ir) == expected,
             f"{label}: adding/removing/versioning the trust-ir cohort is unsupported"
             + (f" (admitted: {', '.join(sorted(admitted))})" if admitted else ""))
-    require(cohort(old_rows, "clean", CLEAN_URL, state.clean)
+    clean_version = selected_clean_version(state, clean_version)
+    old_clean = cohort(old_rows, "clean", CLEAN_URL, state.clean)
+    require(dict.fromkeys(old_clean, clean_version)
             == cohort(new_rows, "clean", CLEAN_URL, clean),
             f"{label}: adding/removing/versioning the clean cohort is unsupported")
     ay_present = lambda rows: any(family(row["name"], "ay")
@@ -1421,6 +1586,10 @@ def validate_graph(before: bytes, after: bytes, label: str, state: Current,
 
     def identity(row, remap):
         original = row.get("source", "")
+        if remap and family(row["name"], "trust-ir") and original == source(IR_URL, state.ir):
+            return row["name"], ir_cohort_version, source(IR_URL, ir)
+        if remap and family(row["name"], "clean") and original == source(CLEAN_URL, state.clean):
+            return row["name"], clean_version, source(CLEAN_URL, clean)
         if remap and exec_policy.identity(row) == old_vendor:
             return exec_policy.NAME, exec_policy.VERSION, source(AY_URL, ay)
         if remap and family(row["name"], "ay") and original == source(AY_URL, state.ay):
@@ -1516,7 +1685,9 @@ def validate_installed(root: Path, before: dict[str, Snapshot], staged: dict[str
                        authority: AyTarget | None = None,
                        admitted: dict[str, frozenset[str]] | None = None,
                        admitted_ay: dict[str, frozenset[str]] | None = None,
-                       dropped: frozenset[str] = frozenset()) -> None:
+                       dropped: frozenset[str] = frozenset(), *,
+                       clean_version: str | None = None,
+                       ir_version: str | None = None) -> None:
     after = snapshot(root)
     for relative in OWNED:
         require(after[relative].mode == before[relative].mode, f"{relative}: file mode changed")
@@ -1527,10 +1698,15 @@ def validate_installed(root: Path, before: dict[str, Snapshot], staged: dict[str
             "installed dependency authority disagrees with immutable target")
     require(new_state.ay_version == (state.ay_version if authority is None else authority.version),
             "installed AY package version disagrees with immutable target")
+    require(set(new_state.clean_packages.values()) == {selected_clean_version(state, clean_version)},
+            "installed Clean package version disagrees with immutable target")
+    require(set(new_state.ir_packages.values()) == {selected_ir_version(state, ir_version)},
+            "installed TrustIR package version disagrees with immutable target")
     left: set[str] = set()
     for lock in LOCKS:
         left |= validate_graph(before[lock].data, after[lock].data, lock, state, revision,
-                               clean, ay, authority, admitted, admitted_ay, dropped)
+                               clean, ay, authority, admitted, admitted_ay, dropped,
+                               clean_version=clean_version, ir_version=ir_version)
     for name in sorted(dropped - left):
         raise Refusal(f"--admit-dropped-package {name}: the move drops it from no lock")
 
@@ -1558,12 +1734,21 @@ def admit_dropped_packages(before: dict[str, Snapshot], names: tuple[str, ...]) 
 def transaction(root: Path, revision: str, commands: Commands,
                 ay_revision: str | None = None, admit: tuple[str, ...] = (),
                 admit_ay: tuple[str, ...] = (), drop: tuple[str, ...] = (),
-                ay_version: str | None = None, admit_registry: tuple[str, ...] = ()) -> None:
+                ay_version: str | None = None, admit_registry: tuple[str, ...] = (), *,
+                qualification_ir_source: Path | None = None,
+                qualification_receipt: Path | None = None,
+                clean_version: str | None = None,
+                ir_version: str | None = None) -> None:
     exact_sha(revision)
     if ay_revision is not None:
         exact_sha(ay_revision)
     require(ay_version is None or ay_revision is not None,
             "--ay-version requires an explicit --ay-revision")
+    require((qualification_ir_source is None) == (qualification_receipt is None),
+            "qualification source and receipt must be explicitly selected together")
+    if qualification_receipt is not None:
+        require(qualification_receipt.is_absolute() and not qualification_receipt.exists(),
+                "qualification receipt needs a fresh absolute path")
     with exclusive(commands):
         clean_owned(commands)
         before = snapshot(root)
@@ -1578,16 +1763,24 @@ def transaction(root: Path, revision: str, commands: Commands,
         state = current(root, before)
         ay_revision = state.ay if ay_revision is None else ay_revision
         selected_version = selected_ay_version(state, ay_version)
+        selected_ir = selected_ir_version(state, ir_version)
         with tempfile.TemporaryDirectory(prefix="trust-cg-pin-authority-") as temporary:
             target = target_cohort(commands, Path(temporary), state, revision, ay_revision,
-                                   tuple(admit), tuple(admit_ay), ay_version, admit_registry)
+                                   tuple(admit), tuple(admit_ay), ay_version, admit_registry,
+                                   qualification_ir_source=qualification_ir_source,
+                                   clean_version=clean_version,
+                                   ir_version=ir_version)
         clean = target.clean
         require(target.ay is None and selected_version == state.ay_version
                 or target.ay is not None
                 and (target.ay.revision, target.ay.version) == (ay_revision, selected_version),
                 "immutable AY target disagrees with explicit revision/version")
         staged = rewritten(before, state.ir, revision, state.ay, ay_revision, state.clean, clean,
-                           state.ay_version, selected_version)
+                           state.ay_version, selected_version,
+                           old_clean_version=next(iter(set(state.clean_packages.values()))),
+                           new_clean_version=selected_clean_version(state, clean_version),
+                           old_ir_version=next(iter(set(state.ir_packages.values()))),
+                           new_ir_version=selected_ir)
         clean_owned(commands)
         unchanged(root, before)
         backup = Path(tempfile.mkdtemp(prefix="trust-cg-pin-recovery-"))
@@ -1603,11 +1796,14 @@ def transaction(root: Path, revision: str, commands: Commands,
                     os.fsync(output.fileno())
             for relative, data in staged.items():
                 install(root, relative, data, before[relative].mode)
+            offline = ["--offline"] if qualification_ir_source is not None else []
             for lock in LOCKS:
                 manifest = str(root / Path(lock).with_name("Cargo.toml"))
-                commands.frontend(["metadata", "--format-version", "1", "--manifest-path", manifest])
+                commands.frontend(["metadata", "--format-version", "1", "--manifest-path", manifest,
+                                   *offline])
                 commands.frontend(["update", "--manifest-path", manifest, "-p",
-                                   f"trust-ir@{state.ir_packages['trust-ir']}", "--precise", revision])
+                                   f"trust-ir@{selected_ir}", "--precise", revision,
+                                   *offline])
                 if target.ay is not None and target.ay.registry_owners:
                     try:
                         constraints = registry_owner.resolution_constraints(
@@ -1618,9 +1814,10 @@ def transaction(root: Path, revision: str, commands: Commands,
                         raise Refusal(str(error)) from error
                     for name, previous, wanted in constraints:
                         commands.frontend(["update", "--manifest-path", manifest, "-p",
-                                           name + "@" + previous, "--precise", wanted])
+                                           name + "@" + previous, "--precise", wanted, *offline])
             validate_installed(root, before, staged, state, revision, clean, ay_revision,
-                               target.ay, target.admitted, target.admitted_ay, dropped)
+                               target.ay, target.admitted, target.admitted_ay, dropped,
+                               clean_version=clean_version, ir_version=ir_version)
             gained_registry = set()
             for lock in LOCKS:
                 old_ids = {registry_owner.identity(row) for row in packages(before[lock].data, lock)}
@@ -1632,7 +1829,43 @@ def transaction(root: Path, revision: str, commands: Commands,
             for lock in LOCKS:
                 manifest = str(root / Path(lock).with_name("Cargo.toml"))
                 commands.frontend(["metadata", "--locked", "--format-version", "1",
-                                   "--manifest-path", manifest])
+                                   "--manifest-path", manifest, *offline])
+            if qualification_receipt is not None:
+                require(target.qualification_ir_tree is not None,
+                        "qualification stage has no immutable IR tree")
+                require(safe_file(root, GUARD).read_bytes() == guard
+                        and safe_file(root, CORPUS_GUARD).read_bytes() == corpus_guard
+                        and all(safe_file(root, path).read_bytes() == data
+                                for path, data in {**inventory_guards, **fixture_guards}.items())
+                        and guard_tree(root, VENDORED_FIXTURES) == vendored,
+                        "qualification preparation changed a guard or its fixture inputs")
+                qualification_receipt.parent.mkdir(parents=True, exist_ok=True)
+                originals = qualification_receipt.parent / (qualification_receipt.name + ".originals")
+                originals.mkdir()
+                after = snapshot(root)
+                for relative, saved in before.items():
+                    path = originals / relative
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    path.write_bytes(saved.data)
+                    path.chmod(saved.mode)
+                qualification_receipt.write_text(json.dumps({
+                    "schema": "trust-cg.qualification-source-stage.v1",
+                    "source_role": "untrusted-candidate-data",
+                    "publication_authority": False,
+                    "rust_guards": "NOT RUN", "upstream_qualification": "NOT JUDGED",
+                    "ir_commit": revision, "ir_tree": target.qualification_ir_tree,
+                    "clean_commit": clean, "ay_commit": ay_revision,
+                    "originals": str(originals),
+                    "files": {path: {
+                        "before_sha256": hashlib.sha256(before[path].data).hexdigest(),
+                        "after_sha256": hashlib.sha256(saved.data).hexdigest(),
+                        "mode": saved.mode,
+                    } for path, saved in after.items()},
+                }, indent=2) + "\n")
+                print("QUALIFICATION ONLY: staged immutable local IR source and locked graph; "
+                      "Rust guards NOT RUN, adoption/publication NOT JUDGED. Restore original "
+                      "bytes and run the ordinary authenticated transaction before landing.")
+                return
             require(safe_file(root, GUARD).read_bytes() == guard, "independent Rust guard changed")
             # Compilation uses the repository default or build-slot's admitted
             # CARGO_BUILD_JOBS, like every later guard. Runtime order stays serial.
@@ -1684,7 +1917,8 @@ def transaction(root: Path, revision: str, commands: Commands,
             require(guard_tree(root, VENDORED_FIXTURES) == vendored,
                     "vendored conformance fixtures changed")
             validate_installed(root, before, staged, state, revision, clean, ay_revision,
-                               target.ay, target.admitted, target.admitted_ay, dropped)
+                               target.ay, target.admitted, target.admitted_ay, dropped,
+                               clean_version=clean_version, ir_version=ir_version)
         except BaseException as error:
             try:
                 restore(root, before)
@@ -1726,9 +1960,20 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--ay-revision", help="explicit coordinated AY source move")
     parser.add_argument("--ay-version", choices=[AY_VERSION_MIGRATION[1]],
                         help="explicit reviewed 0.27.0 to 0.28.0 package-version migration")
+    parser.add_argument("--clean-version", choices=[CLEAN_VERSION_MIGRATION[1]],
+                        help="explicit reviewed 0.9.1 to 0.9.2 package-version migration")
+    parser.add_argument("--ir-version", choices=[IR_VERSION_MIGRATION[1]],
+                        help="explicit reviewed 0.14.0 to 0.15.0 package-version migration")
     parser.add_argument("--targo", required=True, help="explicit operational frontend selection, not proof authority")
+    parser.add_argument("--guard-admission", choices=("ordinary", "native-worker", "original-fixed-v1"),
+                        default="native-worker",
+                        help="explicit supported test interface; ordinary uses normal execution, not optional worker discovery")
     parser.add_argument("--authority-cache", action="append", default=[], metavar="NAME=/ABS/PATH",
                         help="source Git cache for trust-ir, clean or ay; fresh Agh authentication required")
+    parser.add_argument("--stage-qualification-ir-source", type=Path,
+                        help="stage local immutable IR DATA only; exits 3, no adoption/publication")
+    parser.add_argument("--qualification-receipt", type=Path,
+                        help="fresh absolute receipt retaining original files for qualification-only staging")
     parser.add_argument("--admit-ir-package", action="append", default=[], metavar="NAME",
                         help="explicitly admit one new trust-ir-* workspace crate the target requires")
     parser.add_argument("--admit-ay-package", action="append", default=[], metavar="NAME",
@@ -1755,11 +2000,17 @@ def main(argv: list[str] | None = None) -> int:
             cache = Path(path)
             require(cache.is_absolute() and cache.is_dir(), "authority cache needs an existing absolute directory")
             caches[urls[name]] = cache
-        transaction(root, revision, Commands(root, selected_targo(args.targo), caches), args.ay_revision,
+        require(args.stage_qualification_ir_source is None or IR_URL not in caches,
+                "qualification IR DATA cannot also be selected as an authenticated authority cache")
+        transaction(root, revision, Commands(root, selected_targo(args.targo), caches,
+                                            guard_admission=args.guard_admission), args.ay_revision,
                     tuple(args.admit_ir_package), tuple(args.admit_ay_package),
                     tuple(args.admit_dropped_package), args.ay_version,
-                    tuple(args.admit_registry_package))
-        return 0
+                    tuple(args.admit_registry_package),
+                    qualification_ir_source=args.stage_qualification_ir_source,
+                    qualification_receipt=args.qualification_receipt,
+                    clean_version=args.clean_version, ir_version=args.ir_version)
+        return 3 if args.stage_qualification_ir_source is not None else 0
     except (Refusal, OSError, KeyboardInterrupt) as error:
         print(f"REFUSED: {error}", file=sys.stderr)
         return 1

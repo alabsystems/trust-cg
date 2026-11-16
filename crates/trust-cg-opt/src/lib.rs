@@ -179,6 +179,7 @@ pub mod x86_pass_manager;
 pub mod x86_peephole;
 pub mod x86_proof_opts;
 pub mod x86_rotate;
+pub mod x86_select_flag_fusion;
 pub mod x86_slot_forward;
 pub mod x86_sroa;
 pub mod x86_strength_reduce;
@@ -240,6 +241,9 @@ pub use x86_pass_manager::{X86MachinePass, X86PassManager, X86PassStats, x86_pas
 pub use x86_peephole::{ConstMulShiftAdmit, ReconstructionAdmit, X86Peephole};
 pub use x86_proof_opts::{X86ProofGuardElimination, X86ProofOptStats};
 pub use x86_rotate::X86LoopRotate;
+pub use x86_select_flag_fusion::{
+    set_x86_select_flag_fusion_disabled, x86_select_flag_fusion_withheld,
+};
 pub use x86_slot_forward::X86SlotForward;
 pub use x86_sroa::X86ScalarReplacementOfAggregates;
 pub use x86_strength_reduce::{StrengthReduceAdmission, X86StrengthReduce};

@@ -41,7 +41,10 @@
 //!    (store, volatile load, call, atomic, bulk-memory) must be WITNESSED by
 //!    at least one emitted instruction stamped from it. The omission direction is the store-drop
 //!    catch: a dropped store leaves its `(block, index)` unwitnessed and the
-//!    function fails closed. This is the exact blind spot (per-instruction
+//!    function fails closed. A canonical AArch64 zero-byte bulk operation is
+//!    independently recognized from its exact source constants as having no
+//!    memory effect; it is never assigned a synthetic machine witness.
+//!    This is the exact blind spot (per-instruction
 //!    proofs blind to omissions) that let the union-loop store-drop through
 //!    historically. The only exception is a plain `Store` that a selector
 //!    folded into an idiom and linked to its witness with a fusion edge
@@ -67,7 +70,7 @@
 //! a per-function summary.
 
 use std::sync::atomic::{AtomicU64, Ordering};
-use trust_cg_ir::fast_hash::FxHashSet as HashSet;
+use trust_cg_ir::fast_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 use trust_cg_ir::provenance::{LoweringProvenance, SourceInstId};
 
@@ -253,6 +256,74 @@ fn fence_is_zero_instruction_on_target(opcode: &LirOpcode, arch: &str) -> bool {
     )
 }
 
+/// Source instructions whose AArch64 bulk-memory effect is independently known
+/// to be empty. This is a semantic zero-byte case, not a machine witness or a
+/// selector-supplied waiver. No pseudo or fusion edge can establish it.
+///
+/// Match only the selectors' current emission-free cases: canonical memcpy /
+/// memmove of zero bytes, or zero-fill memset of zero bytes. Both constants must
+/// be real, uniquely defined, correctly typed Iconst instructions earlier in the
+/// SAME block; parameters, aliases, malformed constants and duplicate definitions
+/// remain ordinary effects. This deliberately does not infer cross-block value
+/// availability or trust the selector's constant-origin table.
+fn aarch64_empty_bulk_effects(lir: &trust_cg_lower::Function) -> HashSet<(u32, u32)> {
+    use trust_cg_lower::instructions::Value;
+    use trust_cg_lower::types::Type;
+
+    let mut definitions: HashMap<Value, usize> = HashMap::default();
+    let mut zero_origins = HashMap::default();
+    for (block, bb) in &lir.blocks {
+        for (value, _) in &bb.params {
+            *definitions.entry(*value).or_default() += 1;
+        }
+        for (index, inst) in bb.instructions.iter().enumerate() {
+            for result in &inst.results {
+                *definitions.entry(*result).or_default() += 1;
+            }
+            if let LirOpcode::Iconst { ty, imm: 0 } = &inst.opcode
+                && inst.args.is_empty()
+                && let [result] = inst.results.as_slice()
+                && matches!(ty, Type::I32 | Type::I64)
+                && lir
+                    .value_types
+                    .get(result)
+                    .is_none_or(|recorded| recorded == ty)
+            {
+                zero_origins.insert(*result, (*block, index, ty.clone()));
+            }
+        }
+    }
+    zero_origins.retain(|value, _| definitions.get(value) == Some(&1));
+
+    let mut empty = HashSet::default();
+    for (block, bb) in &lir.blocks {
+        for (index, inst) in bb.instructions.iter().enumerate() {
+            if !matches!(
+                inst.opcode,
+                LirOpcode::Memcpy | LirOpcode::Memmove | LirOpcode::Memset
+            ) || inst.args.len() != 3
+                || !inst.results.is_empty()
+            {
+                continue;
+            }
+            let earlier_zero = |value: &Value, expected: Type| {
+                zero_origins
+                    .get(value)
+                    .is_some_and(|(origin_block, origin_index, ty)| {
+                        origin_block == block && *origin_index < index && *ty == expected
+                    })
+            };
+            if earlier_zero(&inst.args[2], Type::I64)
+                && (!matches!(inst.opcode, LirOpcode::Memset)
+                    || earlier_zero(&inst.args[1], Type::I32))
+            {
+                empty.insert((block.0, index as u32));
+            }
+        }
+    }
+    empty
+}
+
 // ---------------------------------------------------------------------------
 // Core check
 // ---------------------------------------------------------------------------
@@ -371,10 +442,20 @@ pub fn check_function<F: DataflowFunctionView>(
     // fence, bulk-memory operation, volatile store or volatile load must be
     // witnessed by an instruction stamped from itself, whatever edges the
     // selector recorded.
+    // A zero-byte source operation has no memory effect to witness. Derive the
+    // narrow fact from this exact LIR input; do not count a stamped no-op as an
+    // emitted effect or extend fusion admission to bulk-memory instructions.
+    let empty_bulk = if arch == "aarch64" {
+        aarch64_empty_bulk_effects(lir)
+    } else {
+        HashSet::default()
+    };
     let mut effectful: Vec<(u32, u32, &'static str, bool)> = Vec::new();
     for (block, bb) in &lir.blocks {
         for (index, inst) in bb.instructions.iter().enumerate() {
-            if let Some(kind) = must_witness_effect(&inst.opcode, arch) {
+            if let Some(kind) = must_witness_effect(&inst.opcode, arch)
+                && !empty_bulk.contains(&(block.0, index as u32))
+            {
                 let fusable = matches!(inst.opcode, LirOpcode::Store { .. });
                 effectful.push((block.0, index as u32, kind, fusable));
             }
@@ -1254,6 +1335,240 @@ mod tests {
     // ===================================================================
     // Property 3b — OMISSION DIRECTION (store-drop catch)
     // ===================================================================
+
+    fn lir_with_constant_bulk(opcode: LirOpcode, len: i64) -> trust_cg_lower::Function {
+        let mut lir = trust_cg_lower::Function::new(
+            "f",
+            Signature {
+                params: vec![Type::I64, Type::I64],
+                returns: vec![],
+            },
+        );
+        let mut instructions = vec![Instruction {
+            opcode: LirOpcode::Iconst {
+                ty: Type::I64,
+                imm: len,
+            },
+            args: vec![],
+            results: vec![Value(2)],
+        }];
+        let fill = if matches!(opcode, LirOpcode::Memset) {
+            instructions.push(Instruction {
+                opcode: LirOpcode::Iconst {
+                    ty: Type::I32,
+                    imm: 0,
+                },
+                args: vec![],
+                results: vec![Value(3)],
+            });
+            Value(3)
+        } else {
+            Value(1)
+        };
+        instructions.push(Instruction {
+            opcode,
+            args: vec![Value(0), fill, Value(2)],
+            results: vec![],
+        });
+        instructions.push(Instruction {
+            opcode: LirOpcode::Return,
+            args: vec![],
+            results: vec![],
+        });
+        lir.block_order.push(Block(0));
+        lir.blocks.insert(
+            Block(0),
+            BasicBlock {
+                params: vec![(Value(0), Type::I64), (Value(1), Type::I64)],
+                instructions,
+                source_locs: vec![],
+            },
+        );
+        lir
+    }
+
+    fn bulk_with_no_machine_effect(
+        lir: &trust_cg_lower::Function,
+        arch: &str,
+    ) -> Vec<DataflowViolation> {
+        let last = lir.blocks[&Block(0)].instructions.len() as u32 - 1;
+        let view = MockView {
+            name: "f".into(),
+            blocks: vec![MockBlock {
+                id: 0,
+                insts: vec![terminator("Ret", 0, last)],
+            }],
+        };
+        check_function(&view, lir, arch)
+    }
+
+    #[test]
+    fn aarch64_zero_byte_bulk_operations_need_no_fake_effect_witness() {
+        for opcode in [LirOpcode::Memcpy, LirOpcode::Memmove, LirOpcode::Memset] {
+            let lir = lir_with_constant_bulk(opcode, 0);
+            assert!(bulk_with_no_machine_effect(&lir, "aarch64").is_empty());
+            // Other backends retain their existing witnessed-libcall contract.
+            for arch in ["x86_64", "wasm", "unknown"] {
+                assert!(
+                    kinds(&bulk_with_no_machine_effect(&lir, arch))
+                        .contains(&DataflowViolationKind::UnwitnessedEffect),
+                    "{arch}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn aarch64_nonzero_or_dynamic_bulk_effects_still_require_real_emission() {
+        for opcode in [LirOpcode::Memcpy, LirOpcode::Memmove, LirOpcode::Memset] {
+            for len in [1, -1, i64::MAX] {
+                let lir = lir_with_constant_bulk(opcode.clone(), len);
+                assert!(
+                    kinds(&bulk_with_no_machine_effect(&lir, "aarch64"))
+                        .contains(&DataflowViolationKind::UnwitnessedEffect),
+                    "{opcode:?} {len}"
+                );
+            }
+            let mut dynamic = lir_with_constant_bulk(opcode.clone(), 0);
+            let length = &mut dynamic.blocks.get_mut(&Block(0)).unwrap().instructions[0];
+            length.opcode = LirOpcode::Iadd;
+            length.args = vec![Value(0), Value(1)];
+            assert!(
+                kinds(&bulk_with_no_machine_effect(&dynamic, "aarch64"))
+                    .contains(&DataflowViolationKind::UnwitnessedEffect),
+                "{opcode:?} dynamic"
+            );
+        }
+    }
+
+    #[test]
+    fn aarch64_empty_bulk_does_not_hide_a_neighboring_dropped_store() {
+        let mut lir = lir_with_constant_bulk(LirOpcode::Memmove, 0);
+        lir.blocks.get_mut(&Block(0)).unwrap().instructions.insert(
+            1,
+            Instruction {
+                opcode: LirOpcode::Store {
+                    ty: Type::I64,
+                    align: None,
+                },
+                args: vec![Value(1), Value(0)],
+                results: vec![],
+            },
+        );
+        let violations = bulk_with_no_machine_effect(&lir, "aarch64");
+        assert_eq!(
+            kinds(&violations),
+            [DataflowViolationKind::UnwitnessedEffect]
+        );
+        assert!(
+            violations[0]
+                .detail
+                .contains("instruction store at (block 0, index 1)")
+        );
+    }
+
+    #[test]
+    fn aarch64_empty_bulk_requires_canonical_unique_available_source_constants() {
+        let base = lir_with_constant_bulk(LirOpcode::Memmove, 0);
+        let mut cases = Vec::new();
+        for ty in [Type::I8, Type::I32, Type::I128] {
+            let mut lir = base.clone();
+            lir.blocks.get_mut(&Block(0)).unwrap().instructions[0].opcode =
+                LirOpcode::Iconst { ty, imm: 0 };
+            cases.push(("wrong constant type", lir));
+        }
+        let mut conflicting_hint = base.clone();
+        conflicting_hint.value_types.insert(Value(2), Type::I32);
+        cases.push(("conflicting type hint", conflicting_hint));
+        let mut malformed_constant_args = base.clone();
+        malformed_constant_args
+            .blocks
+            .get_mut(&Block(0))
+            .unwrap()
+            .instructions[0]
+            .args
+            .push(Value(0));
+        cases.push(("constant has arguments", malformed_constant_args));
+        let mut malformed_constant_results = base.clone();
+        malformed_constant_results
+            .blocks
+            .get_mut(&Block(0))
+            .unwrap()
+            .instructions[0]
+            .results
+            .push(Value(4));
+        cases.push(("constant has extra result", malformed_constant_results));
+        let mut duplicate = base.clone();
+        let second_definition = duplicate.blocks[&Block(0)].instructions[0].clone();
+        duplicate
+            .blocks
+            .get_mut(&Block(0))
+            .unwrap()
+            .instructions
+            .insert(0, second_definition);
+        cases.push(("duplicate constant definition", duplicate));
+        let mut shadowed = base.clone();
+        shadowed
+            .blocks
+            .get_mut(&Block(0))
+            .unwrap()
+            .params
+            .push((Value(2), Type::I64));
+        cases.push(("parameter shadows constant", shadowed));
+        let mut late = base.clone();
+        late.blocks
+            .get_mut(&Block(0))
+            .unwrap()
+            .instructions
+            .swap(0, 1);
+        cases.push(("constant follows use", late));
+        let mut sibling = base.clone();
+        let constant = sibling
+            .blocks
+            .get_mut(&Block(0))
+            .unwrap()
+            .instructions
+            .remove(0);
+        sibling.blocks.insert(
+            Block(1),
+            BasicBlock {
+                params: vec![],
+                instructions: vec![constant],
+                source_locs: vec![],
+            },
+        );
+        cases.push(("constant in sibling block", sibling));
+        for count in [2, 4] {
+            let mut malformed_bulk = base.clone();
+            malformed_bulk
+                .blocks
+                .get_mut(&Block(0))
+                .unwrap()
+                .instructions[1]
+                .args
+                .resize(count, Value(0));
+            cases.push(("wrong bulk argument count", malformed_bulk));
+        }
+        let mut result = base.clone();
+        result.blocks.get_mut(&Block(0)).unwrap().instructions[1]
+            .results
+            .push(Value(4));
+        cases.push(("bulk has a result", result));
+        let mut nonzero_fill = lir_with_constant_bulk(LirOpcode::Memset, 0);
+        nonzero_fill.blocks.get_mut(&Block(0)).unwrap().instructions[1].opcode =
+            LirOpcode::Iconst {
+                ty: Type::I32,
+                imm: 1,
+            };
+        cases.push(("memset retains nonzero-fill libcall", nonzero_fill));
+        for (label, lir) in cases {
+            assert!(
+                kinds(&bulk_with_no_machine_effect(&lir, "aarch64"))
+                    .contains(&DataflowViolationKind::UnwitnessedEffect),
+                "{label}"
+            );
+        }
+    }
 
     /// PINNED REFUTATION (c): an effectful LIR store with NO emitted machine
     /// instruction stamped from it fails closed — the store-drop shape.

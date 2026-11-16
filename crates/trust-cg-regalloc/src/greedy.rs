@@ -485,6 +485,11 @@ pub struct GreedyAllocator {
     /// Per vreg, call positions where the call reads it for the last time
     /// (see [`Self::set_call_operand_exempt`]). Empty by default.
     call_operand_exempt: BTreeMap<VReg, Vec<u32>>,
+    /// See [`Self::set_avoid_claimed_hint_regs`]. `false` by default.
+    avoid_claimed_hint_regs: bool,
+    /// `(first hint, vreg)` of every interval whose hint list names at most
+    /// two registers, built by [`Self::set_avoid_claimed_hint_regs`].
+    hint_claims: Vec<(PReg, VReg)>,
     /// Physical registers reserved at specific instruction positions by
     /// implicit defs, such as call-clobbered ABI registers.
     reserved_regs: BTreeMap<PReg, Vec<u32>>,
@@ -600,6 +605,8 @@ impl GreedyAllocator {
             hints,
             hint_exempt: BTreeMap::new(),
             call_operand_exempt: BTreeMap::new(),
+            avoid_claimed_hint_regs: false,
+            hint_claims: Vec::new(),
             reserved_regs,
             reserved_union: std::cell::RefCell::new(BTreeMap::new()),
             max_cascade_depth: 10,
@@ -661,6 +668,54 @@ impl GreedyAllocator {
     /// strict check.
     pub fn set_call_operand_exempt(&mut self, exempt: BTreeMap<VReg, Vec<u32>>) {
         self.call_operand_exempt = exempt;
+    }
+
+    /// When picking a free register for an interval whose hints are all
+    /// unusable (or that has none), first skip every register that is the
+    /// FIRST hint of another interval that is still unassigned and overlaps
+    /// this one, and fall back to the plain first-free order only when every
+    /// free register is so claimed.
+    ///
+    /// Why: intervals are assigned in weight order, and a short temporary
+    /// outweighs a long incoming argument. Without this the temporary takes
+    /// the first free register in pool order, which is often the argument's
+    /// own register, and the argument's hint (its identity copy) is lost
+    /// although another register was free for the temporary. A preference
+    /// only: the candidate is checked against the same interference model as
+    /// any other, so the choice among free registers is all it can change.
+    /// `false` (the default) reproduces the historical behavior exactly.
+    ///
+    /// Only a hint list of at most two registers makes a claim: that is an
+    /// identity-copy hint (an ABI copy, possibly named twice). A longer list
+    /// is a call-crossing preference for the whole callee-saved set, which
+    /// claims nothing in particular and would make the check scale with the
+    /// number of call-crossing intervals.
+    pub fn set_avoid_claimed_hint_regs(&mut self, avoid: bool) {
+        self.avoid_claimed_hint_regs = avoid;
+        self.hint_claims = if avoid {
+            self.hints
+                .iter()
+                .filter(|(_, regs)| regs.len() <= 2)
+                .filter_map(|(vreg, regs)| regs.first().map(|preg| (*preg, *vreg)))
+                .collect()
+        } else {
+            Vec::new()
+        };
+    }
+
+    /// Whether `preg` is claimed (see [`Self::set_avoid_claimed_hint_regs`])
+    /// by another unassigned interval that overlaps `interval`.
+    fn claimed_by_other_hint(&self, vreg: VReg, interval: &LiveInterval, preg: PReg) -> bool {
+        self.hint_claims.iter().any(|(claimed, other)| {
+            *other != vreg
+                && allocator_pregs_overlap(*claimed, preg)
+                && !self.is_assigned(*other)
+                && !self.is_spilled(*other)
+                && self
+                    .intervals
+                    .get(other)
+                    .is_some_and(|other_iv| interval.overlaps(other_iv))
+        })
     }
 
     fn call_operand_exempt_for(&self, vreg: VReg, interval: &LiveInterval) -> Vec<u32> {
@@ -929,7 +984,15 @@ impl GreedyAllocator {
             }
         }
 
-        // Try all allocatable registers.
+        // Try all allocatable registers, leaving the registers other
+        // intervals are hinted to for last when that is enabled.
+        if self.avoid_claimed_hint_regs
+            && let Some(&preg) = allocatable.iter().find(|&&preg| {
+                !self.interferes(vreg, preg) && !self.claimed_by_other_hint(vreg, interval, preg)
+            })
+        {
+            return Some(preg);
+        }
         allocatable
             .iter()
             .find(|&&preg| !self.interferes(vreg, preg))
@@ -2098,6 +2161,108 @@ mod tests {
         assert_eq!(result.allocation.len(), 2);
         // v0 should have received its hint register.
         assert_eq!(result.allocation[&vreg(0)], PReg::new(5));
+    }
+
+    /// A heavier unhinted temporary allocated first leaves the register that a
+    /// lighter overlapping interval is hinted to free when
+    /// `avoid_claimed_hint_regs` is on, and takes it when it is off.
+    #[test]
+    fn claimed_hint_register_is_left_to_its_claimant() {
+        let run = |avoid: bool| {
+            let intervals = vec![
+                make_interval(0, &[(0, 10)], 1.0), // hinted to r0, light
+                make_interval(1, &[(2, 4)], 50.0), // unhinted temporary, heavy
+            ];
+            let mut hints = BTreeMap::new();
+            hints.insert(vreg(0), vec![PReg::new(0)]);
+            let mut alloc = GreedyAllocator::new(intervals, &two_gpr_regs(), hints);
+            alloc.set_avoid_claimed_hint_regs(avoid);
+            alloc.allocate().unwrap().allocation
+        };
+        let on = run(true);
+        assert_eq!(on[&vreg(1)], PReg::new(1));
+        assert_eq!(on[&vreg(0)], PReg::new(0));
+        let off = run(false);
+        assert_eq!(off[&vreg(1)], PReg::new(0));
+        assert_eq!(off[&vreg(0)], PReg::new(1));
+    }
+
+    /// A claimant that is already assigned (here elsewhere than its hint,
+    /// which a heavier interval holds) claims nothing any more.
+    #[test]
+    fn assigned_claimant_claims_nothing() {
+        let intervals = vec![
+            make_interval(2, &[(0, 3)], 100.0), // takes r0 first, by hint
+            make_interval(0, &[(0, 10)], 50.0), // hinted to r0, gets r1
+            make_interval(1, &[(5, 8)], 10.0),  // r0 is free again here
+        ];
+        let mut hints = BTreeMap::new();
+        hints.insert(vreg(0), vec![PReg::new(0)]);
+        // v2 takes r0 through its own hint (the hint path ignores claims).
+        hints.insert(vreg(2), vec![PReg::new(0)]);
+        let mut regs = BTreeMap::new();
+        regs.insert(
+            RegClass::Gpr64,
+            vec![PReg::new(0), PReg::new(1), PReg::new(2)],
+        );
+        let mut alloc = GreedyAllocator::new(intervals, &regs, hints);
+        alloc.set_avoid_claimed_hint_regs(true);
+        let allocation = alloc.allocate().unwrap().allocation;
+        assert_eq!(allocation[&vreg(2)], PReg::new(0));
+        assert_eq!(allocation[&vreg(0)], PReg::new(1));
+        assert_eq!(allocation[&vreg(1)], PReg::new(0));
+    }
+
+    /// A hint list naming more than two registers (a call-crossing
+    /// preference) claims nothing.
+    #[test]
+    fn long_hint_list_claims_nothing() {
+        let intervals = vec![
+            make_interval(0, &[(0, 10)], 1.0),
+            make_interval(1, &[(2, 4)], 50.0),
+        ];
+        let mut hints = BTreeMap::new();
+        hints.insert(vreg(0), vec![PReg::new(0), PReg::new(1), PReg::new(2)]);
+        let mut regs = BTreeMap::new();
+        regs.insert(
+            RegClass::Gpr64,
+            vec![PReg::new(0), PReg::new(1), PReg::new(2)],
+        );
+        let mut alloc = GreedyAllocator::new(intervals, &regs, hints);
+        alloc.set_avoid_claimed_hint_regs(true);
+        let allocation = alloc.allocate().unwrap().allocation;
+        assert_eq!(allocation[&vreg(1)], PReg::new(0));
+    }
+
+    /// The avoidance is a preference: with every free register claimed the
+    /// temporary still gets one, and a claim by a NON-overlapping interval
+    /// does not count.
+    #[test]
+    fn claimed_hint_register_is_still_used_when_nothing_else_is_free() {
+        let intervals = vec![
+            make_interval(0, &[(0, 10)], 1.0),
+            make_interval(1, &[(2, 4)], 50.0),
+            make_interval(2, &[(20, 30)], 1.0), // claims r1 but never overlaps v1
+        ];
+        let mut hints = BTreeMap::new();
+        hints.insert(vreg(0), vec![PReg::new(0)]);
+        hints.insert(vreg(2), vec![PReg::new(1)]);
+        let mut alloc = GreedyAllocator::new(intervals, &two_gpr_regs(), hints);
+        alloc.set_avoid_claimed_hint_regs(true);
+        let allocation = alloc.allocate().unwrap().allocation;
+        assert_eq!(allocation[&vreg(1)], PReg::new(1));
+        assert_eq!(allocation[&vreg(0)], PReg::new(0));
+
+        let intervals = vec![
+            make_interval(0, &[(0, 10)], 1.0),
+            make_interval(1, &[(2, 4)], 50.0),
+        ];
+        let mut hints = BTreeMap::new();
+        hints.insert(vreg(0), vec![PReg::new(0)]);
+        let mut alloc = GreedyAllocator::new(intervals, &one_gpr_regs(), hints);
+        alloc.set_avoid_claimed_hint_regs(true);
+        let allocation = alloc.allocate().unwrap().allocation;
+        assert_eq!(allocation[&vreg(1)], PReg::new(0));
     }
 
     /// A hint toward a register that is RESERVED inside the interval is refused

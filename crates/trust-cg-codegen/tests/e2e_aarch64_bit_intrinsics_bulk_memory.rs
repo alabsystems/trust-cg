@@ -4,7 +4,8 @@
 // `BinOp::RotL`/`RotR`/`FCopySign`, `UnOp::CtLz`/`CtTz`/`BSwap`/`BitReverse`
 // and `Inst::MemCopy`/`MemSet`. None has a single LIR opcode; the adapter
 // expands the bit operations into covered shift/mask/popcount opcodes and the
-// bulk-memory pair into the libc memcpy/memmove/memset intrinsics. This
+// bulk-memory pair into shared memcpy/memmove/memset intrinsics, with small
+// constant copies expanded inline. This
 // compiles one module at O0-O3, links it against a C driver that recomputes
 // every result with its own bit-by-bit reference (not a compiler builtin), and
 // executes it: every width, the zero operand (`ctlz 0 = cttz 0 = width`),
@@ -80,9 +81,8 @@ fn mem_copy(builder: &mut ModuleBuilder, name: &str, overlap: bool) {
     f.build();
 }
 
-/// `fn copy16(dst: ptr, src: ptr) { memcopy dst, src, 16 }`: a constant
-/// count, which instruction selection copies inline.
-fn mem_copy_constant(builder: &mut ModuleBuilder, name: &str, count: i128) {
+/// A constant-count copy, including the overlapping memmove form.
+fn mem_copy_constant(builder: &mut ModuleBuilder, name: &str, count: i128, overlap: bool) {
     let sig = builder.add_func_type(vec![Ty::Ptr, Ty::Ptr], vec![]);
     let mut f = builder.function(name, sig);
     let entry = f.create_block();
@@ -90,7 +90,7 @@ fn mem_copy_constant(builder: &mut ModuleBuilder, name: &str, count: i128) {
     let src = f.add_block_param(entry, Ty::Ptr);
     f.switch_to_block(entry);
     let n = f.iconst(Ty::U64, count);
-    f.memcopy(dst, src, n, false);
+    f.memcopy(dst, src, n, overlap);
     f.ret(vec![]);
     f.build();
 }
@@ -186,7 +186,7 @@ fn bit_intrinsics_module() -> trust_ir::Module {
     binary(&mut builder, "copysign_f64", BinOp::FCopySign, Ty::F64);
     mem_copy(&mut builder, "mem_copy", false);
     mem_copy(&mut builder, "mem_move", true);
-    mem_copy_constant(&mut builder, "mem_copy16", 16);
+    mem_copy_constant(&mut builder, "mem_copy16", 16, false);
     mem_set(&mut builder, "mem_set");
     mem_zero(&mut builder, "mem_zero");
     builder.build().expect("ModuleBuilder::build: test fixture")
@@ -449,6 +449,10 @@ int main(void) {
 "#;
 
 fn link_run(object: &[u8], tag: &str) -> Option<(i32, String)> {
+    link_run_driver(object, tag, DRIVER)
+}
+
+fn link_run_driver(object: &[u8], tag: &str, driver: &str) -> Option<(i32, String)> {
     if !native_host::NATIVE {
         eprintln!("SKIP: needs an AArch64 Linux GNU or macOS host");
         return None;
@@ -460,7 +464,7 @@ fn link_run(object: &[u8], tag: &str) -> Option<(i32, String)> {
     let driver_path = dir.join("driver.c");
     let binary_path = dir.join("driver");
     fs::write(&object_path, object).unwrap();
-    fs::write(&driver_path, DRIVER).unwrap();
+    fs::write(&driver_path, driver).unwrap();
     let link = Command::new("cc")
         .arg("-O1")
         .arg("-fno-builtin")
@@ -477,7 +481,8 @@ fn link_run(object: &[u8], tag: &str) -> Option<(i32, String)> {
         String::from_utf8_lossy(&link.stderr)
     );
     let run = Command::new(&binary_path).output().expect("run driver");
-    let stdout = String::from_utf8_lossy(&run.stdout).into_owned();
+    let mut stdout = String::from_utf8_lossy(&run.stdout).into_owned();
+    stdout.push_str(&String::from_utf8_lossy(&run.stderr));
     let code = run.status.code().unwrap_or(-1);
     if code == 0 {
         let _ = fs::remove_dir_all(&dir);
@@ -504,6 +509,143 @@ fn e2e_aarch64_ws320_bit_intrinsics_and_bulk_memory_match_c_reference() {
         assert_eq!(code, 0, "{opt_level:?}: {stdout}");
         eprintln!("{opt_level:?}: {}", stdout.trim());
     }
+}
+
+fn constant_memmove_module() -> trust_ir::Module {
+    let mut builder = ModuleBuilder::new("constant_memmove_snapshot");
+    for count in 0..=32 {
+        mem_copy_constant(&mut builder, &format!("move_{count}"), count, true);
+    }
+    builder.build().expect("constant memmove fixture")
+}
+
+#[test]
+fn e2e_aarch64_constant_memmove_preserves_overlap_and_exact_guarded_extents() {
+    let mut driver = String::from(
+        "#include <stdint.h>\n#include <stdio.h>\n#include <string.h>\n#include <sys/mman.h>\n#include <unistd.h>\n",
+    );
+    for count in 0..=32 {
+        driver.push_str(&format!(
+            "extern void move_{count}(void *, const void *);\n"
+        ));
+    }
+    driver.push_str("static void (*moves[])(void *, const void *) = {\n");
+    for count in 0..=32 {
+        driver.push_str(&format!("move_{count},\n"));
+    }
+    driver.push_str(
+        r#"};
+int main(void) {
+    static const unsigned pairs[][2] = {
+        {0,0}, {1,0}, {0,1}, {3,0}, {0,3}, {7,0}, {0,7},
+        {16,0}, {0,16}, {40,0}, {0,40}
+    };
+    moves[0](NULL, NULL);
+    for (unsigned n = 1; n <= 32; n++) {
+        for (unsigned k = 0; k < sizeof(pairs)/sizeof(pairs[0]); k++) {
+            unsigned char got[128], want[128];
+            for (unsigned i = 0; i < sizeof(got); i++)
+                got[i] = want[i] = (unsigned char)(i * 13 + n * 7);
+            unsigned dst = pairs[k][0], src = pairs[k][1];
+            moves[n](got + dst, got + src);
+            memmove(want + dst, want + src, n);
+            if (memcmp(got, want, sizeof(got))) {
+                fprintf(stderr, "overlap n=%u dst=%u src=%u\n", n, dst, src);
+                return 1;
+            }
+        }
+        long page = sysconf(_SC_PAGESIZE);
+        if (page <= 32) return 2;
+        unsigned char *a = mmap(NULL, 2 * (size_t)page, PROT_READ|PROT_WRITE,
+                               MAP_PRIVATE|MAP_ANON, -1, 0);
+        unsigned char *b = mmap(NULL, 2 * (size_t)page, PROT_READ|PROT_WRITE,
+                               MAP_PRIVATE|MAP_ANON, -1, 0);
+        if (a == MAP_FAILED || b == MAP_FAILED) return 3;
+        if (mprotect(a + page, (size_t)page, PROT_NONE) ||
+            mprotect(b + page, (size_t)page, PROT_NONE)) return 4;
+        for (unsigned i = 0; i < n; i++) a[page - n + i] = (unsigned char)(i + n);
+        moves[n](b + page - n, a + page - n);
+        if (memcmp(b + page - n, a + page - n, n)) return 5;
+        if (munmap(a, 2 * (size_t)page) || munmap(b, 2 * (size_t)page)) return 6;
+    }
+    puts("constant memmove: every length, overlap direction, and guarded extent match");
+    return 0;
+}
+"#,
+    );
+    let module = constant_memmove_module();
+    for opt_level in [OptLevel::O0, OptLevel::O1, OptLevel::O2, OptLevel::O3] {
+        let compiler = Compiler::new(CompilerConfig {
+            opt_level,
+            ..CompilerConfig::default()
+        })
+        .with_codegen_license(permit_unlicensed());
+        let object = compiler
+            .compile(&module)
+            .unwrap_or_else(|error| panic!("{opt_level:?}: {error:?}"))
+            .object_code;
+        let Some((code, stdout)) =
+            link_run_driver(&object, &format!("constant_memmove_{opt_level:?}"), &driver)
+        else {
+            return;
+        };
+        assert_eq!(code, 0, "{opt_level:?}: {stdout}");
+        eprintln!("{opt_level:?}: {}", stdout.trim());
+    }
+}
+
+#[test]
+fn constant_memmove_instruction_evidence_does_not_supply_a_body_license() {
+    use trust_cg_codegen::compiler::CompileError;
+    use trust_cg_lower::AdapterError;
+
+    let module = constant_memmove_module();
+    assert!(
+        module
+            .functions
+            .iter()
+            .all(|function| function.body_gate.is_none())
+    );
+    let config = CompilerConfig {
+        emit_proofs: true,
+        ..CompilerConfig::default()
+    };
+    let strict = Compiler::new(config.clone());
+    let assert_unlicensed = || match strict.compile(&module) {
+        Err(CompileError::Adapter(AdapterError::UnlicensedBody { function })) => {
+            assert_eq!(function, "move_0");
+        }
+        Err(error) => panic!("unexpected admission refusal: {error}"),
+        Ok(_) => panic!("instruction evidence must not license an unlicensed source body"),
+    };
+    assert_unlicensed();
+
+    // This diagnostic policy explicitly permits hand-built source bodies.
+    // emit_proofs requests target instruction/object reports; its documented
+    // contract does not construct a source license or a certified pass chain.
+    let result = Compiler::new(config)
+        .with_codegen_license(permit_unlicensed())
+        .compile(&module)
+        .unwrap_or_else(|error| panic!("constant instruction evidence: {error}"));
+    let proofs = result
+        .proofs
+        .as_ref()
+        .expect("requested instruction evidence");
+    assert!(!proofs.is_empty());
+    assert!(proofs.iter().all(|proof| proof.verified));
+    assert!(
+        proofs
+            .iter()
+            .all(|proof| proof.source_bound_obligation.is_none())
+    );
+    assert!(result.certified_pass_chain.is_none());
+    assert!(
+        module
+            .functions
+            .iter()
+            .all(|function| function.body_gate.is_none())
+    );
+    assert_unlicensed();
 }
 
 /// Since trust-ir's v51 INST wire batch (`e2154f00`) every WS3.20 sub-op and

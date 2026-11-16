@@ -76,8 +76,7 @@ def singletonClass {w : Nat} (a : BV w) : EClass w :=
   { rep := a, members := [a], equiv := by
       intro m hm
       simp at hm
-      subst hm
-      exact bvEq_refl a }
+      exact hm.symm }
 
 theorem singleton_rep {w : Nat} (a : BV w) : (singletonClass a).rep = a := rfl
 

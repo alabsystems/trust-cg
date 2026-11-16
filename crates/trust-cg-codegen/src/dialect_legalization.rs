@@ -2939,6 +2939,14 @@ fn inst_types_mut(inst: &mut Inst, mut visit: impl FnMut(&mut Ty)) {
             visit(src_ty);
             visit(dst_ty);
         }
+        // trust-ir v74: the pointer type and the pointee the validity fact is
+        // about. The fact itself spells no type.
+        Inst::BoxDeref {
+            ptr_ty, pointee, ..
+        } => {
+            visit(ptr_ty);
+            visit(pointee.ty_mut());
+        }
         Inst::GEP { pointee_ty, .. } => visit(pointee_ty),
         Inst::PtrData { ptr_ty, .. } => visit(ptr_ty),
         Inst::PtrMetadata {

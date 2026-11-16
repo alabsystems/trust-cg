@@ -209,6 +209,7 @@ pub(super) enum MissingApi {
     GenericArgsRef,
     SuperClausesQuery,
     OwnClausesQuery,
+    BoxDerefFacts,
 }
 
 fn primary_span_matches(diagnostic: &Value, path: &Path, source: &str, token: &str) -> bool {
@@ -297,7 +298,8 @@ fn exact_absence(diagnostics: &[Value], api: MissingApi, path: &Path, source: &s
         | MissingApi::BackendLaneCount
         | MissingApi::BoundFnArgs
         | MissingApi::SuperClausesQuery
-        | MissingApi::OwnClausesQuery => [
+        | MissingApi::OwnClausesQuery
+        | MissingApi::BoxDerefFacts => [
             "For more information about this error, try `rustc --explain E0599`.",
             "For more information about this error, try `trustc --explain E0599`.",
         ],
@@ -478,6 +480,11 @@ fn exact_absence(diagnostics: &[Value], api: MissingApi, path: &Path, source: &s
             code == Some("E0599")
                 && message == "no method named `clauses_of` found for struct `TyCtxt<'tcx>` in the current scope"
                 && primary_span_matches(diagnostic, path, source, "clauses_of")
+        }
+        MissingApi::BoxDerefFacts => {
+            code == Some("E0599")
+                && message == "no method named `trust_box_deref_facts` found for struct `TyCtxt<'tcx>` in the current scope"
+                && primary_span_matches(diagnostic, path, source, "trust_box_deref_facts")
         }
         MissingApi::BooleanCastPadding => {
             code == Some("E0026")

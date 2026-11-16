@@ -8,12 +8,15 @@
 //! positions `Inst::visit_value_operands` reports, in the same order, and
 //! replacing through it is seen by the read-only walk.
 
+use trust_ir::box_validity::{
+    BoxDerefSite, BoxFactSession, BoxPointee, BoxValidityFact, PremiseRoot,
+};
 use trust_ir::inst::{AllocOrigin, BindingFrameDef, BindingSlot};
 use trust_ir::value::{BindingFrameId, ClosureTyId, GlobalId};
 use trust_ir::{
     AssertKind, AssertOverflowOp, AtomicRMWOp, BinOp, BlockId, CallingConv, CastOp, Constant,
-    DialectInst, FCmpOp, FuncId, FuncTyId, ICmpOp, Inst, Ordering, OverflowOp, PanicLocation,
-    PanicSite, SwitchCase, Ty, UnOp, ValueId,
+    DialectInst, FCmpOp, FuncId, FuncTyId, ICmpOp, Inst, InstrNode, Ordering, OverflowOp,
+    PanicLocation, PanicSite, SwitchCase, Ty, UnOp, ValueId,
 };
 
 use super::{for_each_operand_mut, operands, replace_operands};
@@ -24,6 +27,17 @@ fn v(n: u32) -> ValueId {
 
 fn vs(range: std::ops::Range<u32>) -> Vec<ValueId> {
     range.map(ValueId).collect()
+}
+
+fn box_fact() -> BoxValidityFact {
+    BoxValidityFact::premise(
+        BoxDerefSite {
+            item: [0x5a; 16],
+            ordinal: 0,
+        },
+        BoxFactSession::PROOF_SNAPSHOT,
+        PremiseRoot::ParamByValue,
+    )
 }
 
 #[allow(clippy::too_many_lines)]
@@ -265,6 +279,12 @@ fn every_variant() -> Vec<Inst> {
             ty: Ty::I32,
             operand: v(1),
         },
+        Inst::BoxDeref {
+            ptr_ty: Ty::Ptr,
+            pointee: BoxPointee::Sized { ty: Ty::I64 },
+            operand: v(1),
+            fact: Box::new(box_fact()),
+        },
         Inst::Select {
             ty: Ty::I32,
             cond: v(1),
@@ -479,5 +499,42 @@ fn mutable_walk_matches_visit_value_operands_on_every_variant() {
         assert!(!replace_operands(&mut long, &extra));
     }
     // Every variant of the pinned `Inst` was built at least once.
-    assert_eq!(shapes.len(), 74, "variant shapes built");
+    assert_eq!(shapes.len(), 75, "variant shapes built");
+}
+
+#[test]
+fn box_deref_remaps_only_its_pointer_operand() {
+    let fact = box_fact();
+    let pointee = BoxPointee::Sized { ty: Ty::I64 };
+    let original = InstrNode::new(Inst::BoxDeref {
+        ptr_ty: Ty::Ptr,
+        pointee: pointee.clone(),
+        operand: v(1),
+        fact: Box::new(fact.clone()),
+    })
+    .with_result(v(2));
+    let mut remapped = original.clone();
+    assert!(replace_operands(&mut remapped.inst, &[v(101)]));
+
+    let Inst::BoxDeref {
+        ptr_ty,
+        pointee: remapped_pointee,
+        operand,
+        fact: remapped_fact,
+    } = &remapped.inst
+    else {
+        panic!("BoxDeref remapped to another instruction")
+    };
+    assert_eq!(*operand, v(101), "the SSA pointer operand is remapped");
+    assert_eq!(*ptr_ty, Ty::Ptr, "the pointer type is not an operand");
+    assert_eq!(remapped_pointee, &pointee, "the pointee shape is preserved");
+    assert_eq!(
+        remapped_fact.as_ref(),
+        &fact,
+        "the judged fact is preserved"
+    );
+    assert_eq!(
+        remapped.results, original.results,
+        "the result ids are not operands"
+    );
 }

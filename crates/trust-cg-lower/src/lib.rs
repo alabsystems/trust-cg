@@ -22,6 +22,7 @@ pub mod aggregate_call_transport;
 pub mod bitfield_dialect;
 pub mod block_arguments;
 pub mod borrow_frame_undef;
+pub mod box_deref;
 pub mod codegen_license;
 mod codegen_metadata;
 pub mod compute_graph;
@@ -211,6 +212,10 @@ pub use adapter::{
     translate_validated_module_strict_for_core_qualification, validate_codegen_prerequisites,
     validate_function_codegen_prerequisites, with_x86_i128_mulo_division_form,
     x86_swift_budget_is_witnessed_for_abi,
+};
+pub use box_deref::{
+    BoxDerefDisclosure, BoxDerefDisclosureRecord, BoxDerefManifest, BoxDerefManifestRow,
+    BoxDerefRefusal, BoxValidityFloor, admit_box_derefs,
 };
 pub use codegen_license::{
     CLEAN_KERNEL_TV_AUTHORITY, CodegenLicensePolicy, UnlicensedBodyPolicy,

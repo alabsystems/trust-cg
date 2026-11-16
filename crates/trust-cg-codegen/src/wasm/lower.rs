@@ -977,6 +977,8 @@ fn result_tys_with(
         | Inst::PtrData { .. } => one(Ty::Ptr),
         Inst::PtrMetadata { metadata_ty, .. } => one(metadata_ty.clone()),
         Inst::PtrFromParts { ptr_ty, .. } => one(ptr_ty.clone()),
+        // trust-ir v74: the operand's pointer, unchanged, at `ptr_ty`.
+        Inst::BoxDeref { ptr_ty, .. } => one(ptr_ty.clone()),
         Inst::Call { callee, .. } => module
             .function_by_id(*callee)
             .and_then(|f| module.func_type(f.ty))
@@ -4390,6 +4392,23 @@ impl<'a> Lowering<'a> {
             Inst::Borrow { ptr } | Inst::BorrowMut { ptr } => {
                 let r = self.result1(results)?;
                 self.alias(r, *ptr)?;
+            }
+            // trust-ir v74 `Inst::BoxDeref`, admitted by the ONE acceptance
+            // check both wasm module entries and the single-function entry
+            // run before any body is walked (`trust_cg_lower::box_deref`,
+            // through `validate_codegen_prerequisites`, the shared floor and
+            // the codegen license). The result IS the operand, as a borrow's
+            // is. The pointee and the fact are deliberately unread: no check
+            // is removed and no memory access is emitted or moved on the
+            // strength of a named assumption (section 28, "No licence").
+            Inst::BoxDeref {
+                ptr_ty: _,
+                pointee: _,
+                operand,
+                fact: _,
+            } => {
+                let r = self.result1(results)?;
+                self.alias(r, *operand)?;
             }
             Inst::EndBorrow { .. } => {}
             Inst::Alloca { .. } => {
@@ -7833,6 +7852,13 @@ pub fn compile_object_with_evidence_license_options_hints(
         // nothing here checks what it binds them to.
         "link_verification",
     ];
+    // trust-ir v74: a module holding an `Inst::BoxDeref` compiled only
+    // because the license opted into the named-premise floor. Its Box
+    // validity is ASSUMED, never established here; the assumptions are in
+    // the license's `BoxDerefDisclosure`.
+    if trust_cg_lower::box_deref::module_has_box_deref(module) {
+        not_run.push(BOX_VALIDITY_NOT_ESTABLISHED);
+    }
     if local_emission.optimized > 0 {
         ran.push("wasm_local_emission_tv");
     }
@@ -9543,6 +9569,11 @@ pub fn compile_sized_closed_module_with_evidence_license_options(
     )
 }
 
+/// The [`WasmCompileEvidence::not_run`] entry of a module compiled under a
+/// named Box validity assumption (trust-ir v74 `Inst::BoxDeref` admitted at
+/// the license's opt-in floor): nothing established that validity.
+pub const BOX_VALIDITY_NOT_ESTABLISHED: &str = "box_validity_establishment";
+
 /// The closed-module evidence entries' shared body.
 fn compile_module_evidence(
     module: &Module,
@@ -9598,6 +9629,13 @@ fn compile_module_evidence(
         // the stack base names a region only this island may touch.
         "host_contract_verification",
     ];
+    // trust-ir v74: a module holding an `Inst::BoxDeref` compiled only
+    // because the license opted into the named-premise floor. Its Box
+    // validity is ASSUMED, never established here; the assumptions are in
+    // the license's `BoxDerefDisclosure`.
+    if trust_cg_lower::box_deref::module_has_box_deref(module) {
+        not_run.push(BOX_VALIDITY_NOT_ESTABLISHED);
+    }
     if local_emission.optimized > 0 {
         ran.push("wasm_local_emission_tv");
     }

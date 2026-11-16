@@ -248,7 +248,8 @@ pub(crate) fn direct_enum_def<'a>(ty: &Ty, enums: &'a [EnumDef]) -> Option<&'a E
         Some(
             EnumTagEncoding::Niche { .. }
             | EnumTagEncoding::Untagged
-            | EnumTagEncoding::SingleInhabited { .. },
+            | EnumTagEncoding::SingleInhabited { .. }
+            | EnumTagEncoding::DirectWithUninhabited { .. },
         ) => None,
     }
 }
@@ -292,6 +293,12 @@ pub(crate) fn enum_layout_matches_canonical(
         EnumTagEncoding::Untagged | EnumTagEncoding::SingleInhabited { .. } => {
             return Err(
                 "untagged encoding; the LIR enum has no tag-free representation".to_string(),
+            );
+        }
+        EnumTagEncoding::DirectWithUninhabited { .. } => {
+            return Err(
+                "direct-with-uninhabited encoding is not yet represented by the native enum carrier"
+                    .to_string(),
             );
         }
     };

@@ -60,6 +60,7 @@ const PIN_MOVE: &str = "crates/trust-cg-lower/tests/pin_move_floor.rs";
 const HANDLE: &str = "crates/trust-cg-lower/tests/v43_opaque_handle.rs";
 const SELF_FILE: &str = "crates/trust-cg-lower/tests/trust_ir_construct_inventory.rs";
 const LW_DEALLOC: &str = "crates/trust-cg-lower/tests/trust_ir_dealloc_refusal.rs";
+const LW_BOX_DEREF: &str = "crates/trust-cg-lower/tests/box_deref_admission.rs";
 /// The test in this file that drives every `Refused` row; rows with no other
 /// pin name it.
 const REFUSAL_GATE: &str = "refused_rows_are_refused_by_the_adapter_by_name";
@@ -135,6 +136,7 @@ variant_inventory!(ty_variant_name, TY_VARIANTS, Ty, [
     Ty::Dialect(..) => "Dialect",
     Ty::Handle(..) => "Handle",
     Ty::Tensor(..) => "Tensor",
+    Ty::FnItem(..) => "FnItem",
 ], uninhabited: [
     Ty::Ext(e) => e.unreachable(),
 ]);
@@ -214,6 +216,7 @@ variant_inventory!(inst_variant_name, INST_VARIANTS, Inst, [
     Inst::TensorView { .. } => "TensorView",
     Inst::TensorGather { .. } => "TensorGather",
     Inst::TensorScatter { .. } => "TensorScatter",
+    Inst::BoxDeref { .. } => "BoxDeref",
 ]);
 
 variant_inventory!(constant_variant_name, CONSTANT_VARIANTS, Constant, [
@@ -235,6 +238,7 @@ variant_inventory!(constant_variant_name, CONSTANT_VARIANTS, Constant, [
     Constant::Uninit => "Uninit",
     Constant::Splat { .. } => "Splat",
     Constant::TensorBlob { .. } => "TensorBlob",
+    Constant::FnItem(..) => "FnItem",
 ], uninhabited: [
     Constant::Ext(e) => e.unreachable(),
 ]);
@@ -459,6 +463,8 @@ fn ty_rows() -> Vec<Row> {
         row(T, "Tuple", executed(cg!("e2e_aarch64_nested_bytes"), "native_nested_tuple_bytes_and_empty_leaf_o0_through_o3"), "Ty::Tuple", "nested tuples with an empty leaf"),
         row(T, "Enum", executed(cg!("e2e_aarch64_direct_enums"), "native_direct_enums_agree_with_the_c_oracle_and_the_interpreter_o0_through_o3"), "Ty::Enum", "direct-tag enums against a C oracle and the reference interpreter"),
         row(T, "Func", executed(cg!("e2e_aarch64_closures"), "nested_closure_fndef_and_symbol_addr_constants_materialize_at_every_level"), "Ty::Func", "function-typed constants reified and called"),
+        row(T, "FnItem", refused(&["Ty::FnItem", "no native value ABI", "function-item coercion"], SELF_FILE, REFUSAL_GATE), "Ty::FnItem", "v73 nominal zero-storage function identity: never a code pointer or an ABI value until an explicit coercion reifies it")
+            .probe(probe_fn_item_type),
         row(T, "Ref", executed(cg!("e2e_aarch64_construct_sweep_types"), "native_reference_carriers_load_and_store_through_ptr_to_ptr_o0_through_o3"), "Ty::Ref(", "shared reference parameter loaded through, from `PtrToPtr` and from C, against the interpreter and C")
             .probe(probe_reference_pointer_carriers),
         row(T, "RefMut", executed(cg!("e2e_aarch64_construct_sweep_types"), "native_reference_carriers_load_and_store_through_ptr_to_ptr_o0_through_o3"), "Ty::RefMut", "unique reference parameter stored and reloaded through, against the interpreter and C")
@@ -615,6 +621,9 @@ fn inst_rows() -> Vec<Row> {
         row(I, "ArraySplat", executed(cg!("e2e_aarch64_construct_sweep_insts"), "native_array_splat_and_splat_constants_fill_every_lane_o0_through_o3"), "Inst::ArraySplat", "v50 `[v; n]` from a register: a mixed-byte lane stored once then doubled, a byte-uniform constant register as one memset, a tuple lane copied then doubled, each read back by a runtime index against the interpreter and C; the lowering is constant-size in n (`array_splat_lowering`); a non-array type is refused")
             .probe(probe_array_splat)
             .negative(&["Inst::ArraySplat", "not an array"], probe_array_splat_non_array),
+        row(I, "BoxDeref", model_only(LW_BOX_DEREF, "an_admitted_box_deref_lowers_to_one_copy_and_takes_no_licence"), ".box_deref(", "v74 pointer-preserving Box dereference carrying a validity fact: refused by the default consumer-rederived floor and by proof-required lanes; lowered as one value-preserving copy, taking no licence from the fact, only under the diagnostic lane's disclosed named-premise opt-in")
+            .probe(probe_box_deref_named_premise)
+            .negative(&["Inst::BoxDeref is not admitted", "below this lane's Box validity floor consumer_rederived"], probe_box_deref_default_license),
     ]
 }
 
@@ -760,6 +769,18 @@ fn constant_rows() -> Vec<Row> {
             &["const type mismatch: expected a unique module-owned function item, got missing or ambiguous func.99"],
             probe_fndef_unregistered,
         ),
+        row(
+            C,
+            "FnItem",
+            refused(
+                &["[TCG-FN-ITEM]", "nominal zero-sized identity", "explicit coercion"],
+                SELF_FILE,
+                REFUSAL_GATE,
+            ),
+            "Constant::FnItem",
+            "v73 zero-byte nominal function identity; native lowering refuses to invent an address-bearing Ty::Func value",
+        )
+        .probe(probe_fn_item_constant),
         row(
             C,
             "SymbolAddr",
@@ -1148,6 +1169,10 @@ fn probe_storage_value() -> Result<String, String> {
 
 fn probe_error_type() -> Result<String, String> {
     type_lowers(&Ty::Error, "Ty::Error")
+}
+
+fn probe_fn_item_type() -> Result<String, String> {
+    type_lowers(&Ty::FnItem(FuncId::new(0)), "Ty::FnItem")
 }
 
 fn probe_tensor_type() -> Result<String, String> {
@@ -2185,6 +2210,60 @@ fn probe_array_splat() -> Result<String, String> {
     lowered(&module, "Inst::ArraySplat")
 }
 
+/// `f(p: ptr) -> i64 { *box_deref(p) }` over a `param_by_value` premise.
+fn box_deref_module() -> TrustIrModule {
+    use trust_ir::box_validity::{BoxDerefSite, BoxFactSession, BoxValidityFact, PremiseRoot};
+    let fact = BoxValidityFact::premise(
+        BoxDerefSite {
+            item: [0x5a; 16],
+            ordinal: 0,
+        },
+        BoxFactSession::PROOF_SNAPSHOT,
+        PremiseRoot::ParamByValue,
+    );
+    let mut mb = trust_ir_build::ModuleBuilder::new_with_target_info(
+        "inventory_box_deref",
+        TargetInfo {
+            triple: "aarch64-apple-darwin".to_owned(),
+            pointer_size: 8,
+            endianness: Endianness::Little,
+            abi: None,
+            struct_passing: StructPassingPolicy::NativeC,
+        },
+    );
+    let ft = mb.add_func_type(vec![Ty::Ptr], vec![Ty::I64]);
+    let mut fb = mb.function("inventory_box_deref", ft);
+    let entry = fb.create_block();
+    let pointer = fb.add_block_param(entry, Ty::Ptr);
+    fb.switch_to_block(entry);
+    let boxed = fb.box_deref(Ty::I64, pointer, fact);
+    let read = fb.load(Ty::I64, boxed);
+    fb.ret(vec![read]);
+    fb.build();
+    mb.build().expect("ModuleBuilder::build: test fixture")
+}
+
+/// The opt-in: the diagnostic lane's named-premise floor admits and lowers it.
+fn probe_box_deref_named_premise() -> Result<String, String> {
+    trust_cg_lower::translate_module_for_arch_with_tls_with_license(
+        &box_deref_module(),
+        trust_cg_lower::GuardCarrierArch::default(),
+        trust_cg_lower::TlsDialect::default(),
+        &permit_unlicensed()
+            .with_named_premise_box_floor(&trust_cg_lower::BoxDerefDisclosure::new()),
+    )
+    .map(|funcs| format!("Inst::BoxDeref: {} function(s)", funcs.len()))
+    .map_err(|err| err.to_string())
+}
+
+/// The default license refuses the same module.
+fn probe_box_deref_default_license() -> Result<String, String> {
+    lowered_module(
+        &box_deref_module(),
+        "Inst::BoxDeref under the default license",
+    )
+}
+
 fn probe_array_splat_non_array() -> Result<String, String> {
     lowered(
         &single_inst_module(
@@ -2692,6 +2771,27 @@ fn probe_fndef_unregistered() -> Result<String, String> {
     ))
 }
 
+fn probe_fn_item_constant() -> Result<String, String> {
+    let module = module_with_blocks(
+        "inventory_fn_item_constant",
+        vec![],
+        vec![],
+        vec![TrustIrBlock {
+            id: b(0),
+            params: vec![],
+            body: vec![
+                InstrNode::new(Inst::Const {
+                    ty: Ty::FnItem(FuncId::new(0)),
+                    value: Constant::FnItem(FuncId::new(0)),
+                })
+                .with_result(v(0)),
+                InstrNode::new(Inst::Return { values: vec![] }),
+            ],
+        }],
+    );
+    lowered(&module, "Constant::FnItem")
+}
+
 fn probe_transmute() -> Result<String, String> {
     lowered(
         &single_inst_module(
@@ -3054,11 +3154,21 @@ fn sited_assert_is_refused_by_the_site_name() {
 #[test]
 fn every_ty_variant_has_exactly_one_row() {
     check_family_complete(&all_rows(), Family::Ty, TY_VARIANTS);
+    assert_eq!(
+        TY_VARIANTS.len(),
+        43,
+        "Ty variant census at the pinned trust-ir"
+    );
 }
 
 #[test]
 fn every_inst_variant_has_exactly_one_row() {
     check_family_complete(&all_rows(), Family::Inst, INST_VARIANTS);
+    assert_eq!(
+        INST_VARIANTS.len(),
+        75,
+        "Inst variant census at the pinned trust-ir"
+    );
 }
 
 #[test]
@@ -3066,7 +3176,7 @@ fn every_constant_variant_has_exactly_one_row() {
     check_family_complete(&all_rows(), Family::Constant, CONSTANT_VARIANTS);
     assert_eq!(
         CONSTANT_VARIANTS.len(),
-        18,
+        19,
         "Constant variant census at the pinned trust-ir"
     );
 }

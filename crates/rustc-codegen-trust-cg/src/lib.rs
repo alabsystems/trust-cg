@@ -106,6 +106,8 @@ use trust_cg_verify::SmtExpr;
 mod aarch64_fp_asm;
 mod abi_edges;
 mod assert_panic;
+mod box_deref_disclosure;
+mod box_deref_facts;
 mod box_payload_drop;
 mod call_references;
 mod canonicalize_copies;
@@ -558,6 +560,77 @@ fn x86_cpu_family_lacks_jcc_erratum(cpu: &str) -> bool {
         )
 }
 
+/// The x86 code-quality switches the bridge installs that are on by default
+/// only for a compile without proof certificates (`no-proof-certs`). Each
+/// `*_disabled` field is the value handed to its setter; the relocation field
+/// is an enable. None of these changes has been run under per-compile proof
+/// gating on any host, so a compile that keeps proof certificates withholds
+/// every one of them whatever its own opt-out knob says ("withheld by
+/// policy": the certificate lane does not run on the x86-64 Linux host where
+/// they were measured, so no certificate-lane bytes were compared).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct X86CertificateFreeSwitches {
+    ra_abi_copy_hints_disabled: bool,
+    ra_caller_saved_first_disabled: bool,
+    ra_cold_call_weight_disabled: bool,
+    ra_call_split_disabled: bool,
+    rowreg_memory_rmw_disabled: bool,
+    select_flag_fusion_disabled: bool,
+    sumq_register_seed_disabled: bool,
+    loop_align_relocate_contained: bool,
+}
+
+/// Decide [`X86CertificateFreeSwitches`] from the knob reader `enabled`
+/// (`knobs::is_enabled` in the bridge). `no-proof-certs` is read here, not
+/// by the caller, so the unit test below pins the whole decision.
+fn x86_certificate_free_switches(
+    enabled: impl Fn(&str) -> bool,
+) -> Result<X86CertificateFreeSwitches, String> {
+    let proof_certificates = !enabled(knobs::NO_PROOF_CERTS);
+    let ra = |opt_out: &str| {
+        trust_cg_codegen::x86_ra_quality_withheld(enabled(opt_out), proof_certificates)
+    };
+    Ok(X86CertificateFreeSwitches {
+        ra_abi_copy_hints_disabled: ra(knobs::NO_X86_RA_ABI_COPY_HINTS),
+        ra_caller_saved_first_disabled: ra(knobs::NO_X86_RA_CALLER_SAVED_FIRST),
+        ra_cold_call_weight_disabled: ra(knobs::NO_X86_RA_COLD_CALL_WEIGHT),
+        ra_call_split_disabled: ra(knobs::NO_X86_RA_CALL_SPLIT),
+        rowreg_memory_rmw_disabled: trust_cg_codegen::x86_rowreg_memory_rmw_withheld(
+            enabled(knobs::NO_X86_ROWREG_MEMORY_RMW),
+            proof_certificates,
+        ),
+        select_flag_fusion_disabled: trust_cg_codegen::x86_select_flag_fusion_withheld(
+            enabled(knobs::NO_X86_SELECT_FLAG_FUSION),
+            proof_certificates,
+        ),
+        sumq_register_seed_disabled: trust_cg_codegen::x86_sumq_register_seed_withheld(
+            enabled(knobs::NO_X86_SUMQ_REGISTER_SEED),
+            proof_certificates,
+        ),
+        loop_align_relocate_contained:
+            !trust_cg_codegen::x86_loop_align_relocate_contained_withheld(
+                enabled(knobs::NO_X86_LOOP_ALIGN_RELOCATE_CONTAINED),
+                proof_certificates,
+            ),
+    })
+}
+
+/// The value of `x86-rowreg-gpr-accumulators`, or the bridge default when it
+/// is absent. The knob's `Shape::Uint` already refuses a non-integer at parse
+/// time; a value that still fails to parse here is refused, never defaulted.
+fn x86_rowreg_gpr_accumulators(raw: Option<&str>) -> Result<usize, String> {
+    match raw {
+        None => Ok(X86_ROWREG_GPR_ACCUMULATORS_DEFAULT),
+        Some(value) => value.trim().parse::<usize>().map_err(|_| {
+            format!(
+                "`-Ztrust-ir-cg-args` knob `{}` was given `{value}`, which is not a base-10 \
+                 non-negative integer",
+                knobs::X86_ROWREG_GPR_ACCUMULATORS
+            )
+        }),
+    }
+}
+
 fn install_knob_backed_library_settings(jcc_align_disabled_by_target: bool) -> Result<(), String> {
     knobs::require_compatible_policy(
         knobs::DUMP_AARCH64_PREPARED,
@@ -997,14 +1070,61 @@ fn install_knob_backed_library_settings(jcc_align_disabled_by_target: bool) -> R
         )),
     )?;
     knobs::require_compatible_policy(
+        knobs::TRACE_X86_RA,
+        trust_cg_codegen::set_x86_ra_trace_enabled(knobs::is_enabled(knobs::TRACE_X86_RA)),
+    )?;
+    // The certificate-free code-quality switches (x86 allocation, row tier,
+    // select fusion, sum seed, loop relocation), decided in one pure function
+    // so the withholding under proof certificates is pinned by a unit test.
+    let switches = x86_certificate_free_switches(knobs::is_enabled)?;
+    // `x86-ra-abi-copy-hints` is still accepted; the hints are the default
+    // without certificates, so it changes nothing.
+    let _ = knobs::is_enabled(knobs::X86_RA_ABI_COPY_HINTS);
+    knobs::require_compatible_policy(
+        knobs::NO_X86_RA_ABI_COPY_HINTS,
+        trust_cg_codegen::set_x86_ra_abi_copy_hints_disabled(switches.ra_abi_copy_hints_disabled),
+    )?;
+    knobs::require_compatible_policy(
+        knobs::NO_X86_RA_CALLER_SAVED_FIRST,
+        trust_cg_codegen::set_x86_ra_caller_saved_first_disabled(
+            switches.ra_caller_saved_first_disabled,
+        ),
+    )?;
+    knobs::require_compatible_policy(
+        knobs::NO_X86_RA_COLD_CALL_WEIGHT,
+        trust_cg_codegen::set_x86_ra_cold_call_weight_disabled(
+            switches.ra_cold_call_weight_disabled,
+        ),
+    )?;
+    knobs::require_compatible_policy(
+        knobs::NO_X86_RA_CALL_SPLIT,
+        trust_cg_codegen::set_x86_ra_call_split_disabled(switches.ra_call_split_disabled),
+    )?;
+    knobs::require_compatible_policy(
         knobs::NO_X86_ROWREG_MEMORY_RMW,
-        // Proof certificates on: keep the XMM route. The in-memory route has
-        // not been run under per-compile proof gating on any host.
-        trust_cg_codegen::set_x86_rowreg_memory_rmw_disabled(
-            trust_cg_codegen::x86_rowreg_memory_rmw_withheld(
-                knobs::is_enabled(knobs::NO_X86_ROWREG_MEMORY_RMW),
-                !knobs::is_enabled(knobs::NO_PROOF_CERTS),
-            ),
+        trust_cg_codegen::set_x86_rowreg_memory_rmw_disabled(switches.rowreg_memory_rmw_disabled),
+    )?;
+    // The in-memory row route's GPR prefix. Installed unconditionally (the
+    // route itself is withheld with proof certificates on), so a direct pass
+    // entry, which installs nothing, keeps the all-in-memory body.
+    knobs::require_compatible_policy(
+        knobs::X86_ROWREG_GPR_ACCUMULATORS,
+        trust_cg_codegen::set_x86_rowreg_gpr_accumulators(x86_rowreg_gpr_accumulators(
+            knobs::raw(knobs::X86_ROWREG_GPR_ACCUMULATORS),
+        )?),
+    )?;
+    knobs::require_compatible_policy(
+        knobs::NO_X86_SELECT_FLAG_FUSION,
+        trust_cg_codegen::set_x86_select_flag_fusion_disabled(switches.select_flag_fusion_disabled),
+    )?;
+    knobs::require_compatible_policy(
+        knobs::NO_X86_SUMQ_REGISTER_SEED,
+        trust_cg_codegen::set_x86_sumq_register_seed_disabled(switches.sumq_register_seed_disabled),
+    )?;
+    knobs::require_compatible_policy(
+        knobs::NO_X86_LOOP_ALIGN_RELOCATE_CONTAINED,
+        trust_cg_codegen::set_x86_loop_align_relocate_contained(
+            switches.loop_align_relocate_contained,
         ),
     )?;
     knobs::require_compatible_policy(
@@ -1542,6 +1662,10 @@ impl CodegenBackend for TrustCgCodegenBackend {
         // The object compile runs here, after rustc dropped the type context
         // (see `OngoingCodegen`).
         let (compiled, allocator) = ongoing.finish(sess);
+        // What was compiled under a named Box validity assumption, if the
+        // operator opted in; printed before any module's refusal ends the
+        // session.
+        box_deref_disclosure::print();
 
         let mut modules = Vec::new();
         for module in compiled {
@@ -4675,6 +4799,9 @@ fn collect_module_referenced_symbols(
             | Constant::Float(_)
             | Constant::Bool(_)
             | Constant::FnDef(_)
+            // A nominal function item is zero-sized and does not materialize
+            // an emitted symbol reference without an explicit coercion.
+            | Constant::FnItem(_)
             | Constant::PhantomData
             // A v49 unwritten lane holds no value, so it references nothing.
             | Constant::Uninit
@@ -10352,10 +10479,20 @@ fn backend_opt_level(rustc_opt_level: OptLevel) -> OptLevel {
 /// `the_unlicensed_permit_exceptions_are_named_and_counted` in
 /// trust-cg-lower) — never under a silent default. `Ungated`, unrecognized
 /// authorities and a gated body without its evidence stay refused.
+///
+/// `Inst::BoxDeref`: the default floor refuses every one. Only
+/// `-Ztrust-ir-cg-args=box-deref-named-premise` selects trust-ir's
+/// named-premise floor, and with it the report every admission is recorded in
+/// (`box_deref_disclosure`), which the lane prints.
 fn in_process_mir_lane_license() -> trust_cg_codegen::CodegenLicensePolicy {
-    trust_cg_codegen::CodegenLicensePolicy::default().with_unlicensed_permit_exception(
-        trust_cg_codegen::UnlicensedPermitException::InProcessMirLane,
-    )
+    let license = trust_cg_codegen::CodegenLicensePolicy::default()
+        .with_unlicensed_permit_exception(
+            trust_cg_codegen::UnlicensedPermitException::InProcessMirLane,
+        );
+    match box_deref_disclosure::report() {
+        Some(report) => license.with_named_premise_box_floor(report),
+        None => license,
+    }
 }
 
 fn compile_trust_ir_module_object_in_env(
@@ -11547,6 +11684,9 @@ struct MirLoweringCtx<'tcx> {
     /// collapse the LATER `dst = [copy _t; N]` repeats to a single fill (the b05
     /// matmul `c` array, whose fill would otherwise scalarize to 576 stores).
     persistent_zero_locals: HashSet<Local>,
+    /// The admitted Box deref casts of the body being lowered
+    /// (`box_deref_facts::plan`); empty when it holds none.
+    box_deref_plan: box_deref_facts::BoxDerefPlan,
     /// wasm32 memory-backed locals whose slot pointer is the address of a
     /// constant aggregate's read-only data global (`wasm32_const_image_locals`):
     /// their one `local = const C` assignment lowers to nothing.
@@ -13658,6 +13798,7 @@ impl<'tcx> MirLoweringCtx<'tcx> {
             per_execution_allocas: HashSet::new(),
             zero_filled_locals: HashSet::new(),
             persistent_zero_locals: HashSet::new(),
+            box_deref_plan: box_deref_facts::BoxDerefPlan::default(),
             wasm32_const_image_slots: HashSet::new(),
             place_geps: wasm32_inbounds::place_geps_enabled(tcx),
             scalar_cells: HashMap::new(),
@@ -18185,7 +18326,7 @@ fn mir_to_trust_ir<'tcx>(
     crate_refine_memo: &mut CrateRefineMemo<'tcx>,
 ) -> Result<LoweredFn, String> {
     let original = tcx.instance_mir(instance.def);
-    rustc_api::refuse_unmodeled_body(original)?;
+    rustc_api::refuse_unmodeled_body(tcx, instance, original)?;
     let normalized = mono_cfg::for_instance(tcx, instance, original);
     let body = normalized.as_ref();
     // A function cannot be entered with a valid value of an uninhabited
@@ -18316,7 +18457,7 @@ fn mir_to_trust_ir_for_body<'tcx>(
     crate_refine_memo: &mut CrateRefineMemo<'tcx>,
     body: &Body<'tcx>,
 ) -> Result<LoweredFn, String> {
-    rustc_api::refuse_unmodeled_body(body)?;
+    rustc_api::refuse_unmodeled_body(tcx, instance, body)?;
     let mut retry = Ssa071CellRetry::default();
     let first = mir_to_trust_ir_for_body_with_cells(
         tcx,
@@ -18417,6 +18558,10 @@ fn mir_to_trust_ir_for_body_with_cells<'tcx>(
     if debug_lines_requested(tcx) {
         ctx.debug_lines = debug_line_file(tcx, body, &mut ctx.module);
     }
+    // Every Box deref cast of THIS body is admitted by the compiler's own
+    // fail-closed check, or the body was refused above; the plan is what the
+    // cast lowering reads and what the emitted module is counted against.
+    ctx.box_deref_plan = box_deref_facts::plan(tcx, instance, body)?;
     // At O1 and above rustc can inline `.step_by()` before the call-level
     // iterator interception sees it. Reject any surviving `StepBy` local at
     // MIR admission as well as at the constructor call below: this makes the
@@ -21877,6 +22022,17 @@ fn mir_to_trust_ir_for_body_with_cells<'tcx>(
     rustc_signature_layouts::attach(&mut ctx);
     const_references::canonicalize(&mut ctx.module);
     ctx.module_fault()?;
+    // One `Inst::BoxDeref` per admitted cast, with its fact, and no other.
+    ctx.box_deref_plan.check_emitted(&ctx.module)?;
+    // The lane's floor decides here, through the one shared acceptance check
+    // the license runs again on the object module: a function the license
+    // will refuse is refused now, under the key every Box deref refusal has.
+    if !ctx.box_deref_plan.is_empty() {
+        let floor = in_process_mir_lane_license().box_validity_floor();
+        trust_cg_lower::admit_box_derefs(&ctx.module, floor)
+            .map_err(|error| format!("{}: {error}", box_deref_facts::REFUSAL))?;
+    }
+    box_deref_disclosure::note_emitted(symbol, &ctx.box_deref_plan);
     lower_marks.mark("blocks_and_drains");
     let nounwind_callees = NounwindCallees {
         ids: ctx.nounwind_callee_ids(),
@@ -40575,6 +40731,52 @@ fn lower_scalar_memory_store_value<'tcx>(
                 .push(InstrNode::new(Inst::Copy { ty, operand: ptr }).with_result(value));
             Ok(())
         }
+        // `*cell = &(*s)[k].f…` — the deref-STORE twin of `lower_scalar_ref`'s
+        // slice-element-part arm, with the identical guard: a memory-backed
+        // `&[T]` base, a Field / Downcast / index chain after the element, and a
+        // part that is one plain scalar value (`slice_element_part_is_scalar_value`).
+        // The stored value is the part's address from the same walker
+        // (`memory_place_address_raw`, the slot's data lane plus rustc's
+        // offsets). It is reached where the reference local itself has a home
+        // (a cell, as AArch64 Linux gives a reference passed to a call,
+        // `call_references`), so the scalar-binding arm never sees the borrow.
+        // Gated with the struct-part admission
+        // (`slice_element_newtype_borrow_target`); every other target keeps the
+        // catch-all refusal below.
+        Rvalue::Ref(_, _, source)
+            if slice_element_newtype_borrow_target(ctx.tcx)
+                && is_pointer_like_trust_ir_ty(&ty)
+                && source.projection.len() > 2
+                && matches!(
+                    source.projection[..2],
+                    [
+                        ProjectionElem::Deref,
+                        ProjectionElem::Index(_) | ProjectionElem::ConstantIndex { .. }
+                    ]
+                )
+                && source.projection[2..].iter().all(|elem| {
+                    matches!(
+                        elem,
+                        ProjectionElem::Field(..)
+                            | ProjectionElem::Downcast(..)
+                            | ProjectionElem::Index(_)
+                            | ProjectionElem::ConstantIndex { .. }
+                    )
+                })
+                && local_is_memory_backed(ctx, source.local)
+                && is_slice_or_str_fat_ptr_ty(local_rust_ty(ctx, body, source.local))
+                && slice_element_part_is_scalar_value(
+                    ctx.tcx,
+                    ctx.monomorphize_ty(place_rust_ty(ctx, body, source)),
+                ) =>
+        {
+            let addr = memory_place_address_raw(ctx, body, block, source)?;
+            let addr = coerce_to_plain_ptr(ctx, block, addr);
+            block
+                .body
+                .push(InstrNode::new(Inst::Copy { ty, operand: addr }).with_result(value));
+            Ok(())
+        }
         // `*place = &(*r).f…` — the stored value is the ADDRESS of a projected
         // sub-place reached through a THIN reference: either one whose pointee is a
         // memory-eligible aggregate, or an entry argument whose projected leaf is a
@@ -42066,6 +42268,34 @@ fn slice_element_address<'tcx>(
     ))
 }
 
+/// Whether a borrowed PART of a slice element (`&(*s)[k].f…`) is one plain
+/// scalar VALUE in memory, so the borrow is a thin reference to bytes every
+/// reader loads with one typed access: a primitive integer, float, `bool` or
+/// `char`, or a STRUCT whose rustc layout is a single `Scalar` that
+/// `memory_scalar_leaf_ty` maps to such a primitive (the `struct Name(u32)`
+/// newtype of `&all_types[idx].name`). Enums (a niche or tag is not a plain
+/// value), pointers, wide pointers, collections and multi-lane structs are not
+/// admitted: those parts keep their own borrow models or refusals.
+fn slice_element_part_is_scalar_value<'tcx>(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>) -> bool {
+    match ty.kind() {
+        ty::Int(_) | ty::Uint(_) | ty::Float(_) | ty::Bool | ty::Char => true,
+        ty::Adt(def, _) if def.is_struct() && slice_element_newtype_borrow_target(tcx) => {
+            let Ok(layout) = tcx.layout_of(ty::TypingEnv::fully_monomorphized().as_query_input(ty))
+            else {
+                return false;
+            };
+            matches!(layout.backend_repr, rustc_abi::BackendRepr::Scalar(_))
+                && matches!(
+                    memory_scalar_leaf_ty(tcx, ty),
+                    Ok(leaf) if leaf.bit_width().is_some()
+                        && !is_pointer_like_trust_ir_ty(&leaf)
+                        && !matches!(leaf, TrustIrTy::Vector(..))
+                )
+        }
+        _ => false,
+    }
+}
+
 fn lower_scalar_ref<'tcx>(
     ctx: &mut MirLoweringCtx<'tcx>,
     body: &Body<'tcx>,
@@ -42390,9 +42620,9 @@ fn lower_scalar_ref<'tcx>(
             ctx.tcx,
             ctx.monomorphize_ty(local_rust_ty(ctx, body, place.local)),
         )
-        && matches!(
-            ctx.monomorphize_ty(place_rust_ty(ctx, body, source)).kind(),
-            ty::Int(_) | ty::Uint(_) | ty::Float(_) | ty::Bool | ty::Char
+        && slice_element_part_is_scalar_value(
+            ctx.tcx,
+            ctx.monomorphize_ty(place_rust_ty(ctx, body, source)),
         )
     {
         let addr = memory_place_address_raw(ctx, body, block, source)?;
@@ -54773,6 +55003,21 @@ fn lower_cast<'tcx>(
 
     let operand = lower_operand_to_value(ctx, body, block, operand)?;
 
+    // The Box deref cast is never a plain copy or cast here: it is the
+    // instruction that carries the compiler's validity fact, or a refusal.
+    if box_deref_facts::is_box_deref_cast(&kind) {
+        return lower_box_deref_cast(
+            ctx,
+            block,
+            kind,
+            &src_ty,
+            dst_rust_ty,
+            &dst_ty,
+            operand,
+            result,
+        );
+    }
+
     // `transmute` between `bool` and a 1-BYTE integer (`u8`/`i8`) — the `AtomicBool`
     // load/store path and direct bool<->u8 reinterprets. Rust guarantees a `bool`'s
     // byte is `0`/`1`, so the reinterpret is value-preserving. The trust-ir `Bool` is
@@ -54972,6 +55217,106 @@ fn lower_cast<'tcx>(
     // bridge-only change. The structural soundness of the emitted FPExt/FPTrunc is
     // instead covered by the trust-ir->machine lowering proofs (`fp_convert_proofs`
     // / `x86_64_lowering_proofs`: `FPTrunc_F32_F64 -> CVTSD2SS`, `FPExt -> CVTSS2SD`).
+    Ok(())
+}
+
+/// Emit `Inst::BoxDeref` for an admitted `BoxDerefTransmute` cast: the
+/// operand pointer, unchanged, with the compiler's fact for the cast's site.
+///
+/// Refuses (with `[TCG-BOX-DEREF]`) unless the cast is thin pointer to thin
+/// pointer in trust-ir (typed or untyped), the pointee is sized, inhabited and of positive size
+/// in rustc's layout, a trust-ir pointee type with exactly that size and ABI
+/// alignment exists, and the cast's site is in the body's plan.
+#[allow(clippy::too_many_arguments)]
+fn lower_box_deref_cast<'tcx>(
+    ctx: &mut MirLoweringCtx<'tcx>,
+    block: &mut Block,
+    kind: mir::CastKind,
+    src_ty: &TrustIrTy,
+    dst_rust_ty: Ty<'tcx>,
+    dst_ty: &TrustIrTy,
+    operand: ValueId,
+    result: ValueId,
+) -> Result<(), String> {
+    let refuse = |why: String| format!("{}: {why}", box_deref_facts::REFUSAL);
+    let Some(pointee_rust) = dst_rust_ty.builtin_deref(true) else {
+        return Err(refuse(format!(
+            "the cast's result type {dst_rust_ty:?} has no pointee"
+        )));
+    };
+    let Ok(layout) = ctx
+        .tcx
+        .layout_of(ty::TypingEnv::fully_monomorphized().as_query_input(pointee_rust))
+    else {
+        return Err(refuse(format!(
+            "the pointee {pointee_rust:?} has no layout"
+        )));
+    };
+    // Every gate is in `box_deref_facts::admit_emission`, which alone yields
+    // the pointee type the instruction states: the pointee's own trust-ir
+    // type when trust-ir lays it out exactly as rustc does, else an array of
+    // `size / align` integers of `align` bytes, else a refusal.
+    let pointee = box_deref_facts::admit_emission(
+        &mut ctx.module,
+        src_ty,
+        dst_ty,
+        operand,
+        result,
+        &format_args!("{pointee_rust:?}"),
+        box_deref_facts::PointeeLayout {
+            sized: layout.is_sized(),
+            zero_sized: layout.is_zst(),
+            uninhabited: layout.is_uninhabited(),
+            size: layout.size.bytes(),
+            align: layout.align.bytes(),
+        },
+        rust_ty_to_trust_ir_ty(ctx.tcx, pointee_rust).ok(),
+    )?
+    .into_ty();
+    let fact = ctx.box_deref_plan.fact_for(ctx.tcx, &kind)?;
+    // trust-ir states the instruction over the untyped `ptr` on both sides.
+    // The bridge's typed thin pointers reach and leave it through explicit
+    // `PtrToPtr` casts, which change no bit and carry no claim.
+    let untyped_operand = if *src_ty == TrustIrTy::Ptr {
+        operand
+    } else {
+        let value = ctx.fresh_value();
+        block.body.push(
+            InstrNode::new(Inst::Cast {
+                op: CastOp::PtrToPtr,
+                src_ty: src_ty.clone(),
+                dst_ty: TrustIrTy::Ptr,
+                operand,
+            })
+            .with_result(value),
+        );
+        value
+    };
+    let untyped_result = if *dst_ty == TrustIrTy::Ptr {
+        result
+    } else {
+        ctx.fresh_value()
+    };
+    block.body.push(
+        InstrNode::new(Inst::BoxDeref {
+            ptr_ty: TrustIrTy::Ptr,
+            pointee: trust_ir::box_validity::BoxPointee::Sized { ty: pointee },
+            operand: untyped_operand,
+            fact: Box::new(fact),
+        })
+        .with_result(untyped_result),
+    );
+    if untyped_result != result {
+        block.body.push(
+            InstrNode::new(Inst::Cast {
+                op: CastOp::PtrToPtr,
+                src_ty: TrustIrTy::Ptr,
+                dst_ty: dst_ty.clone(),
+                operand: untyped_result,
+            })
+            .with_result(result),
+        );
+    }
     Ok(())
 }
 
@@ -72713,34 +73058,35 @@ fn lower_round_intrinsic<'tcx>(
     Ok(())
 }
 
-/// `raw_eq::<T>(a: &T, b: &T) -> bool` for a `T = [E; N]` array of a SCALAR
-/// integer / bool element `E`. `raw_eq` is a BYTE comparison of `*a` and `*b`;
-/// for such an array that is identical to element-wise `==`:
-///   * the array layout is exactly `N` contiguous `size_of::<E>()`-byte elements
-///     with NO inter-element padding (`size_of::<[E;N]>() == N*size_of::<E>()`,
-///     which we assert and otherwise fail closed), and
-///   * a scalar integer / bool has no padding bits (every byte of the element is
-///     part of the value), so byte equality of two elements coincides with their
-///     integer `ICmp Eq`.
-///
-/// We synthesize it over already-proven primitives (no new opcode/proof): for
-/// each element `i in 0..N`, load `E` from `a + i*size` and from `b + i*size`
-/// (`emit_element_addr` = the proven `PtrToInt`/add/`IntToPtr` address sequence
-/// + a typed `Load`), compare the pair with `ICmp Eq` (a Bool), and AND-reduce
-/// the N booleans with the verified Bool `Select(acc, next, false)` idiom
-/// (`a && b`), seeded with `true`. The result binds the `bool` destination.
-///
-/// Fails closed for anything not covered: a non-array `T`, a non-scalar /
-/// floating / nested-aggregate element, a zero-element array seeded result aside,
-/// an `N` whose loads we cap, or a layout with padding. A clean compile-fail is
-/// acceptable; a wrong answer is not.
+/// Whether `typed_swap_nonoverlapping::<T>` may swap `T` as ONE pointer value:
+/// `T` is a reference or raw pointer whose pointee is `Sized` (rustc's layout
+/// says the pointer has no metadata) AND its trust-ir type is a thin pointer.
+/// Such a value is one pointer-width scalar on every target this backend
+/// emits, loaded and stored with the same typed `Load`/`Store` every other
+/// pointer field uses; `Ty::bit_width` only answers `None` for it because the
+/// width is target-dependent. This is `slice::reverse` over `[&T]`
+/// (`revswap`) and `mem::swap` of two `*const T`. A wide pointer (`&[T]`,
+/// `&str`, `&dyn`, a slice-tail DST) is NOT admitted here: the fat
+/// slice/str arm above swaps both lanes, and every other wide pointer keeps
+/// the refusal.
+fn typed_swap_thin_pointer_value<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    t_ty: Ty<'tcx>,
+    t_ir: &TrustIrTy,
+) -> bool {
+    typed_swap_thin_pointer_target(tcx)
+        && is_thin_pointer_by_layout_ty(tcx, t_ty)
+        && is_pointer_like_trust_ir_ty(t_ir)
+}
+
 /// Lower `typed_swap_nonoverlapping::<T>(x: *mut T, y: *mut T)` — swaps the `T`
 /// values at the two NON-OVERLAPPING pointers (what `mem::swap` / `Cell::swap` of
 /// two scalars lowers to on this toolchain). For a SCALAR `T` (single-width leaf),
 /// load BOTH values then store them swapped, over the already-proven `Load`/`Store`
 /// primitives — loading both before storing either is correct regardless of
 /// aliasing (and the intrinsic's contract is non-overlapping anyway). A non-scalar
-/// `T` (aggregate / array / fat pointer) fails closed.
+/// `T` (aggregate / array / fat pointer) fails closed, except a thin pointer
+/// value (`typed_swap_thin_pointer_value`) and the arms below.
 fn lower_typed_swap_intrinsic<'tcx>(
     ctx: &mut MirLoweringCtx<'tcx>,
     body: &Body<'tcx>,
@@ -72820,7 +73166,7 @@ fn lower_typed_swap_intrinsic<'tcx>(
         return Ok(());
     }
     let t_ir = rust_ty_to_trust_ir_ty(ctx.tcx, t_ty)?;
-    if t_ir.bit_width().is_none() {
+    if t_ir.bit_width().is_none() && !typed_swap_thin_pointer_value(ctx.tcx, t_ty, &t_ir) {
         return Err(format!(
             "typed_swap_nonoverlapping over non-scalar {t_ty:?} — fail closed"
         ));
@@ -73903,6 +74249,27 @@ fn lower_compare_bytes_intrinsic<'tcx>(
     Ok(())
 }
 
+/// `raw_eq::<T>(a: &T, b: &T) -> bool` for a `T = [E; N]` array of a SCALAR
+/// integer / bool element `E`. `raw_eq` is a BYTE comparison of `*a` and `*b`;
+/// for such an array that is identical to element-wise `==`:
+///   * the array layout is exactly `N` contiguous `size_of::<E>()`-byte elements
+///     with NO inter-element padding (`size_of::<[E;N]>() == N*size_of::<E>()`,
+///     which we assert and otherwise fail closed), and
+///   * a scalar integer / bool has no padding bits (every byte of the element is
+///     part of the value), so byte equality of two elements coincides with their
+///     integer `ICmp Eq`.
+///
+/// We synthesize it over already-proven primitives (no new opcode/proof): for
+/// each element `i in 0..N`, load `E` from `a + i*size` and from `b + i*size`
+/// (`emit_element_addr` = the proven `PtrToInt`/add/`IntToPtr` address sequence
+/// + a typed `Load`), compare the pair with `ICmp Eq` (a Bool), and AND-reduce
+/// the N booleans with the verified Bool `Select(acc, next, false)` idiom
+/// (`a && b`), seeded with `true`. The result binds the `bool` destination.
+///
+/// Fails closed for anything not covered: a non-array `T`, a non-scalar /
+/// floating / nested-aggregate element, a zero-element array seeded result aside,
+/// an `N` whose loads we cap, or a layout with padding. A clean compile-fail is
+/// acceptable; a wrong answer is not.
 fn lower_raw_eq_intrinsic<'tcx>(
     ctx: &mut MirLoweringCtx<'tcx>,
     body: &Body<'tcx>,
@@ -95487,20 +95854,80 @@ fn print_falls_back_to_std<'tcx>(
     print_std_fallback_target(ctx.tcx) && !print_interception_synthesizes(ctx, body, args_local)
 }
 
-/// x86-64 Linux: the one target the `print!` std fallback was measured on
-/// (bridge vs LLVM, O0-O3, `reports/2026-11-15-x86-slice-capabilities`).
-/// Deliberately separate from `array_element_aggregate_target`: widening one
-/// admission to a new target must not widen the other.
-fn print_std_fallback_target(tcx: TyCtxt<'_>) -> bool {
-    tcx.sess.target.arch.desc() == "x86_64" && tcx.sess.target.os == rustc_target::spec::Os::Linux
+// ---- Target sets of the slice capabilities (parity, 2026-11-15) ----------
+//
+// Each admission below is a target-independent MIR lowering (rustc's layout,
+// the bridge's shared typed loads/stores and calls). Each has its OWN
+// predicate, so widening one cannot widen another. The sets are what was
+// measured or compiled on 2026-11-15 (`reports/2026-11-15-slice-parity`):
+//
+// * x86-64 Linux: executed, bridge vs LLVM at O0-O3.
+// * AArch64 Linux: object emission compiled on the x86-64 host (cross
+//   sysroot), "written, compiled, not executed"
+//   (`tests/slice_parity_cross_targets.rs`; the executing test,
+//   `tests/slice_capabilities_2_linux.rs`, runs on an AArch64 Linux host).
+// * wasm32 is NOT admitted: on this pin the wasm lane refuses the programs
+//   that would exercise these admissions in trust-ir validation
+//   (`CallArgTypeMismatch` of typed references against `ptr`, `memcopy`
+//   byte counts typed `u32` against `usize`), and 11 of the 13
+//   `tests/wasm32_differential.rs` tests fail the same way before this lane,
+//   so nothing could be executed. An unexercised admission is not taken.
+// * AArch64 Darwin is NOT admitted: its bridge gate
+//   (`scripts/check_darwin_aarch64_bridge.py`) pins per-suite refusal counts
+//   that could change, and no Darwin run measured them.
+// * RISC-V: the bridge has no RISC-V session target at all
+//   (`trust_cg_target_for_session` refuses it), so none applies.
+//
+// `reports/2026-11-15-slice-parity/AARCH64_VALIDATION.md` lists what an
+// AArch64 host must run to execute or widen each of them.
+
+/// Linux on x86-64 or AArch64.
+fn linux_x86_64_or_aarch64(tcx: TyCtxt<'_>) -> bool {
+    matches!(tcx.sess.target.arch.desc(), "x86_64" | "aarch64")
+        && tcx.sess.target.os == rustc_target::spec::Os::Linux
 }
 
-/// x86-64 Linux: the one target the whole-aggregate array-element store and
-/// scalarized element read through a reference to a sized array were measured
-/// on (bridge vs LLVM, O0-O3, `reports/2026-11-15-x86-slice-capabilities`).
-/// Every other target keeps the previous refusal for an element step.
+/// The `print!` std fallback (`print_falls_back_to_std`): x86-64 Linux
+/// (executed) and AArch64 Linux (compiled). Not AArch64 Darwin: the Darwin
+/// gate pins a `TCG-FMT-DECLINED` count in its `strings_format` suite.
+fn print_std_fallback_target(tcx: TyCtxt<'_>) -> bool {
+    linux_x86_64_or_aarch64(tcx)
+}
+
+/// An aggregate-to-aggregate `Transmute` whose endpoint is a non-scalar union
+/// (`MaybeUninit<S>`) gets a byte slot on both sides (rule 0f of
+/// `compute_memory_backed_locals`): AArch64 Linux (where it was introduced)
+/// and x86-64 Linux. The lowering is the equal-size slot copy.
+fn union_transmute_slot_target(tcx: TyCtxt<'_>) -> bool {
+    linux_x86_64_or_aarch64(tcx)
+}
+
+/// The whole-aggregate array-element store and scalarized element read through
+/// a reference to a sized array: x86-64 Linux and AArch64 Linux. Every other
+/// target keeps the previous refusal for an element step.
 fn array_element_aggregate_target(tcx: TyCtxt<'_>) -> bool {
-    tcx.sess.target.arch.desc() == "x86_64" && tcx.sess.target.os == rustc_target::spec::Os::Linux
+    linux_x86_64_or_aarch64(tcx)
+}
+
+/// `typed_swap_nonoverlapping` of one thin pointer value
+/// (`typed_swap_thin_pointer_value`): x86-64 Linux and AArch64 Linux.
+fn typed_swap_thin_pointer_target(tcx: TyCtxt<'_>) -> bool {
+    linux_x86_64_or_aarch64(tcx)
+}
+
+/// A borrow of a single-scalar STRUCT part of a slice element
+/// (`slice_element_part_is_scalar_value`'s struct arm, and the deref-store
+/// twin in `lower_scalar_memory_store_value`): x86-64 Linux and AArch64
+/// Linux. A primitive part keeps its previous, ungated scalar-binding arm.
+fn slice_element_newtype_borrow_target(tcx: TyCtxt<'_>) -> bool {
+    linux_x86_64_or_aarch64(tcx)
+}
+
+/// Celling the referent of a reference stored into an aggregate
+/// (`compute_scalar_cell_locals`' aggregate-stored pass): x86-64 Linux and
+/// AArch64 Linux.
+fn aggregate_stored_reference_cell_target(tcx: TyCtxt<'_>) -> bool {
+    linux_x86_64_or_aarch64(tcx)
 }
 
 /// Whether the `print!`/`eprint!` interception (`lower_print`) synthesizes the
@@ -136459,10 +136886,16 @@ fn compute_memory_backed_locals<'tcx>(
             // a checked byte-slot layout, but the ordinary aggregate classifier
             // deliberately excludes overlapping fields. Give both endpoints a
             // slot so the existing equal-size, weaker-alignment copy can run.
+            //
+            // The union endpoint is target-independent (rustc's layout, the
+            // same byte-lane copy); it was introduced on AArch64 Linux and is
+            // admitted on x86-64 Linux too (`union_transmute_slot_target`:
+            // `MaybeUninit::<S>::assume_init` of a multi-field struct `S`, the
+            // `ProbeIds` out-parameter of the Clean slices). Darwin and wasm32
+            // keep their previous route.
             let has_transmute_slot = |ty| {
                 matches!(memory_aggregate_layout_shared(ctx.tcx, ty), Ok(Some(_)))
-                    || (ctx.tcx.sess.target.arch.desc() == "aarch64"
-                        && ctx.tcx.sess.target.os == rustc_target::spec::Os::Linux
+                    || (union_transmute_slot_target(ctx.tcx)
                         && matches!(nonscalar_union_memory_layout(ctx.tcx, ty), Ok(Some(_))))
             };
             let representable = has_transmute_slot(dst_ty) && has_transmute_slot(src_ty);
@@ -139704,6 +140137,42 @@ fn cleanup_scalar_home_shape<'tcx>(
         || padded_scalar_home_extent(ctx, ty, &leaf).is_some()
 }
 
+/// The referent admission of `compute_scalar_cell_locals`' `&dyn` unsize pass,
+/// repeated verbatim for the aggregate-stored reference pass: a non-union
+/// primitive or non-pointer scalar newtype, a single-scalar-storage pointer
+/// newtype without drop glue, or a thin 8-byte pointer. Everything else (a
+/// union, a slot-modelled collection, a needs-drop owner, a `core::fmt` type,
+/// a multi-lane aggregate) is not celled and keeps its existing refusal.
+fn cellable_address_referent<'tcx>(
+    ctx: &MirLoweringCtx<'tcx>,
+    body: &Body<'tcx>,
+    referent: Local,
+) -> Result<bool, String> {
+    let referent_ty = ctx.monomorphize_ty(local_rust_ty(ctx, body, referent));
+    let is_union_ty = matches!(referent_ty.kind(), ty::Adt(adt, _) if adt.is_union());
+    let is_pointer_scalar_storage_referent = !is_union_ty
+        && !is_fmt_internal_ty(ctx.tcx, referent_ty)
+        && !referent_ty.needs_drop(ctx.tcx, ty::TypingEnv::fully_monomorphized())
+        && wide_slice_carrier_layout(ctx.tcx, referent_ty).is_none()
+        && local_is_single_scalar_storage(ctx, referent)
+        && rust_ty_to_trust_ir_ty(ctx.tcx, referent_ty)
+            .map(|t| is_pointer_like_trust_ir_ty(&t))
+            .unwrap_or(false);
+    let is_scalar_referent = !is_union_ty
+        && (matches!(
+            referent_ty.kind(),
+            ty::Int(_) | ty::Uint(_) | ty::Float(_) | ty::Bool | ty::Char
+        ) || rust_ty_to_trust_ir_ty(ctx.tcx, referent_ty)
+            .map(|t| t.bit_width().is_some() && !is_pointer_like_trust_ir_ty(&t))
+            .unwrap_or(false));
+    let is_thin_pointer_referent = matches!(referent_ty.kind(), ty::RawPtr(..) | ty::Ref(..))
+        && is_thin_pointer_ref_ty(ctx.tcx, referent_ty)
+        && ctx.tcx.data_layout.pointer_size().bytes() == 8
+        && layout_size_of(ctx, referent_ty)? == 8
+        && memory_scalar_leaf_ty(ctx.tcx, referent_ty).is_ok();
+    Ok(is_scalar_referent || is_pointer_scalar_storage_referent || is_thin_pointer_referent)
+}
+
 /// Scalar locals whose ADDRESS is captured by a closure: each needs a memory
 /// "cell" (an entry-block `Alloca`) so `&local` is a stable runtime address the
 /// closure environment can hold and deref. We match a scalar local `L` such that
@@ -140135,6 +140604,66 @@ fn compute_scalar_cell_locals<'tcx>(
             if is_scalar_referent || is_pointer_scalar_storage_referent || is_thin_pointer_referent
             {
                 cells.insert(referent);
+            }
+        }
+    }
+    // A REFERENT WHOSE REFERENCE IS STORED INTO AN AGGREGATE VALUE:
+    //
+    //     _r = &x
+    //     _a = [move _r, ..]       (or a tuple / struct / enum constructor)
+    //
+    // The aggregate holds the reference's VALUE, an address, and every reader
+    // of `*_a[i]` loads through it; a scalarized `x` has no address, so the
+    // aggregate store refuses ("borrowed scalar reference used without deref",
+    // the `let names = [&ind_name, &sib]` shape of the Clean slices). Celling
+    // `x` gives it one stable home, the same remedy and the same three
+    // admission predicates as the `&dyn` pass above (`cellable_address_referent`
+    // repeats them verbatim): NO new referent type is admitted, only a new
+    // reason to cell an admissible one. Only the direct `_r = &x` definition is
+    // followed (`ref_to_referent`); a reference reaching the aggregate through
+    // a copy or a reborrow keeps its existing refusal.
+    //
+    // Only array, tuple and ADT constructors are followed. A closure's upvar
+    // aggregate has its own pass above, and a COROUTINE's upvar aggregate
+    // (`#[coroutine] |x| { .. seed .. }` borrowing a captured scalar) is not a
+    // shape this pass was measured on: AArch64 Linux pins its refusal natively
+    // (`tests/coroutine_generator_linux.rs`, `ay_gen_resume_args`, "borrowed
+    // scalar reference used without deref", the gate's
+    // `refused_coroutines` row), and the remaining kinds (raw pointers,
+    // coroutine closures) carry no measured program either.
+    let aggregate_stored_target = aggregate_stored_reference_cell_target(ctx.tcx);
+    for bb in body.basic_blocks.indices() {
+        if !aggregate_stored_target {
+            break;
+        }
+        for statement in &body.basic_blocks[bb].statements {
+            let StatementKind::Assign(boxed) = &statement.kind else {
+                continue;
+            };
+            let Rvalue::Aggregate(kind, operands) = &boxed.1 else {
+                continue;
+            };
+            if !matches!(
+                &**kind,
+                mir::AggregateKind::Array(_)
+                    | mir::AggregateKind::Tuple
+                    | mir::AggregateKind::Adt(..)
+            ) {
+                continue;
+            }
+            for operand in operands.iter() {
+                let (Operand::Copy(source) | Operand::Move(source)) = operand else {
+                    continue;
+                };
+                if !source.projection.is_empty() {
+                    continue;
+                }
+                let Some(referent) = ref_to_referent.get(&source.local).copied() else {
+                    continue;
+                };
+                if cellable_address_referent(ctx, body, referent)? {
+                    cells.insert(referent);
+                }
             }
         }
     }
@@ -150878,5 +151407,91 @@ mod tests {
         assert!(!declined.is_refuted());
         assert!(!inconclusive.is_refuted());
         assert!(refuted.is_refuted());
+    }
+}
+
+/// The bridge's default for `x86-rowreg-gpr-accumulators`: how many c-row
+/// elements the row tier's in-memory route holds in GPR accumulators.
+const X86_ROWREG_GPR_ACCUMULATORS_DEFAULT: usize = 4;
+
+#[cfg(test)]
+mod x86_certificate_free_switch_tests {
+    use super::{
+        X86CertificateFreeSwitches, x86_certificate_free_switches, x86_rowreg_gpr_accumulators,
+    };
+    use crate::knobs;
+
+    const OPT_OUTS: [&str; 8] = [
+        knobs::NO_X86_RA_ABI_COPY_HINTS,
+        knobs::NO_X86_RA_CALLER_SAVED_FIRST,
+        knobs::NO_X86_RA_COLD_CALL_WEIGHT,
+        knobs::NO_X86_RA_CALL_SPLIT,
+        knobs::NO_X86_ROWREG_MEMORY_RMW,
+        knobs::NO_X86_SELECT_FLAG_FUSION,
+        knobs::NO_X86_SUMQ_REGISTER_SEED,
+        knobs::NO_X86_LOOP_ALIGN_RELOCATE_CONTAINED,
+    ];
+
+    const ALL_WITHHELD: X86CertificateFreeSwitches = X86CertificateFreeSwitches {
+        ra_abi_copy_hints_disabled: true,
+        ra_caller_saved_first_disabled: true,
+        ra_cold_call_weight_disabled: true,
+        ra_call_split_disabled: true,
+        rowreg_memory_rmw_disabled: true,
+        select_flag_fusion_disabled: true,
+        sumq_register_seed_disabled: true,
+        loop_align_relocate_contained: false,
+    };
+
+    fn switches(on: &[&str]) -> X86CertificateFreeSwitches {
+        x86_certificate_free_switches(|key| on.contains(&key)).expect("switches decide")
+    }
+
+    #[test]
+    fn proof_certificates_withhold_every_switch_whatever_the_opt_outs_say() {
+        // No `no-proof-certs`: certificates are kept.
+        assert_eq!(switches(&[]), ALL_WITHHELD);
+        for opt_out in OPT_OUTS {
+            assert_eq!(switches(&[opt_out]), ALL_WITHHELD, "{opt_out}");
+        }
+        assert_eq!(switches(&OPT_OUTS), ALL_WITHHELD);
+    }
+
+    #[test]
+    fn without_certificates_every_switch_is_on_unless_opted_out() {
+        let all_on = X86CertificateFreeSwitches {
+            ra_abi_copy_hints_disabled: false,
+            ra_caller_saved_first_disabled: false,
+            ra_cold_call_weight_disabled: false,
+            ra_call_split_disabled: false,
+            rowreg_memory_rmw_disabled: false,
+            select_flag_fusion_disabled: false,
+            sumq_register_seed_disabled: false,
+            loop_align_relocate_contained: true,
+        };
+        assert_eq!(switches(&[knobs::NO_PROOF_CERTS]), all_on);
+        // Each opt-out turns off exactly its own switch.
+        let mut seen = std::collections::BTreeSet::new();
+        for opt_out in OPT_OUTS {
+            let got = switches(&[knobs::NO_PROOF_CERTS, opt_out]);
+            assert_ne!(got, all_on, "{opt_out} changed nothing");
+            assert!(
+                seen.insert(format!("{got:?}")),
+                "{opt_out} duplicates another opt-out"
+            );
+        }
+        assert_eq!(
+            switches(&[&[knobs::NO_PROOF_CERTS][..], &OPT_OUTS[..]].concat()),
+            ALL_WITHHELD
+        );
+    }
+
+    #[test]
+    fn the_gpr_accumulator_count_defaults_and_refuses_a_non_integer() {
+        assert_eq!(x86_rowreg_gpr_accumulators(None), Ok(4));
+        assert_eq!(x86_rowreg_gpr_accumulators(Some("0")), Ok(0));
+        assert_eq!(x86_rowreg_gpr_accumulators(Some("7")), Ok(7));
+        assert!(x86_rowreg_gpr_accumulators(Some("four")).is_err());
+        assert!(x86_rowreg_gpr_accumulators(Some("-1")).is_err());
     }
 }

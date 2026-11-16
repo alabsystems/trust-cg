@@ -546,6 +546,67 @@ fn a_module_declaring_a_closure_layout_is_left_unchanged() {
     );
 }
 
+/// No mid-end pass models the validity fact on `BoxDeref`. Its presence is a
+/// hard module barrier: even an unrelated dead instruction must remain, and
+/// the complete instruction (operand, pointee and fact) must be byte-for-byte
+/// unchanged under the wasm profile.
+#[test]
+fn a_module_with_box_deref_is_left_unchanged_and_reported_not_run() {
+    use trust_ir::box_validity::{BoxDerefSite, BoxFactSession, BoxValidityFact, PremiseRoot};
+    use trust_ir::{Endianness, StructPassingPolicy, TargetInfo};
+    use trust_ir_build::ModuleBuilder;
+
+    let mut builder = ModuleBuilder::new_with_target_info(
+        "irmid_box_barrier",
+        TargetInfo {
+            triple: "wasm32-unknown-unknown".to_string(),
+            pointer_size: 4,
+            endianness: Endianness::Little,
+            abi: None,
+            struct_passing: StructPassingPolicy::NativeC,
+        },
+    );
+    let signature = builder.add_func_type(vec![Ty::Ptr], vec![Ty::Ptr]);
+    let mut function = builder.function("box_barrier", signature);
+    let entry = function.create_block();
+    let pointer = function.add_block_param(entry, Ty::Ptr);
+    function.switch_to_block(entry);
+    let _dead = function.iconst(Ty::I32, 7);
+    let boxed = function.box_deref(
+        Ty::I64,
+        pointer,
+        BoxValidityFact::premise(
+            BoxDerefSite {
+                item: [0x5a; 16],
+                ordinal: 1,
+            },
+            BoxFactSession::PROOF_SNAPSHOT,
+            PremiseRoot::ParamByValue,
+        ),
+    );
+    function.ret(vec![boxed]);
+    function.build();
+    let module = builder.build().expect("valid BoxDeref fixture");
+    assert_eq!(module.pointer_bits(), 32);
+
+    let (out, report) = optimize_module(&module, &MidConfig::wasm32());
+    assert_eq!(
+        out, module,
+        "the entire module, including its fact, is preserved"
+    );
+    assert!(!report.enabled);
+    assert!(report.passes.is_empty());
+    assert!(
+        report.not_run.as_deref().is_some_and(|why| {
+            why.contains("box_barrier")
+                && why.contains("Inst::BoxDeref")
+                && why.contains("validity fact")
+        }),
+        "{:?}",
+        report.not_run
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Stage B: store forwarding, dead slots, constant-table promotion
 // ---------------------------------------------------------------------------

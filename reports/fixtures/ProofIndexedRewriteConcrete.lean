@@ -18,19 +18,29 @@ def add (a b : BV8) : BV8 := a + b
 def mul (a b : BV8) : BV8 := a * b
 
 theorem add_comm_concrete (a b : BV8) : add a b = add b a := by
-  simp [add, Fin.add_comm]
+  apply Fin.eq_of_val_eq
+  change (a.val + b.val) % 256 = (b.val + a.val) % 256
+  rw [Nat.add_comm]
 
 theorem mul_comm_concrete (a b : BV8) : mul a b = mul b a := by
-  simp [mul, Fin.mul_comm]
+  apply Fin.eq_of_val_eq
+  change (a.val * b.val) % 256 = (b.val * a.val) % 256
+  rw [Nat.mul_comm]
 
 theorem add_zero_concrete (a : BV8) : add a 0 = a := by
-  simp [add]
+  apply Fin.eq_of_val_eq
+  change (a.val + 0) % 256 = a.val
+  rw [Nat.add_zero, Nat.mod_eq_of_lt a.isLt]
 
 theorem mul_one_concrete (a : BV8) : mul a 1 = a := by
-  simp [mul]
+  apply Fin.eq_of_val_eq
+  change (a.val * 1) % 256 = a.val
+  rw [Nat.mul_one, Nat.mod_eq_of_lt a.isLt]
 
 theorem mul_zero_concrete (a : BV8) : mul a 0 = 0 := by
-  simp [mul]
+  apply Fin.eq_of_val_eq
+  change (a.val * 0) % 256 = 0
+  rw [Nat.mul_zero]
 
 -- Concrete witnesses re-checked by the kernel.
 example : add 1 2 = 3 := by decide

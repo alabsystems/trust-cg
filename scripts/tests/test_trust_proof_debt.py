@@ -30,15 +30,15 @@ class ProofDebtControls(unittest.TestCase):
             "  - `" + GATE.THEOREM + "` reaches the incomplete-proof marker `sorryAx`. Finish the proof.\n"
             "  = note: the Clean island was rejected during resolver checking (two-language design E10)"
         )
-        self.assertEqual(GATE.debt_refusal(text, 1, False), "publish-audit-sorryAx")
+        self.assertEqual(GATE.debt_refusal(text, 101, False), "publish-audit-sorryAx")
         for changed in [
             text.replace(GATE.THEOREM, "another.theorem"),
             text.replace("sorryAx", "UnknownConstant"),
             text.replace("nothing was registered", "some definitions were registered"),
             text.replace("resolver checking", "code generation"),
         ]:
-            self.assertIsNone(GATE.debt_refusal(changed, 1, False))
-        for code, exists in [(0, False), (101, False), (-9, False), (1, True)]:
+            self.assertIsNone(GATE.debt_refusal(changed, 101, False))
+        for code, exists in [(0, False), (1, False), (-9, False), (101, True)]:
             self.assertIsNone(GATE.debt_refusal(text, code, exists))
 
     def test_reviewed_strict_island_refusal_is_named(self):
@@ -46,8 +46,8 @@ class ProofDebtControls(unittest.TestCase):
             "error: Clean island declaration `" + GATE.THEOREM
             + "` uses explicit `sorry`; strict islands reject all trust debt"
         )
-        self.assertEqual(GATE.debt_refusal(text, 1, False), "strict-island-explicit-sorry")
-        self.assertIsNone(GATE.debt_refusal(text.replace(GATE.THEOREM, "wrong"), 1, False))
+        self.assertEqual(GATE.debt_refusal(text, 101, False), "strict-island-explicit-sorry")
+        self.assertIsNone(GATE.debt_refusal(text.replace(GATE.THEOREM, "wrong"), 101, False))
 
     def test_generic_parser_producer_and_missing_input_errors_do_not_count(self):
         for text in [
@@ -56,7 +56,7 @@ class ProofDebtControls(unittest.TestCase):
             "error: unsupported Type-valued definition",
             "error: " + GATE.THEOREM + " contains sorry but parser failed",
         ]:
-            self.assertIsNone(GATE.debt_refusal(text, 1, False))
+            self.assertIsNone(GATE.debt_refusal(text, 101, False))
 
 
     def test_decoy_name_cannot_qualify_another_theorems_refusal(self):
@@ -72,29 +72,33 @@ class ProofDebtControls(unittest.TestCase):
                 "error: Clean island declaration `" + actual_name
                 + "` uses explicit `sorry`; strict islands reject all trust debt\n"
             )
-            self.assertIsNone(GATE.debt_refusal(publish, 1, False))
-            self.assertIsNone(GATE.debt_refusal(strict, 1, False))
+            self.assertIsNone(GATE.debt_refusal(publish, 101, False))
+            self.assertIsNone(GATE.debt_refusal(strict, 101, False))
 
     def test_publish_evidence_cannot_be_combined_across_errors(self):
         header = "error: the publish audit refused this batch; nothing was registered\n"
         issue = "  - `" + GATE.THEOREM + "` reaches the incomplete-proof marker `sorryAx`.\n"
         phase = "  = note: the Clean island was rejected during resolver checking\n"
         self.assertIsNone(GATE.debt_refusal(
-            header + issue + "error: an unrelated parser failure\n" + phase, 1, False))
+            header + issue + "error: an unrelated parser failure\n" + phase, 101, False))
         self.assertIsNone(GATE.debt_refusal(
-            header + phase + "error: another failure\n" + issue, 1, False))
+            header + phase + "error: another failure\n" + issue, 101, False))
 
     def test_source_and_help_echoes_are_not_semantic_diagnostics(self):
         named = ("Clean island declaration `" + GATE.THEOREM
                  + "` uses explicit `sorry`; strict islands reject all trust debt")
         for echo in ["  | " + named, "  = help: " + named, "note: " + named]:
-            self.assertIsNone(GATE.debt_refusal("error: unrelated failure\n" + echo, 1, False))
+            self.assertIsNone(GATE.debt_refusal("error: unrelated failure\n" + echo, 101, False))
         # Both unwrapped Clean and rustc-wrapped canonical publish headers count.
-        for prefix in ["error: ", "error: error: "]:
+        for prefix in [
+            "error: ",
+            "error: error: ",
+            "error: Clean island batch has no source-local recovery boundary: error: ",
+        ]:
             text = (prefix + "the publish audit refused this batch; nothing was registered\n"
                     "  - `" + GATE.THEOREM + "` reaches the incomplete-proof marker `sorryAx`.\n"
                     "  = note: the Clean island was rejected during resolver checking\n")
-            self.assertEqual(GATE.debt_refusal(text, 1, False), "publish-audit-sorryAx")
+            self.assertEqual(GATE.debt_refusal(text, 101, False), "publish-audit-sorryAx")
 
 if __name__ == "__main__":
     unittest.main()

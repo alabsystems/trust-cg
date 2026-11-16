@@ -140,7 +140,7 @@ class TranscriptTests(unittest.TestCase):
         self.assertEqual({key: len(names) for key, names in bump.GUARD_TEST_NAMES.items()},
                          {("trust-cg-test", "dependency_authority"): 4,
                           ("trust-cg-verify", "fsym_layout"): 9,
-                          ("trust-cg-verify", "fsym_ub_map"): 19,
+                          ("trust-cg-verify", "fsym_ub_map"): 21,
                           ("trust-cg-lower", "trust_ir_construct_inventory"): 13,
                           ("trust-cg-codegen", "trust_ir_corpus_roundtrip"): 4,
                           ("trust-cg-codegen", "trust_ir_binary_container"): 20,
@@ -224,6 +224,40 @@ class GuardCommandsTests(unittest.TestCase):
 
 
 class GuardTransportTests(unittest.TestCase):
+    def test_explicit_fixed_profile_uses_its_api_and_the_same_owned_serial_config(self):
+        commands = bump.Commands(Path("/synthetic/root"), Path("/chosen/targo"),
+                                 guard_admission="original-fixed-v1")
+        args = ["--unverified", "test", "--locked", "-p", "pkg", "--test", "guard"]
+        fixed = (0, '{"version":1,"fixed_admission":"original-fixed-v1"}', "")
+        with patch.object(commands, "run", side_effect=[fixed, receipt()]) as run, \
+                redirect_stdout(io.StringIO()):
+            commands.rust_guard(args, ("alpha", "beta"))
+        self.assertEqual([call.args[0] for call in run.call_args_list], [
+            ["/chosen/targo", "--resource-capabilities", "--fixed-admission-v1"],
+            ["/chosen/targo", "--unverified", "test", "--config", "build.test-jobs=1", *args[2:]],
+        ])
+
+    def test_explicit_fixed_refusal_never_retries_worker_or_legacy(self):
+        positive = '{"version":1,"fixed_admission":"original-fixed-v1"}'
+        replies = [
+            (0, '{"version":1,"fixed_admission":null}', ""),
+            (0, '{"version":true,"fixed_admission":"original-fixed-v1"}', ""),
+            (0, '{"version":2,"fixed_admission":"original-fixed-v1"}', ""),
+            (0, '{"version":1,"fixed_admission":"other"}', ""),
+            (0, '{"version":1,"fixed_admission":"original-fixed-v1","extra":true}', ""),
+            (0, '{"version":3,"cpu_workers":true,"supports_invocation":true}', ""),
+            (0, 'not JSON', positive), (0, "", positive),
+            (1, positive, "fixed admission refused"),
+            (1, "", "error: unexpected argument '--resource-capabilities' found\nUsage: targo"),
+        ]
+        for reply in replies:
+            commands = bump.Commands(Path("/synthetic/root"), Path("/chosen/targo"),
+                                     guard_admission="original-fixed-v1")
+            with self.subTest(reply=reply), patch.object(commands, "run", return_value=reply) as run:
+                with self.assertRaises(bump.Refusal):
+                    commands.rust_guard(["--unverified", "test"], ("alpha", "beta"))
+                self.assertEqual(run.call_count, 1)
+
     def commands(self):
         return bump.Commands(Path("/synthetic/root"), Path("/chosen/targo"))
 

@@ -628,3 +628,156 @@ fn universal_source_word_owner_refuses_an_independent_wrong_source_body() {
         0
     );
 }
+
+#[cfg(feature = "source-defined-call")]
+#[test]
+fn universal_source_word_refusal_preserves_a_valid_retry() {
+    use cg::jit::entry_stack::OwnedEntryStack;
+    let (module, target) = forwarding_source_with_leaf(true, true).unwrap();
+    let conditional = fixture::qualified_plan(module, target)
+        .compile_for_owned_peer_entry("entry")
+        .unwrap();
+    let failure = conditional
+        .check_source_word_entry(&universal_source_selection(8))
+        .unwrap_err();
+    assert!(failure.reason().contains("source-call island differs"));
+    let predecessor = failure.into_predecessor();
+    assert_eq!(predecessor.source_function(), FuncId::new(1));
+    assert_eq!(
+        predecessor.diagnostic_report().genuinely_verified_count(),
+        0
+    );
+    let checked = predecessor
+        .check_source_word_entry(&universal_source_selection(7))
+        .expect("refused source selection must retain the original valid native peer");
+    let (mut entry, _) = checked
+        .install_owned_stack(
+            OwnedEntryStack::allocate(65_536).unwrap(),
+            manifest(1),
+            cg::compile_service::CompileGeneration::new(1),
+        )
+        .unwrap();
+    assert_eq!(entry.invoke1_u64(0).unwrap(), 7);
+    assert_eq!(entry.invoke1_u64(u64::MAX).unwrap(), 6);
+}
+
+#[cfg(feature = "source-defined-call")]
+#[test]
+fn universal_source_word_owner_refuses_wrong_function_ids_without_losing_the_peer() {
+    let (module, target) = forwarding_source_with_leaf(true, true).unwrap();
+    let mut predecessor = fixture::qualified_plan(module, target)
+        .compile_for_owned_peer_entry("entry")
+        .unwrap();
+    for (caller, callee) in [(0, 0), (1, 1), (2, 0), (1, 2)] {
+        let mut selection = universal_source_selection(7);
+        selection.caller = FuncId::new(caller);
+        selection.callee = FuncId::new(callee);
+        let failure = predecessor.check_source_word_entry(&selection).unwrap_err();
+        assert!(
+            failure
+                .reason()
+                .contains("source/Core selection differs from the original one-word native peer"),
+            "caller={caller} callee={callee}: {failure}"
+        );
+        predecessor = failure.into_predecessor();
+        assert_eq!(predecessor.source_function(), FuncId::new(1));
+        assert_eq!(
+            predecessor.diagnostic_report().genuinely_verified_count(),
+            0
+        );
+    }
+}
+
+#[cfg(feature = "source-defined-call")]
+#[test]
+fn universal_source_word_owner_refuses_wrong_source_refs_in_the_same_island() {
+    let (module, target) = forwarding_source_with_leaf(true, true).unwrap();
+    let mut predecessor = fixture::qualified_plan(module, target)
+        .compile_for_owned_peer_entry("entry")
+        .unwrap();
+    for change_caller in [true, false] {
+        let mut selection = universal_source_selection(7);
+        let original_island = selection.island.declarations.clone();
+        if change_caller {
+            selection.caller_source.decl = "ForwardedCalls.leaf".into();
+        } else {
+            selection.callee_source.decl = "ForwardedCalls.entry".into();
+        }
+        assert_eq!(selection.island.declarations, original_island);
+        let failure = predecessor.check_source_word_entry(&selection).unwrap_err();
+        assert!(
+            failure
+                .reason()
+                .contains("source-call selection differs from the replayed original binding"),
+            "changed caller={change_caller}: {failure}"
+        );
+        predecessor = failure.into_predecessor();
+        assert_eq!(
+            predecessor.diagnostic_report().genuinely_verified_count(),
+            0
+        );
+    }
+}
+
+#[cfg(feature = "source-defined-call")]
+#[test]
+fn universal_source_word_installation_refuses_wrong_argument_abi() {
+    use cg::jit::entry_stack::OwnedEntryStack;
+    use cg::jit_contract::{AbiValue, AbiValueKind};
+    let mut floating_argument = manifest(1);
+    floating_argument.symbols[0].signature.params = vec![AbiValue::new(AbiValueKind::F64)];
+    for wrong_manifest in [manifest(0), floating_argument] {
+        let (module, target) = forwarding_source_with_leaf(true, true).unwrap();
+        let conditional = fixture::qualified_plan(module, target)
+            .compile_for_owned_peer_entry("entry")
+            .unwrap();
+        let checked = conditional
+            .check_source_word_entry(&universal_source_selection(7))
+            .unwrap();
+        let error = checked
+            .install_owned_stack(
+                OwnedEntryStack::allocate(65_536).unwrap(),
+                wrong_manifest,
+                cg::compile_service::CompileGeneration::new(1),
+            )
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("compile.manifest_signature_mismatch"),
+            "{error}"
+        );
+    }
+}
+
+#[cfg(feature = "source-defined-call")]
+#[test]
+fn universal_source_word_installation_refuses_insufficient_owned_storage() {
+    use cg::jit::entry_stack::{EntryStackError, OwnedEntryStack};
+    let (module, target) = forwarding_source_with_leaf(true, true).unwrap();
+    let conditional = fixture::qualified_plan(module, target)
+        .compile_for_owned_peer_entry("entry")
+        .unwrap();
+    assert_eq!(conditional.required_private_stack_bytes(), 16);
+    let checked = conditional
+        .check_source_word_entry(&universal_source_selection(7))
+        .unwrap();
+    // This is a real RW allocation, but none of its page-rounding surplus is
+    // granted as usable entry storage. Source proof cannot authorize that loan.
+    let stack = OwnedEntryStack::allocate(0).unwrap();
+    assert_eq!(stack.allocation().usable_bytes, 0);
+    let error = checked
+        .install_owned_stack(
+            stack,
+            manifest(1),
+            cg::compile_service::CompileGeneration::new(1),
+        )
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        EntryStackError::Insufficient {
+            required: 16,
+            available: 0
+        }
+    ));
+}

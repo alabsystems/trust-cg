@@ -1,3 +1,40 @@
+Canonical self-proof cohort intake, 2026-11-15:
+  Target IR: d156d81890bccf0287a7eca3e7d5bb34f53ee790
+  Co-owned Clean: 7722f8495bc4a4fa60ccf79fd78723f5b18ea949
+  Co-owned AY: 91d6b45ab17373b5381d6cdf4e6a97ee4e84dbcc
+  Only certificate_binding.{json,tmbc} changed, copied from immutable Git
+  blobs of the authenticated target; all126 other current module payloads
+  and the historical compat_v22_composition control retain their bytes.
+  No corpus count, wire version, refusal, proof policy or license change.
+  The full canonical eight-guard transaction and actual affected native
+  consumers remain required. This byte custody grants no proof authority.
+BoxDeref validity / current wire74 intake, 2026-11-15:
+  Exact published source: 933e34fa846aca56f64aa3ef0f303aacdf0085a3
+  Co-owned Clean and AY remain the cohort selected by the canonical pin
+  transaction; this fixture intake changes neither dependency.
+  All65 top-level binary/JSON pairs match the exact immutable Git blobs.
+  New box_deref.{json,tmbc} carries the four positive Box-validity forms at
+  wire v74. storage_only.{json,tmbc} is refreshed byte-for-byte because its
+  body is now explicitly Ungated; the other 63 pairs are unchanged from the
+  preceding 9774ee84024ba5e72d0865c8d8756492de5657ee intake. The separate
+  compat_v22_composition control remains frozen. These are source DATA, not
+  proof or native admission; all atomic pin, inventory, corpus, refusal and
+  backend consumer guards remain mandatory.
+
+Current original-execution kernel cohort:
+  Exact published source: 9774ee84024ba5e72d0865c8d8756492de5657ee
+  Contained by native main ACK: 2c45890ffdb13aedf5f548142763343477041eea
+  Co-owned Clean: 7722f8495bc4a4fa60ccf79fd78723f5b18ea949 (0.9.1)
+  AY: 91d6b45ab17373b5381d6cdf4e6a97ee4e84dbcc (0.28.0)
+  Copy only certificate_binding.{json,tmbc} from the exact Git blobs after
+  the documented upstream generator and strict four-format two-certificate
+  replay. Only the actual declaration-environment digests and their derived
+  lineage hashes changed; statement/term/context/body/source data stayed exact.
+  All64 top-level binary/JSON pairs now match the pin byte-for-byte. Every
+  other pair and compat_v22_composition is unchanged; no count, expected
+  verdict, source owner, license or proof/admission policy changes.
+  This is source DATA custody; all eight normal guards remain mandatory.
+
 Tensor gather/scatter and weight-blob wire70 intake, 2026-11-14:
   Target IR: 96f7ff19a7e68ae68ad2bfbd08054be91e465015
   Co-owned Clean: 550ad0858df6a00c61a7cdabc7f37fa0bc975258

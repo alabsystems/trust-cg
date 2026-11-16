@@ -7,6 +7,7 @@ import ast
 from contextlib import redirect_stderr, redirect_stdout
 import fcntl
 import io
+import json
 import os
 from pathlib import Path
 import signal
@@ -24,6 +25,10 @@ import bump_trust_ir_pin as bump  # noqa: E402
 OLD_IR, NEW_IR = "1" * 40, "2" * 40
 OLD_CLEAN, NEW_CLEAN, AY = "3" * 40, "4" * 40, "5" * 40
 NEW_AY = "6" * 40
+TRUST_IR_CURRENT, TRUST_IR_TARGET = bump.IR_VERSION_MIGRATION
+TRUST_IR_UNSUPPORTED = "0.16.0"
+CLEAN_CURRENT, CLEAN_TARGET = bump.CLEAN_VERSION_MIGRATION
+CLEAN_UNSUPPORTED = "0.9.3"
 # A synthetic vendored container fixture tree (relative to VENDORED_FIXTURES).
 VENDORED = ("SOURCE.txt", "conformance/b1_scalars.tmbc", "conformance/b1_scalars.json",
             "pinned_writer/crystal_lane_v49.tmbc")
@@ -56,8 +61,8 @@ def package(name: str, version: str, identity: str = "", dependencies=()) -> str
 
 def immutable_documents() -> dict[tuple[str, str], str]:
     docs = {
-        (bump.IR_URL, "Cargo.toml"): '[workspace.package]\nversion = "0.14.0"\n',
-        (bump.CLEAN_URL, "Cargo.toml"): '[workspace.package]\nversion = "0.9.0"\n'
+        (bump.IR_URL, "Cargo.toml"): f'[workspace.package]\nversion = "{TRUST_IR_CURRENT}"\n',
+        (bump.CLEAN_URL, "Cargo.toml"): f'[workspace.package]\nversion = "{CLEAN_CURRENT}"\n'
         '[workspace.dependencies]\n' + "\n".join(
             f'{name} = {dep(bump.AY_URL, AY, "0.26.0")}'
             for name in ["ay", "ay-core", "ay-dpll", "ay-proof", "ay-frontend",
@@ -68,9 +73,9 @@ def immutable_documents() -> dict[tuple[str, str], str]:
         url = bump.CLEAN_URL if name in ("clean-kernel", "clean-olean") else bump.IR_URL
         text = f'[package]\nname = "{name}"\nversion.workspace = true\n'
         if name in ["trust-ir", "trust-ir-build"]:
-            text += '\n[dependencies]\nclean-kernel = ' + dep(bump.CLEAN_URL, NEW_CLEAN, "0.9.0")
+            text += '\n[dependencies]\nclean-kernel = ' + dep(bump.CLEAN_URL, NEW_CLEAN, CLEAN_CURRENT)
         if name == "trust-ir-build":
-            text += '\n[dev-dependencies]\nclean-verify = ' + dep(bump.CLEAN_URL, NEW_CLEAN, "0.9.0")
+            text += '\n[dev-dependencies]\nclean-verify = ' + dep(bump.CLEAN_URL, NEW_CLEAN, CLEAN_CURRENT)
         docs[url, f"crates/{name}/Cargo.toml"] = text
     return docs
 
@@ -103,11 +108,15 @@ class SyntheticCommands(bump.Commands):
         self.preinstall_change = False
         self.ay_revision = AY
         self.ay_version_move = None
+        self.clean_version_move = None
+        self.ir_version_move = None
+        self.guard_environments = []
 
     def _test_guard_transport(self, args):
         return "legacy"
 
-    def run(self, argv, *, cwd, capture=False, git=False, allowed=(0,), discard_stdout=False, raw=False):
+    def run(self, argv, *, cwd, capture=False, git=False, allowed=(0,), discard_stdout=False, raw=False,
+            env=None):
         self.calls.append((list(argv), Path(cwd), capture, git, allowed))
         if argv[0] == self.agh:
             if self.fail_agh:
@@ -141,9 +150,31 @@ class SyntheticCommands(bump.Commands):
             lock = manifest.with_name("Cargo.lock")
             if "--locked" not in args:
                 data = lock.read_text().replace(OLD_IR, NEW_IR).replace(OLD_CLEAN, NEW_CLEAN).replace(AY, self.ay_revision)
+                if self.ir_version_move is not None:
+                    previous, following = self.ir_version_move
+                    blocks = data.split("[[package]]")
+                    for index, block in enumerate(blocks[1:], 1):
+                        if f'source = "git+{bump.IR_URL}?' in block:
+                            blocks[index] = block.replace(f'version = "{previous}"',
+                                                          f'version = "{following}"')
+                    data = "[[package]]".join(blocks)
+                    for name in ("trust-ir", "trust-ir-build", "trust-ir-giveback", "trust-ir-conformance"):
+                        data = data.replace(f'"{name} {previous} (git+{bump.IR_URL}',
+                                            f'"{name} {following} (git+{bump.IR_URL}')
                 if self.ay_version_move is not None:
                     previous, following = self.ay_version_move
                     data = data.replace('version = "' + previous + '"', 'version = "' + following + '"')
+                if self.clean_version_move is not None:
+                    previous, following = self.clean_version_move
+                    blocks = data.split("[[package]]")
+                    for index, block in enumerate(blocks[1:], 1):
+                        if f'source = "git+{bump.CLEAN_URL}?' in block:
+                            blocks[index] = block.replace(f'version = "{previous}"',
+                                                          f'version = "{following}"')
+                    data = "[[package]]".join(blocks)
+                    for name in ("clean-kernel", "clean-olean", "clean-verify"):
+                        data = data.replace(f'"{name} {previous} (git+{bump.CLEAN_URL}',
+                                            f'"{name} {following} (git+{bump.CLEAN_URL}')
                 lock.write_text(data)
         elif args[:2] != ["--unverified", "test"]:
             raise AssertionError(f"unsupported frontend lane: {args}")
@@ -154,6 +185,7 @@ class SyntheticCommands(bump.Commands):
                 raise self.interruption
             raise bump.Refusal(f"synthetic frontend failure at {step}")
         if args[:2] == ["--unverified", "test"]:
+            self.guard_environments.append(dict(env or {}))
             names = bump.GUARD_TEST_NAMES[args[args.index("-p") + 1], args[args.index("--test") + 1]]
             return (f"running {len(names)} tests\n"
                     + "".join(f"test {name} ... ok\n" for name in names)
@@ -222,9 +254,9 @@ class TransactionTests(unittest.TestCase):
                    '[dev-dependencies]\n' + f'trust-ir-build = {dep(bump.IR_URL, OLD_IR)}\n')
         self.write(bump.VERIFY, '[features]\noriginal-i128-cic = ["dep:clean-kernel", "dep:clean-olean"]\ncore-byte-replay = ["dep:clean-kernel", "dep:clean-verify", "dep:trust-ir-build"]\n'
                    '[dependencies]\n' + '\n'.join(
-                       f'{name} = {dep(bump.CLEAN_URL, OLD_CLEAN, "0.9.0")[:-1]}, optional = true }}'
+                       f'{name} = {dep(bump.CLEAN_URL, OLD_CLEAN, CLEAN_CURRENT)[:-1]}, optional = true }}'
                        for name in ("clean-kernel", "clean-verify")) + '\n'
-                   + f'clean-olean = {dep(bump.CLEAN_URL, OLD_CLEAN, "0.9.0")[:-1]}, optional = true, default-features = false }}\n')
+                   + f'clean-olean = {dep(bump.CLEAN_URL, OLD_CLEAN, CLEAN_CURRENT)[:-1]}, optional = true, default-features = false }}\n')
         self.write(bump.REGALLOC, '[features]\ndefault = []\n'
                    'ay-regalloc = ["dep:ay-pb", "dep:ay-sat", "dep:trust-cg-process-env"]\n'
                    '[dependencies]\n'
@@ -247,12 +279,13 @@ class TransactionTests(unittest.TestCase):
         for lock in bump.LOCKS:
             text = "# retain this original lock comment on rollback\nversion = 4\n"
             for name in ["trust-ir", "trust-ir-build", "trust-ir-giveback"]:
-                text += package(name, "0.14.0", bump.source(bump.IR_URL, OLD_IR))
+                text += package(name, TRUST_IR_CURRENT, bump.source(bump.IR_URL, OLD_IR))
             if lock == "Cargo.lock":
                 # The corpus runner is a dev-dependency of the root workspace only.
-                text += package("trust-ir-conformance", "0.14.0", bump.source(bump.IR_URL, OLD_IR))
+                text += package("trust-ir-conformance", TRUST_IR_CURRENT,
+                                bump.source(bump.IR_URL, OLD_IR))
             for name in ("clean-kernel", "clean-olean"):
-                text += package(name, "0.9.0", bump.source(bump.CLEAN_URL, OLD_CLEAN))
+                text += package(name, CLEAN_CURRENT, bump.source(bump.CLEAN_URL, OLD_CLEAN))
             if lock != "fuzz/Cargo.lock":
                 for name in ["ay-pb", "ay-sat"]:
                     text += package(name, "0.26.0", bump.source(bump.AY_URL, AY))
@@ -270,9 +303,12 @@ class TransactionTests(unittest.TestCase):
         path.write_text(text)
         return path
 
-    def invoke(self, ay_revision=None, admit=(), admit_ay=(), drop=(), ay_version=None):
+    def invoke(self, ay_revision=None, admit=(), admit_ay=(), drop=(), ay_version=None,
+               clean_version=None, ir_version=None):
         with redirect_stdout(self.output), redirect_stderr(self.output):
-            bump.transaction(self.root, NEW_IR, self.commands, ay_revision, admit, admit_ay, drop, ay_version)
+            bump.transaction(self.root, NEW_IR, self.commands, ay_revision, admit, admit_ay, drop, ay_version,
+                             clean_version=clean_version,
+                             ir_version=ir_version)
 
     def assert_restored(self):
         self.assertEqual(bump.snapshot(self.root), self.original)
@@ -292,6 +328,154 @@ class TransactionTests(unittest.TestCase):
                                                    '[workspace.package]\nversion = "0.26.0"\n')
         for name, path in (("ay-pb", "solver/pb"), ("ay-sat", "solver/sat")):
             docs[bump.AY_URL, path + "/Cargo.toml"] = f'[package]\nname = "{name}"\nversion.workspace = true\n'
+
+    def trust_ir_version_migration(self):
+        key = bump.IR_URL, "Cargo.toml"
+        self.commands.documents[key] = self.commands.documents[key].replace(
+            TRUST_IR_CURRENT, TRUST_IR_TARGET)
+        self.commands.ir_version_move = bump.IR_VERSION_MIGRATION
+
+    def test_explicit_trust_ir_minor_move_preserves_roster_edges_and_runs_all_guards(self):
+        self.trust_ir_version_migration()
+        old_edge = (f'trust-ir {TRUST_IR_CURRENT} '
+                    f'({bump.source(bump.IR_URL, OLD_IR)})')
+        for lock in bump.LOCKS:
+            path = self.root / lock
+            path.write_text(path.read_text().replace(
+                'dependencies = ["trust-ir"]',
+                f'dependencies = ["{old_edge}"]'))
+        self.original = bump.snapshot(self.root)
+        self.invoke(ir_version=TRUST_IR_TARGET)
+        state = bump.current(self.root, bump.snapshot(self.root))
+        self.assertEqual(set(state.ir_packages.values()), {TRUST_IR_TARGET})
+        guards = [call for call in self.commands.calls if "--test" in call[0]]
+        self.assertEqual(len(guards), len(bump.GUARD_TEST_NAMES))
+        for lock in bump.LOCKS:
+            rows = bump.packages((self.root / lock).read_bytes(), lock)
+            consumer = next(row for row in rows if row["name"] == "consumer")
+            self.assertEqual(consumer["dependencies"], [
+                f'trust-ir {TRUST_IR_TARGET} ({bump.source(bump.IR_URL, NEW_IR)})'])
+
+    def test_combined_clean_and_trust_ir_version_move_is_one_atomic_transaction(self):
+        self.trust_ir_version_migration()
+        self.clean_version_migration()
+        self.invoke(clean_version=CLEAN_TARGET, ir_version=TRUST_IR_TARGET)
+        state = bump.current(self.root, bump.snapshot(self.root))
+        self.assertEqual(set(state.ir_packages.values()), {TRUST_IR_TARGET})
+        self.assertEqual(set(state.clean_packages.values()), {CLEAN_TARGET})
+        guards = [call for call in self.commands.calls if "--test" in call[0]]
+        self.assertEqual(len(guards), len(bump.GUARD_TEST_NAMES))
+
+    def clean_version_migration(self):
+        self.commands.documents = {
+            key: text.replace(CLEAN_CURRENT, CLEAN_TARGET)
+            for key, text in self.commands.documents.items()}
+        self.commands.clean_version_move = bump.CLEAN_VERSION_MIGRATION
+
+    def test_explicit_clean_patch_move_runs_all_original_named_guards(self):
+        self.clean_version_migration()
+        self.invoke(clean_version=CLEAN_TARGET)
+        state = bump.current(self.root, bump.snapshot(self.root))
+        self.assertEqual(set(state.clean_packages.values()), {CLEAN_TARGET})
+        self.assertEqual((state.ir, state.clean, state.ay), (NEW_IR, NEW_CLEAN, AY))
+        guards = [call for call in self.commands.calls if "--test" in call[0]]
+        self.assertEqual(len(guards), len(bump.GUARD_TEST_NAMES))
+        text = (self.root / bump.VERIFY).read_text()
+        self.assertEqual(text.count(f'version = "{CLEAN_TARGET}"'), 3)
+        self.assertEqual(text.count('optional = true'), 3)
+        self.assertIn('default-features = false', text)
+        self.assertEqual((self.root / "unrelated-user-work.txt").read_text(), "unrelated dirty user work\n")
+
+    def test_clean_patch_move_preserves_disambiguated_edges_and_registry_versions(self):
+        self.clean_version_migration()
+        old_edge = f'clean-kernel {CLEAN_CURRENT} ({bump.source(bump.CLEAN_URL, OLD_CLEAN)})'
+        for lock in bump.LOCKS:
+            path = self.root / lock
+            text = path.read_text().replace('dependencies = ["trust-ir"]',
+                                            f'dependencies = ["trust-ir", "{old_edge}"]')
+            text += package("unchanged-registry-owner", "0.9.0", "registry+https://example.invalid/index")
+            path.write_text(text)
+        self.invoke(clean_version=CLEAN_TARGET)
+        for lock in bump.LOCKS:
+            rows = bump.packages((self.root / lock).read_bytes(), lock)
+            same_version = next(row for row in rows if row["name"] == "unchanged-registry-owner")
+            self.assertEqual(same_version["version"], "0.9.0")
+            consumer = next(row for row in rows if row["name"] == "consumer")
+            self.assertIn(f'clean-kernel {CLEAN_TARGET} ({bump.source(bump.CLEAN_URL, NEW_CLEAN)})',
+                          consumer["dependencies"])
+
+    def test_clean_patch_move_preserves_versionless_exact_revision_requirements(self):
+        self.clean_version_migration()
+        path = self.root / bump.VERIFY
+        path.write_text(path.read_text().replace(f'version = "{CLEAN_CURRENT}", ', ''))
+        self.invoke(clean_version=CLEAN_TARGET)
+        doc = bump.document(path.read_bytes(), bump.VERIFY)
+        for name in ("clean-kernel", "clean-olean", "clean-verify"):
+            self.assertNotIn("version", doc["dependencies"][name])
+            self.assertEqual(bump.pin(doc["dependencies"][name], bump.CLEAN_URL, name), NEW_CLEAN)
+        self.assertEqual(set(bump.current(self.root, bump.snapshot(self.root)).clean_packages.values()),
+                         {CLEAN_TARGET})
+
+    def test_wrong_direct_clean_requirement_refuses_before_install(self):
+        self.clean_version_migration()
+        path = self.root / bump.VERIFY
+        path.write_text(path.read_text().replace(f'version = "{CLEAN_CURRENT}"',
+                                                f'version = "{CLEAN_UNSUPPORTED}"', 1))
+        self.original = bump.snapshot(self.root)
+        with self.assertRaisesRegex(bump.Refusal, "locked Clean authority"):
+            self.invoke(clean_version=CLEAN_TARGET)
+        self.assert_restored()
+
+    def test_clean_move_requires_explicit_review_and_exact_immutable_versions(self):
+        for defect in ("missing", "wrong_option", "root", "member", "ir_requirement"):
+            with self.subTest(defect=defect):
+                self.clean_version_migration()
+                clean_version = None if defect == "missing" else CLEAN_TARGET
+                if defect == "wrong_option": clean_version = CLEAN_UNSUPPORTED
+                docs = self.commands.documents
+                if defect == "root":
+                    docs[bump.CLEAN_URL, "Cargo.toml"] = docs[bump.CLEAN_URL, "Cargo.toml"].replace(
+                        CLEAN_TARGET, CLEAN_UNSUPPORTED)
+                if defect == "member":
+                    docs[bump.CLEAN_URL, "crates/clean-kernel/Cargo.toml"] = (
+                        f'[package]\nname = "clean-kernel"\nversion = "{CLEAN_UNSUPPORTED}"\n')
+                if defect == "ir_requirement":
+                    key = bump.IR_URL, "crates/trust-ir/Cargo.toml"
+                    docs[key] = docs[key].replace(CLEAN_TARGET, CLEAN_UNSUPPORTED)
+                with self.assertRaises(bump.Refusal): self.invoke(clean_version=clean_version)
+                self.assert_restored()
+                self.commands = SyntheticCommands(self.root)
+
+    def test_clean_patch_move_keeps_all_guard_rollbacks_byte_exact(self):
+        for step in GUARD_STEPS.values():
+            with self.subTest(step=step):
+                self.commands = SyntheticCommands(self.root)
+                self.clean_version_migration()
+                self.commands.fail_step = step
+                with self.assertRaises(bump.Refusal): self.invoke(clean_version=CLEAN_TARGET)
+                self.assert_restored()
+
+    def test_clean_patch_move_refuses_resolver_version_membership_and_edge_changes(self):
+        def corrupt(kind, root):
+            path = root / "Cargo.lock"
+            text = path.read_text()
+            if kind == "version":
+                text = text.replace(f'name = "clean-kernel"\nversion = "{CLEAN_TARGET}"',
+                                    f'name = "clean-kernel"\nversion = "{CLEAN_UNSUPPORTED}"')
+            if kind == "membership":
+                text += package("clean-forged", CLEAN_TARGET,
+                                bump.source(bump.CLEAN_URL, NEW_CLEAN))
+            if kind == "edge": text = text.replace('dependencies = ["trust-ir"]',
+                                                     'dependencies = ["clean-kernel"]')
+            if kind == "third_party": text = text.replace('version = "1.0.0"', 'version = "1.0.1"')
+            path.write_text(text)
+        for kind in ("version", "membership", "edge", "third_party"):
+            with self.subTest(kind=kind):
+                self.commands = SyntheticCommands(self.root)
+                self.clean_version_migration()
+                self.commands.mutate = lambda step, root: corrupt(kind, root) if step == 5 else None
+                with self.assertRaises(bump.Refusal): self.invoke(clean_version=CLEAN_TARGET)
+                self.assert_restored()
 
     def version_migration(self):
         self.coordinated()
@@ -614,8 +798,8 @@ class TransactionTests(unittest.TestCase):
     def test_olean_context_pin_and_feature_changes_refuse_without_mutation(self):
         original = self.original[bump.VERIFY].data.decode()
         for old, new in [
-                ('clean-olean = ' + dep(bump.CLEAN_URL, OLD_CLEAN, "0.9.0")[:-1],
-                 'clean-olean = ' + dep(bump.CLEAN_URL, NEW_CLEAN, "0.9.0")[:-1]),
+                ('clean-olean = ' + dep(bump.CLEAN_URL, OLD_CLEAN, CLEAN_CURRENT)[:-1],
+                 'clean-olean = ' + dep(bump.CLEAN_URL, NEW_CLEAN, CLEAN_CURRENT)[:-1]),
                 ('default-features = false', 'default-features = true'),
                 ('["dep:clean-kernel", "dep:clean-olean"]', '["dep:clean-kernel"]')]:
             with self.subTest(mutation=new):
@@ -1471,7 +1655,7 @@ class TransactionTests(unittest.TestCase):
 
     def test_target_workspace_version_changes_refuse(self):
         for url, old, new in [(bump.IR_URL, "0.14.0", "0.15.0"),
-                              (bump.CLEAN_URL, "0.9.0", "0.10.0")]:
+                              (bump.CLEAN_URL, CLEAN_CURRENT, "0.10.0")]:
             with self.subTest(url=url):
                 self.commands = SyntheticCommands(self.root)
                 key = url, "Cargo.toml"
@@ -1517,7 +1701,8 @@ class TransactionTests(unittest.TestCase):
             lambda text: text.replace('name = "trust-ir"\nversion = "0.14.0"',
                                       'name = "trust-ir"\nversion = "0.15.0"'),
             lambda text: text.replace(AY, "6" * 40),
-            lambda text: text + package("clean-new", "0.9.0", bump.source(bump.CLEAN_URL, NEW_CLEAN)),
+            lambda text: text + package("clean-new", CLEAN_CURRENT,
+                                        bump.source(bump.CLEAN_URL, NEW_CLEAN)),
             lambda text: text.replace('source = "' + bump.source(bump.IR_URL, NEW_IR) + '"\n', "", 1),
         ]
         for mutation in mutations:
@@ -1868,7 +2053,7 @@ class TransactionTests(unittest.TestCase):
             ("registry edge", (self.LAWS,), laws, "trust-ir = { workspace = true }",
              'trust-ir = { workspace = true }\nrayon = "1.8"'),
             ("git edge", (self.LAWS,), laws, "trust-ir = { workspace = true }",
-             f'trust-ir = {dep(bump.CLEAN_URL, NEW_CLEAN, "0.9.0")}'),
+             f'trust-ir = {dep(bump.CLEAN_URL, NEW_CLEAN, CLEAN_CURRENT)}'),
             ("outside cohort", (self.LAWS,), laws, "trust-ir = { workspace = true }",
              'trust-ir-contract = { path = "../trust-ir-contract" }'),
             ("aliased workspace path", (self.LAWS,), root, 'trust-ir = { path = "crates/trust-ir" }',
@@ -1974,6 +2159,71 @@ class DependencyEdgeTests(unittest.TestCase):
 
 
 class DriverTests(unittest.TestCase):
+    def test_original_fixed_descriptor_and_ancestor_advertisement_survive_the_child(self):
+        # Transport DATA only: the child is plain Python, never Targo or an
+        # admission consumer. No fixed claim is constructed by this test.
+        read_fd, write_fd = os.pipe()
+        try:
+            commands = bump.Commands(Path("/"), Path("/chosen/targo"))
+            with patch.dict(os.environ, {
+                "TRUST_FIXED_ADMISSION_FD_V1": str(read_fd),
+                "TRUST_FIXED_CLAIM_HANDOFF_V1": "retained ancestor advertisement",
+            }, clear=True):
+                output = commands.run([sys.executable, "-c",
+                    "import os; os.fstat(int(os.environ['TRUST_FIXED_ADMISSION_FD_V1'])); "
+                    "print(os.environ['TRUST_FIXED_CLAIM_HANDOFF_V1'])"],
+                    cwd=Path("/"), capture=True)
+            self.assertEqual(output, "retained ancestor advertisement\n")
+        finally:
+            os.close(read_fd)
+            os.close(write_fd)
+
+    def test_native_nested_fixed_marker_retains_its_opaque_ancestor_data(self):
+        # Exact native routing shape, plain Python child only; the original
+        # Targo owner remains responsible for authenticating the opaque locator.
+        environment = {"TRUST_FIXED_ADMISSION_FD_V1": "requires-live-ancestor-v1",
+                       "TRUST_FIXED_CLAIM_HANDOFF_V1": "opaque original ancestor locator"}
+        commands = bump.Commands(Path("/"), Path("/chosen/targo"))
+        with patch.dict(os.environ, environment, clear=True):
+            output = commands.run([sys.executable, "-c",
+                "import os,json; print(json.dumps({k:os.environ[k] for k in "
+                "('TRUST_FIXED_ADMISSION_FD_V1','TRUST_FIXED_CLAIM_HANDOFF_V1')}))"],
+                cwd=Path("/"), capture=True)
+        self.assertEqual(json.loads(output), environment)
+        for ancestor in [None, ""]:
+            invalid = {"TRUST_FIXED_ADMISSION_FD_V1": "requires-live-ancestor-v1"}
+            if ancestor is not None:
+                invalid["TRUST_FIXED_CLAIM_HANDOFF_V1"] = ancestor
+            with self.subTest(ancestor=ancestor), patch.dict(os.environ, invalid, clear=True), \
+                    patch.object(subprocess, "Popen") as child:
+                with self.assertRaises(bump.Refusal):
+                    commands.run([sys.executable, "-c", "raise AssertionError('must not start')"],
+                                 cwd=Path("/"))
+                child.assert_not_called()
+
+    def test_fixed_descriptor_malformed_or_closed_refuses_before_child(self):
+        read_fd, write_fd = os.pipe()
+        os.close(read_fd)
+        os.close(write_fd)
+        for value in ["-1", "not-a-descriptor", "requires-live-ancestor-v2", str(read_fd)]:
+            with self.subTest(value=value), patch.dict(os.environ, {
+                "TRUST_FIXED_ADMISSION_FD_V1": value,
+            }, clear=True), patch.object(subprocess, "Popen") as child:
+                with self.assertRaises(bump.Refusal):
+                    bump.Commands(Path("/"), Path("/chosen/targo")).run(
+                        [sys.executable, "-c", "raise AssertionError('must not start')"], cwd=Path("/"))
+                child.assert_not_called()
+
+    def test_isolated_cli_loads_its_exact_sibling_owner_guard(self):
+        result = subprocess.run(
+            [sys.executable, "-I", "-B", str(Path(bump.__file__).resolve()), "--help"],
+            cwd="/", text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("--stage-qualification-ir-source", result.stdout)
+        self.assertIn("--qualification-receipt", result.stdout)
+
     def test_exact_immutable_revision_only(self):
         for value in ["main", NEW_IR[:8], NEW_IR.upper().replace("2", "A"), NEW_IR + "\n", ""]:
             with self.subTest(value=value):
@@ -2158,6 +2408,259 @@ class SourceCacheAuthorityTests(unittest.TestCase):
                 with self.assertRaisesRegex(bump.Refusal, "does not match its immutable identity"):
                     self.authority(kind).read("crates/pkg/Cargo.toml")
 
+    def test_qualification_source_is_exact_read_only_data_without_remote_authority(self):
+        refs = self.git("show-ref")
+        with patch.object(self.commands, "run", side_effect=self.intercept):
+            source = bump.QualificationIrSource(self.commands, self.root / "candidate",
+                                                self.cache, self.revision)
+            self.assertEqual(source.read("crates/pkg/Cargo.toml")["package"]["name"], "pkg")
+        self.assertEqual(self.calls, [])
+        self.assertEqual(self.git("show-ref"), refs)
+        self.assertEqual(self.git("status", "--porcelain"), "")
+
+    def test_qualification_missing_selected_blob_refuses(self):
+        oid = self.git("rev-parse", self.revision + ":crates/pkg/Cargo.toml").strip()
+        (self.cache / ".git/objects" / oid[:2] / oid[2:]).unlink()
+        with self.assertRaisesRegex(bump.Refusal, "selected source closure is incomplete"):
+            bump.QualificationIrSource(self.commands, self.root / "missing",
+                                       self.cache, self.revision)
+        self.assertEqual(self.calls, [])
+
+    def test_qualification_does_not_require_unselected_historical_blobs(self):
+        old = self.git("rev-parse", self.revision + ":crates/pkg/Cargo.toml").strip()
+        (self.cache / "crates/pkg/Cargo.toml").write_text('[package]\nname="next"\n')
+        self.git("add", ".")
+        self.git("commit", "--quiet", "-m", "next")
+        self.revision = self.git("rev-parse", "HEAD").strip()
+        (self.cache / ".git/objects" / old[:2] / old[2:]).unlink()
+        source = bump.QualificationIrSource(self.commands, self.root / "selected-only",
+                                            self.cache, self.revision)
+        self.assertEqual(source.read("crates/pkg/Cargo.toml")["package"]["name"], "next")
+
+    def test_qualification_missing_commit_ancestry_refuses(self):
+        parent = self.revision
+        (self.cache / "next").write_text("next")
+        self.git("add", ".")
+        self.git("commit", "--quiet", "-m", "next")
+        self.revision = self.git("rev-parse", "HEAD").strip()
+        (self.cache / ".git/objects" / parent[:2] / parent[2:]).unlink()
+        with self.assertRaises(bump.Refusal):
+            bump.QualificationIrSource(self.commands, self.root / "missing-parent",
+                                       self.cache, self.revision)
+
+    def test_qualification_consumed_object_hash_mismatch_refuses(self):
+        real_bytes = self.commands.git_bytes
+        for kind in ("commit", "tree", "blob"):
+            def changed(args, *, cwd):
+                raw = real_bytes(args, cwd=cwd)
+                return raw + b"changed" if args[1] == kind else raw
+            with self.subTest(kind=kind), patch.object(self.commands, "git_bytes", side_effect=changed):
+                with self.assertRaisesRegex(bump.Refusal, "does not match its immutable identity"):
+                    bump.QualificationIrSource(self.commands, self.root / ("bad-" + kind),
+                                               self.cache, self.revision).read("crates/pkg/Cargo.toml")
+
+
+class QualificationStageTests(unittest.TestCase):
+    setUp = TransactionTests.setUp
+    write = TransactionTests.write
+    assert_restored = TransactionTests.assert_restored
+    def test_candidate_stage_retains_every_original_and_makes_no_guard_or_publication_claim(self):
+        receipt = self.root / "external-evidence" / "stage.json"
+        candidate = self.root / "candidate-ir"
+        target = bump.Target(NEW_CLEAN, None, {}, qualification_ir_tree="a" * 40)
+        with patch.object(bump, "target_cohort", return_value=target) as prepare, \
+                redirect_stdout(self.output), redirect_stderr(self.output):
+            bump.transaction(self.root, NEW_IR, self.commands,
+                             qualification_ir_source=candidate, qualification_receipt=receipt)
+        self.assertEqual(prepare.call_args.kwargs["qualification_ir_source"], candidate)
+        # The three locked metadata calls run; none of the eight Rust guards does.
+        self.assertEqual(self.commands.frontend_count, 9)
+        frontend = [argv for argv, *_ in self.commands.calls
+                    if argv[0] == str(self.commands.targo)]
+        self.assertEqual(len(frontend), 9)
+        self.assertTrue(all("--offline" in argv for argv in frontend))
+        record = json.loads(receipt.read_text())
+        self.assertFalse(record["publication_authority"])
+        self.assertEqual(record["source_role"], "untrusted-candidate-data")
+        self.assertEqual(record["rust_guards"], "NOT RUN")
+        self.assertIn("QUALIFICATION ONLY", self.output.getvalue())
+        self.assertNotIn("All eight files, the Rust authority guard", self.output.getvalue())
+        for path, saved in self.original.items():
+            original = Path(record["originals"]) / path
+            self.assertEqual(original.read_bytes(), saved.data)
+            self.assertEqual(original.stat().st_mode & 0o777, saved.mode)
+
+    def test_candidate_source_and_receipt_must_be_explicitly_paired(self):
+        with self.assertRaisesRegex(bump.Refusal, "explicitly selected together"):
+            bump.transaction(self.root, NEW_IR, self.commands,
+                             qualification_ir_source=self.root / "candidate")
+        self.assert_restored()
+
+    def test_candidate_stage_cli_exits_three_not_successful_adoption(self):
+        with patch.object(bump, "transaction") as transaction, \
+                patch.object(bump, "selected_targo", return_value=Path("/chosen/targo")), \
+                patch.object(bump, "Commands"):
+            status = bump.main([NEW_IR, "--targo", "/chosen/targo",
+                                "--stage-qualification-ir-source", str(self.root / "candidate"),
+                                "--qualification-receipt", str(self.root / "stage.json")])
+        self.assertEqual(status, 3)
+        self.assertEqual(transaction.call_args.kwargs["qualification_ir_source"],
+                         self.root / "candidate")
+
+
+class IrVersionMigrationTests(unittest.TestCase):
+    setUp = TransactionTests.setUp
+    write = TransactionTests.write
+    assert_restored = TransactionTests.assert_restored
+
+    def select_minor_release(self):
+        self.commands.documents[bump.IR_URL, "Cargo.toml"] = '[workspace.package]\nversion = "0.15.0"\n'
+        self.commands.ir_version_move = ("0.14.0", "0.15.0")
+
+    def test_target_version_requires_explicit_selection_before_install(self):
+        self.select_minor_release()
+        with self.assertRaisesRegex(bump.Refusal, "matching explicit selection"):
+            bump.transaction(self.root, NEW_IR, self.commands)
+        self.assert_restored()
+        self.assertEqual(self.commands.frontend_count, 0)
+
+    def test_explicit_minor_move_preserves_roster_and_all_eight_original_guards(self):
+        self.select_minor_release()
+        with redirect_stdout(self.output), redirect_stderr(self.output):
+            bump.transaction(self.root, NEW_IR, self.commands, ir_version="0.15.0")
+        after = bump.current(self.root, bump.snapshot(self.root))
+        before = bump.current(self.root, self.original)
+        self.assertEqual(set(after.ir_packages), set(before.ir_packages))
+        self.assertEqual(set(after.ir_packages.values()), {"0.15.0"})
+        self.assertEqual(self.commands.frontend_count, FRONTEND_STEPS)
+        updates = [argv for argv, *_ in self.commands.calls if "--precise" in argv]
+        self.assertEqual(len(updates), 3)
+        self.assertTrue(all(argv[argv.index("-p") + 1] == "trust-ir@0.15.0" for argv in updates))
+        guards = [argv for argv, *_ in self.commands.calls if argv[1:3] == ["--unverified", "test"]]
+        self.assertEqual([(argv[argv.index("-p") + 1], argv[argv.index("--test") + 1])
+                          for argv in guards], list(GUARD_STEPS))
+
+    def test_wrong_workspace_or_member_version_refuses_before_install(self):
+        self.select_minor_release()
+        for path, text in (("Cargo.toml", '[workspace.package]\nversion = "0.16.0"\n'),
+                           ("crates/trust-ir-build/Cargo.toml",
+                            '[package]\nname = "trust-ir-build"\nversion = "0.14.0"\n'
+                            '[dependencies]\nclean-kernel = ' + dep(
+                                bump.CLEAN_URL, NEW_CLEAN, CLEAN_CURRENT))):
+            with self.subTest(path=path), patch.dict(self.commands.documents, {(bump.IR_URL, path): text}):
+                with self.assertRaises(bump.Refusal):
+                    bump.transaction(self.root, NEW_IR, self.commands, ir_version="0.15.0")
+                self.assert_restored()
+                self.assertEqual(self.commands.frontend_count, 0)
+
+    def test_explicit_manifest_requirements_move_with_the_cohort(self):
+        self.select_minor_release()
+        for relative in bump.MANIFESTS:
+            text = (self.root / relative).read_text().replace(
+                f'git = "{bump.IR_URL}"', f'version = "0.14.0", git = "{bump.IR_URL}"')
+            self.write(relative, text)
+        self.original = bump.snapshot(self.root)
+        with redirect_stdout(self.output), redirect_stderr(self.output):
+            bump.transaction(self.root, NEW_IR, self.commands, ir_version="0.15.0")
+        root = bump.document((self.root / bump.MANIFESTS[0]).read_bytes(), "root")
+        bridge = bump.document((self.root / bump.MANIFESTS[1]).read_bytes(), "bridge")
+        selected = [root["workspace"]["dependencies"][name]
+                    for name in ("trust-ir", "trust-ir-build", "trust-ir-conformance")]
+        selected += [bridge[section][name] for section, name in
+                     (("dependencies", "trust-ir"), ("dev-dependencies", "trust-ir-build"))]
+        self.assertTrue(all(dep["version"] == "0.15.0" and dep["rev"] == NEW_IR
+                            for dep in selected))
+
+    def test_unsupported_version_or_split_current_version_refuses(self):
+        state = bump.current(self.root, self.original)
+        with self.assertRaisesRegex(bump.Refusal, "unsupported TrustIR package-version migration"):
+            bump.selected_ir_version(state, "0.16.0")
+        split = bump.Current(state.ir, state.clean, state.ay, state.ay_version,
+                             {**state.ir_packages, "trust-ir-build": "0.15.0"},
+                             state.clean_packages, state.ay_packages)
+        with self.assertRaisesRegex(bump.Refusal, "versions disagree"):
+            bump.selected_ir_version(split, "0.15.0")
+
+    def test_foreign_same_version_is_not_remapped_and_graph_changes_rollback(self):
+        self.select_minor_release()
+        for lock in bump.LOCKS:
+            with (self.root / lock).open("a") as output:
+                output.write(package("foreign-version-peer", "0.14.0", bump.REGISTRY))
+        self.original = bump.snapshot(self.root)
+        with redirect_stdout(self.output), redirect_stderr(self.output):
+            bump.transaction(self.root, NEW_IR, self.commands, ir_version="0.15.0")
+        for lock in bump.LOCKS:
+            foreign = next(row for row in bump.packages((self.root / lock).read_bytes(), lock)
+                           if row["name"] == "foreign-version-peer")
+            self.assertEqual(foreign["version"], "0.14.0")
+        bump.restore(self.root, self.original)
+        self.commands.mutate = lambda _step, _root: (self.root / "Cargo.lock").write_text(
+            (self.root / "Cargo.lock").read_text().replace(
+                'name = "foreign-version-peer"\nversion = "0.14.0"',
+                'name = "foreign-version-peer"\nversion = "0.15.0"'))
+        with self.assertRaisesRegex(bump.Refusal, "outside the admitted source cohort"):
+            bump.transaction(self.root, NEW_IR, self.commands, ir_version="0.15.0")
+        self.assert_restored()
+
+    def test_last_original_guard_failure_restores_every_original_file(self):
+        self.select_minor_release()
+        self.commands.fail_step = GUARD_STEPS["trust-cg-codegen", "must_refuse_corpus"]
+        with self.assertRaises(bump.Refusal):
+            bump.transaction(self.root, NEW_IR, self.commands, ir_version="0.15.0")
+        self.assert_restored()
+        self.assertEqual(self.commands.frontend_count, FRONTEND_STEPS)
+
+
+class CleanVersionMigrationTests(unittest.TestCase):
+    setUp = TransactionTests.setUp
+    write = TransactionTests.write
+    assert_restored = TransactionTests.assert_restored
+
+    def select_patch_release(self):
+        for (url, path), text in list(self.commands.documents.items()):
+            if url == bump.CLEAN_URL and path == "Cargo.toml":
+                self.commands.documents[url, path] = text.replace(
+                    f'version = "{CLEAN_CURRENT}"', f'version = "{CLEAN_TARGET}"')
+            elif url == bump.IR_URL:
+                self.commands.documents[url, path] = text.replace(CLEAN_CURRENT, CLEAN_TARGET)
+        self.commands.clean_version_move = bump.CLEAN_VERSION_MIGRATION
+
+    def test_patch_release_requires_explicit_selection_before_any_install(self):
+        self.select_patch_release()
+        with self.assertRaisesRegex(bump.Refusal, "Clean version differs from explicit selection"):
+            bump.transaction(self.root, NEW_IR, self.commands)
+        self.assert_restored()
+        self.assertEqual(self.commands.frontend_count, 0)
+
+    def test_explicit_patch_release_preserves_roster_and_runs_all_original_guards(self):
+        self.select_patch_release()
+        with redirect_stdout(self.output), redirect_stderr(self.output):
+            bump.transaction(self.root, NEW_IR, self.commands, clean_version=CLEAN_TARGET)
+        result = bump.current(self.root, bump.snapshot(self.root))
+        self.assertEqual(set(result.clean_packages), set(bump.current(self.root, self.original).clean_packages))
+        self.assertEqual(set(result.clean_packages.values()), {CLEAN_TARGET})
+        self.assertEqual(self.commands.frontend_count, FRONTEND_STEPS)
+        self.assertIn(f'version = "{CLEAN_TARGET}"', (self.root / bump.VERIFY).read_text())
+
+    def test_wrong_target_patch_version_refuses_despite_explicit_flag(self):
+        self.select_patch_release()
+        self.commands.documents[bump.CLEAN_URL, "Cargo.toml"] = self.commands.documents[
+            bump.CLEAN_URL, "Cargo.toml"].replace(CLEAN_TARGET, CLEAN_UNSUPPORTED)
+        with self.assertRaisesRegex(bump.Refusal, "Clean package version move"):
+            bump.transaction(self.root, NEW_IR, self.commands, clean_version=CLEAN_TARGET)
+        self.assert_restored()
+
+    def test_unsupported_patch_selection_and_foreign_graph_change_refuse(self):
+        state = bump.current(self.root, self.original)
+        with self.assertRaisesRegex(bump.Refusal, "unsupported Clean package-version migration"):
+            bump.selected_clean_version(state, CLEAN_UNSUPPORTED)
+        self.select_patch_release()
+        self.commands.mutate = lambda _step, _root: (self.root / "Cargo.lock").write_text(
+            (self.root / "Cargo.lock").read_text().replace('version = "1.0.0"', 'version = "1.0.1"'))
+        with self.assertRaises(bump.Refusal):
+            bump.transaction(self.root, NEW_IR, self.commands, clean_version=CLEAN_TARGET)
+        self.assert_restored()
+
 
 class HostileGitAuthorityTests(unittest.TestCase):
     """Actual local Git ancestry, simulated authenticated metadata; no network."""
@@ -2225,6 +2728,45 @@ class HostileGitAuthorityTests(unittest.TestCase):
 
 
 class CliRegistryAdmissionTests(unittest.TestCase):
+    def test_reviewed_trust_ir_and_clean_versions_reach_transaction_unchanged(self):
+        with patch.object(bump, "selected_targo", return_value=Path("/selected/targo")), \
+                patch.object(bump, "Commands", return_value=object()), \
+                patch.object(bump, "transaction") as transaction:
+            result = bump.main([NEW_IR, "--targo", "/selected/targo",
+                                "--ir-version", TRUST_IR_TARGET,
+                                "--clean-version", CLEAN_TARGET])
+        self.assertEqual(result, 0)
+        self.assertEqual(transaction.call_args.kwargs["ir_version"], TRUST_IR_TARGET)
+        self.assertEqual(transaction.call_args.kwargs["clean_version"], CLEAN_TARGET)
+
+    def test_unreviewed_trust_ir_and_clean_versions_refuse_at_cli_boundary(self):
+        for option, version in (("--ir-version", TRUST_IR_UNSUPPORTED),
+                                ("--clean-version", CLEAN_UNSUPPORTED)):
+            with self.subTest(option=option), patch.object(bump, "transaction") as transaction, \
+                    redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as refused:
+                bump.main([NEW_IR, "--targo", "/selected/targo", option, version])
+            self.assertEqual(refused.exception.code, 2)
+            transaction.assert_not_called()
+
+    def test_explicit_guard_interface_reaches_commands_without_fallback(self):
+        for selection in ["ordinary", "native-worker", "original-fixed-v1"]:
+            with self.subTest(selection=selection), \
+                    patch.object(bump, "selected_targo", return_value=Path("/selected/targo")), \
+                    patch.object(bump, "Commands") as commands, \
+                    patch.object(bump, "transaction") as transaction:
+                self.assertEqual(bump.main([NEW_IR, "--targo", "/selected/targo",
+                                            "--guard-admission", selection]), 0)
+                self.assertEqual(commands.call_args.kwargs, {"guard_admission": selection})
+                transaction.assert_called_once()
+        for selection in ["fixed", "legacy", "sdk", "", "original-fixed-v2"]:
+            with self.subTest(selection=selection), patch.object(bump, "Commands") as commands, \
+                    patch.object(bump, "transaction") as transaction, redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit) as error:
+                    bump.main([NEW_IR, "--targo", "/selected/targo", "--guard-admission", selection])
+                self.assertEqual(error.exception.code, 2)
+                commands.assert_not_called()
+                transaction.assert_not_called()
+
     """Exercise the real main/parser boundary without starting a transaction."""
 
     def test_named_cfg_aliases_versions_reach_transaction_unchanged(self):

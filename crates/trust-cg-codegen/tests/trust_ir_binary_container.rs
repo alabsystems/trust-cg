@@ -43,7 +43,7 @@ use trust_ir_build::ModuleBuilder;
 /// trust-ir pin. Pinned so a lost or added fixture is a visible change; it
 /// equals the pinned corpus's top-level golden count
 /// (`the_vendored_conformance_fixtures_are_the_pinned_corpus_bytes`).
-const CONFORMANCE_FIXTURE_COUNT: usize = 64;
+const CONFORMANCE_FIXTURE_COUNT: usize = 65;
 
 /// The version-read gate of the pinned trust-ir reader, as its error prints.
 const TRUST_IR_VERSION_REFUSAL: &str = "failed to deserialize TRUST_IR module: unsupported version";
@@ -57,12 +57,14 @@ const TRUST_IR_VERSION_REFUSAL: &str = "failed to deserialize TRUST_IR module: u
 /// versions; v64 adds addressable Storage geometry, and v65 adds explicit
 /// single-inhabited enum selectors, v66 adds nominal closure origins, v67
 /// adds tensor types and contractions, v68 tensor maps, reductions and views,
-/// v69 tensor gathers and scatters, and v70 content-addressed weight blobs.
-/// V70 is the reader's `wire_version`
+/// v69 tensor gathers and scatters, v70 content-addressed weight blobs, v71 a
+/// template-only thin-pointer contract, v72 direct uninhabited storage, v73
+/// nominal function items and v74 BoxDeref validity. V74 is the reader's
+/// `wire_version`
 /// (trust-ir `binary::VERSION`). Checked against the pin by
 /// `the_newest_module_version_is_the_readers_and_above_the_template_floor`,
 /// so a pin that moves any of these numbers fails there first.
-const NEWEST_MODULE_VERSION: u32 = trust_ir::binary::TENSOR_BLOB_FORMAT_VERSION;
+const NEWEST_MODULE_VERSION: u32 = trust_ir::binary::BOX_DEREF_VALIDITY_FORMAT_VERSION;
 
 #[test]
 fn the_newest_module_version_is_the_readers_and_above_the_template_floor() {
@@ -70,6 +72,7 @@ fn the_newest_module_version_is_the_readers_and_above_the_template_floor() {
         CERTIFICATE_BINDING_FORMAT_VERSION, EFFECT_SUMMARY_FORMAT_VERSION,
         NOMINAL_IDENTITY_FORMAT_VERSION, PARAM_POINTEE_PLACE_FORMAT_VERSION,
         SIGNATURE_ABI_FORMAT_VERSION, TEMPLATE_FORMAT_VERSION,
+        THIN_POINTER_CONTRACT_FORMAT_VERSION,
     };
     assert_eq!(BUILD_IDENTITY.wire_version, NEWEST_MODULE_VERSION);
     // Every version above the template floor is a module version, in order.
@@ -88,6 +91,9 @@ fn the_newest_module_version_is_the_readers_and_above_the_template_floor() {
             TEMPLATE_FORMAT_VERSION + 11,
             TEMPLATE_FORMAT_VERSION + 12,
             TEMPLATE_FORMAT_VERSION + 13,
+            TEMPLATE_FORMAT_VERSION + 15,
+            TEMPLATE_FORMAT_VERSION + 16,
+            TEMPLATE_FORMAT_VERSION + 17,
         ],
         [
             NOMINAL_IDENTITY_FORMAT_VERSION,
@@ -102,8 +108,16 @@ fn the_newest_module_version_is_the_readers_and_above_the_template_floor() {
             trust_ir::binary::TENSOR_FORMAT_VERSION,
             trust_ir::binary::TENSOR_MAP_REDUCE_VIEW_FORMAT_VERSION,
             trust_ir::binary::TENSOR_GATHER_SCATTER_FORMAT_VERSION,
+            trust_ir::binary::TENSOR_BLOB_FORMAT_VERSION,
+            trust_ir::binary::UNINHABITED_DIRECT_STORAGE_FORMAT_VERSION,
+            trust_ir::binary::FN_ITEM_IDENTITY_FORMAT_VERSION,
             NEWEST_MODULE_VERSION,
         ]
+    );
+    assert_eq!(
+        THIN_POINTER_CONTRACT_FORMAT_VERSION,
+        TEMPLATE_FORMAT_VERSION + 14,
+        "v71 is the template-only thin-pointer contract between module v70 and v72"
     );
 }
 
@@ -124,7 +138,6 @@ const PRODUCER_OMITTED_GATE_FIXTURES: &[&str] = &[
     "conformance/composition",
     "conformance/import_scheme",
     "conformance/spec_carrier",
-    "conformance/storage_only",
     "conformance/text_directives",
 ];
 const PRODUCER_OMITTED_GATE_TEXT: &str = "has a body but no codegen license";
@@ -883,8 +896,9 @@ fn bound_synthetic_kernel_recheck_roundtrips_through_tmbc_at_v61() {
 /// drop first, and the adapter's shared floor refuses it by the construct's
 /// own name, the first it meets.
 /// The blob keeps its own v49 header. Geometry-only `conformance/storage_only`
-/// retains v64; `conformance/single_inhabited_enums` carries the newest module
-/// version v65 (v57 is the template floor, see [`NEWEST_MODULE_VERSION`]).
+/// retains v64; `conformance/single_inhabited_enums` carries v65 and
+/// `conformance/box_deref` carries the newest module version v74 (v71 is the
+/// template-only thin-pointer floor; see [`NEWEST_MODULE_VERSION`]).
 /// The generated `pinned_writer/runtime_closure_v63` retains its v63 header. Previously v62 was carried by
 /// `conformance/param_pointee_place` (trust-ir 8d304e36, the
 /// `ParamPointeeEntry` clause place; v61 is `certificate_binding`'s, from the
@@ -918,6 +932,11 @@ fn v49_crystal_lane_blob_decodes_and_the_adapter_floor_refuses_it_by_name() {
         )),
         trust_ir::binary::SINGLE_INHABITED_ENUM_FORMAT_VERSION,
         "the explicit single-inhabited fixture carries its normative v65 header"
+    );
+    assert_eq!(
+        header_version(&read(&fixture_root().join("conformance/box_deref.tmbc"))),
+        trust_ir::binary::BOX_DEREF_VALIDITY_FORMAT_VERSION,
+        "the BoxDeref validity fixture carries its normative v74 header"
     );
     let expected = json_module(&fixture_root().join("pinned_writer/crystal_lane_v49.json"));
     for (entry, decoded) in [

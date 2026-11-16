@@ -167,7 +167,6 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use trust_cg_ir::regs::VReg;
 use trust_cg_ir::x86_64_ops::{X86CondCode, X86Opcode};
 use trust_cg_ir::x86_64_regs::{
     RAX, RDX, X86_CALLER_SAVED_GPRS, X86PReg, XMM0, XMM1, x86_preg_name,
@@ -177,7 +176,7 @@ use trust_cg_lower::x86_64_isel::{X86CallAbi, X86ISelFunction, X86ISelInst, X86I
 
 use crate::post_ra_dataflow::{
     FLAGS_LOC, GPR_LANE_MASK, InstAccess, NUM_LOCS, SYMBOLIC_LANES, WINDOWS_X64_CALLER_SAVED_GPRS,
-    XMM_LANE_MASK, classify_x86_post_ra_inst, loc_of, low_bits_lane_mask,
+    X86Allocation, XMM_LANE_MASK, classify_x86_post_ra_inst, loc_of, low_bits_lane_mask,
 };
 use crate::post_regalloc_recheck::PostRegallocRecheckMode;
 
@@ -1134,7 +1133,7 @@ fn loc_name(loc: u8) -> String {
 fn classify_stream<'s>(
     block_order: &[Block],
     get_insts: impl Fn(&Block) -> Option<&'s [X86ISelInst]>,
-    alloc: &HashMap<VReg, X86PReg>,
+    alloc: &X86Allocation,
     call_abi: X86CallAbi,
 ) -> Option<HashMap<Block, Vec<InstAccess>>> {
     let mut out = HashMap::new();
@@ -1161,7 +1160,7 @@ fn classify_stream<'s>(
 pub fn check_x86_captured_spec(
     spec: &X86PostFixupSpec,
     final_func: &X86ISelFunction,
-    alloc: &HashMap<VReg, X86PReg>,
+    alloc: &X86Allocation,
     call_abi: X86CallAbi,
 ) -> Vec<PostRaSpecViolation> {
     let mut violations = Vec::new();
@@ -1326,7 +1325,7 @@ pub fn check_x86_captured_spec(
 pub fn evaluate_x86_captured_spec_with_mode(
     spec: &X86PostFixupSpec,
     final_func: &X86ISelFunction,
-    alloc: &HashMap<VReg, X86PReg>,
+    alloc: &X86Allocation,
     arch: &str,
     call_abi: X86CallAbi,
     mode: PostRegallocRecheckMode,
@@ -1356,7 +1355,7 @@ pub fn evaluate_x86_captured_spec_with_mode(
 pub fn evaluate_x86_captured_spec(
     spec: &X86PostFixupSpec,
     final_func: &X86ISelFunction,
-    alloc: &HashMap<VReg, X86PReg>,
+    alloc: &X86Allocation,
     arch: &str,
     call_abi: X86CallAbi,
 ) -> Option<PostRaSpecViolation> {
@@ -1468,7 +1467,12 @@ mod tests {
     }
 
     fn check(spec: &X86PostFixupSpec, final_func: &X86ISelFunction) -> Vec<PostRaSpecViolation> {
-        check_x86_captured_spec(spec, final_func, &HashMap::new(), X86CallAbi::SystemV)
+        check_x86_captured_spec(
+            spec,
+            final_func,
+            &X86Allocation::default(),
+            X86CallAbi::SystemV,
+        )
     }
 
     fn assert_clean(spec: &X86PostFixupSpec, final_func: &X86ISelFunction) {
@@ -1913,7 +1917,7 @@ mod tests {
         let enforced = evaluate_x86_captured_spec_with_mode(
             &spec,
             &wrong,
-            &HashMap::new(),
+            &X86Allocation::default(),
             "x86_64",
             X86CallAbi::SystemV,
             PostRegallocRecheckMode::Enforce,
@@ -1927,7 +1931,7 @@ mod tests {
         let warned = evaluate_x86_captured_spec_with_mode(
             &spec,
             &wrong,
-            &HashMap::new(),
+            &X86Allocation::default(),
             "x86_64",
             X86CallAbi::SystemV,
             PostRegallocRecheckMode::Warn,
@@ -2159,7 +2163,7 @@ mod tests {
             let enforced = evaluate_x86_captured_spec_with_mode(
                 &spec,
                 &wrong,
-                &HashMap::new(),
+                &X86Allocation::default(),
                 "x86_64",
                 X86CallAbi::SystemV,
                 PostRegallocRecheckMode::Enforce,
@@ -2172,7 +2176,7 @@ mod tests {
             let warned = evaluate_x86_captured_spec_with_mode(
                 &spec,
                 &wrong,
-                &HashMap::new(),
+                &X86Allocation::default(),
                 "x86_64",
                 X86CallAbi::SystemV,
                 PostRegallocRecheckMode::Warn,
@@ -2252,7 +2256,7 @@ mod tests {
             let enforced = evaluate_x86_captured_spec_with_mode(
                 &spec,
                 &wrong,
-                &HashMap::new(),
+                &X86Allocation::default(),
                 "x86_64",
                 X86CallAbi::SystemV,
                 PostRegallocRecheckMode::Enforce,
@@ -2265,7 +2269,7 @@ mod tests {
             let warned = evaluate_x86_captured_spec_with_mode(
                 &spec,
                 &wrong,
-                &HashMap::new(),
+                &X86Allocation::default(),
                 "x86_64",
                 X86CallAbi::SystemV,
                 PostRegallocRecheckMode::Warn,
@@ -2486,7 +2490,7 @@ mod tests {
         let outcome = evaluate_x86_captured_spec_with_mode(
             &spec,
             &final_func,
-            &HashMap::new(),
+            &X86Allocation::default(),
             "x86_64",
             X86CallAbi::SystemV,
             PostRegallocRecheckMode::Warn,
@@ -2520,7 +2524,7 @@ mod tests {
         let outcome = evaluate_x86_captured_spec_with_mode(
             &spec,
             &final_func,
-            &HashMap::new(),
+            &X86Allocation::default(),
             "x86_64",
             X86CallAbi::SystemV,
             PostRegallocRecheckMode::Enforce,
@@ -2548,7 +2552,7 @@ mod tests {
         let outcome = evaluate_x86_captured_spec_with_mode(
             &spec,
             &build(),
-            &HashMap::new(),
+            &X86Allocation::default(),
             "x86_64",
             X86CallAbi::SystemV,
             PostRegallocRecheckMode::Warn,

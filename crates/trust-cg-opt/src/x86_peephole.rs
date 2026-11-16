@@ -207,6 +207,16 @@ fn run_impl(
         }
     }
 
+    // Multi-instruction pass: cmp+setcc+(normalize)+zero-test+Cmovcc fusion,
+    // the select-side sibling of the branch fusion above, under the same
+    // ordering constraint. Withheld unless an installed policy enables it
+    // (`x86_select_flag_fusion`'s evidence boundary).
+    if crate::x86_select_flag_fusion::x86_select_flag_fusion_enabled()
+        && crate::x86_select_flag_fusion::select_flag_fusion_run(func)
+    {
+        changed = true;
+    }
+
     // No pass here may separate a `Setcc %D, cc` from ISel's following
     // `Movzx %D, %D`. `Setcc` writes only %D[7:0], and every register model
     // (the allocator's `x86_operand_access`, `effects::x86_operand0_may_be_read`,
@@ -247,19 +257,43 @@ fn run_impl(
     // produced, so the emitted bytes are unchanged. (Same restructuring as
     // `SibFoldVRegMaps` above; `function_use_def_counts` was 8.4% of the whole
     // x86 optimization phase at 2400 functions, measured 2026-08-31.)
+    //
+    // The maps are also built LAZILY: the routine can only rewrite at an
+    // `OrRR` anchor, and on a block without one it returns `false` having
+    // read nothing, so such a block needs no maps. A build is made at the
+    // first block that has an anchor and again at the first anchor block
+    // after each collapse, so every block that reads the maps reads exactly
+    // the maps of the current `func`. Which blocks the filter admits is
+    // pinned by `peephole_lazy_fn_maps_still_reach_every_anchor_block`; that
+    // a rewrite drops the maps is checked in test and debug builds against a
+    // fresh build before every reuse, and pinned by
+    // `peephole_lazy_fn_facts_are_rebuilt_after_each_rewrite`.
     if rotate_var_idiom_enabled() {
         let live_in = flags_live_in_by_block(func);
-        let mut maps = RotateVarFnMaps::build(func);
+        let mut maps: Option<RotateVarFnMaps> = None;
         for block_id in func.block_order.clone() {
+            if !block_has_opcode(func, block_id, X86Opcode::OrRR) {
+                continue;
+            }
+            let current = maps.get_or_insert_with(|| RotateVarFnMaps::build(func));
+            // A reused build must be the build of the current `func`: test and
+            // debug builds compare it with a fresh one, so a rewrite that
+            // stops dropping the maps fails there.
+            #[cfg(any(test, debug_assertions))]
+            assert_eq!(
+                current.canonical_view(),
+                RotateVarFnMaps::build(func).canonical_view(),
+                "rotate-var maps are stale at block {block_id:?}"
+            );
             if rotate_var_idiom_run_on_block_with_maps(
                 func,
                 block_id,
                 &live_in,
                 admit_reconstructed,
-                &maps,
+                current,
             ) {
                 changed = true;
-                maps = RotateVarFnMaps::build(func);
+                maps = None;
             }
         }
     }
@@ -289,12 +323,39 @@ fn run_impl(
     // phase at 2400 functions, measured 2026-08-31). Rebuilding immediately
     // after any fold hands each block exactly the maps a per-block build would
     // have produced, so the emitted bytes are unchanged.
+    //
+    // The rebuild after a fold is INCREMENTAL: a fold edits only its own
+    // block, and every map is a sum (counts) or a union (mentioning blocks)
+    // of per-block parts, so taking the block's part out before the fold and
+    // putting its new part in after yields the maps a whole-function build of
+    // the edited function produces (`sib_fold_maps_refresh_matches_rebuild`
+    // pins it). A block is measured before every fold attempt; the whole
+    // function is no longer re-scanned once per fold.
     {
         let mut maps = SibFoldVRegMaps::build(func);
         for block_id in func.block_order.clone() {
+            // Every anchor is a `LeaSib` or an `AddRR`; a block with neither
+            // folds nothing, so it needs no part measured.
+            if !block_has_opcode(func, block_id, X86Opcode::LeaSib)
+                && !block_has_opcode(func, block_id, X86Opcode::AddRR)
+            {
+                continue;
+            }
+            let before = SibFoldBlockPart::of(func, block_id);
             if sib_addr_fold_run_on_block_with_maps(func, block_id, &maps) {
                 changed = true;
-                maps = SibFoldVRegMaps::build(func);
+                maps.replace_block_part(block_id, &before, &SibFoldBlockPart::of(func, block_id));
+                // The refresh is exact only while a fold edits nothing outside
+                // its own block. Test and debug builds check that against a
+                // whole-function rebuild after every fold, so a fold that
+                // starts touching another block fails there instead of
+                // leaving stale counts or escape sets for the next block.
+                #[cfg(any(test, debug_assertions))]
+                assert_eq!(
+                    maps.canonical_view(),
+                    SibFoldVRegMaps::build(func).canonical_view(),
+                    "SIB fold edited outside block {block_id:?}: incremental map refresh is stale"
+                );
             }
         }
     }
@@ -308,14 +369,38 @@ fn run_impl(
     // modulo 2^64), so it carries no overflow side condition. DEFAULT-ON;
     // `TCG_NO_X86_SIB_SCALE1_FOLD` is the forensic opt-out. See
     // `sib_scale1_index_fold_run_on_block` for the side conditions.
+    //
+    // The counts and the flag liveness are built only for a block that holds
+    // a candidate multiply ([`block_has_sib_scale_candidate`]): on any other
+    // block the fold returns `false` having read neither. They are rebuilt
+    // at the next candidate block after a fold, exactly as the eager rebuild
+    // after every fold would give that block.
     if sib_scale1_index_fold_enabled() {
-        let mut counts = FnUseDefCounts::build(func);
-        let mut flags = X86FlagLiveness::analyze(func);
+        let mut facts: Option<(FnUseDefCounts, X86FlagLiveness)> = None;
         for block_id in func.block_order.clone() {
-            if sib_scale1_index_fold_run_on_block(func, block_id, &counts, &flags) {
+            if !block_has_sib_scale_candidate(func, block_id) {
+                continue;
+            }
+            let (counts, flags) = facts.get_or_insert_with(|| {
+                (FnUseDefCounts::build(func), X86FlagLiveness::analyze(func))
+            });
+            // As for the rotate-var maps: a reused build must equal a fresh one.
+            #[cfg(any(test, debug_assertions))]
+            {
+                assert_eq!(
+                    counts.canonical_view(),
+                    FnUseDefCounts::build(func).canonical_view(),
+                    "SIB scale-1 use/def counts are stale at block {block_id:?}"
+                );
+                assert_eq!(
+                    flags.canonical_view(),
+                    X86FlagLiveness::analyze(func).canonical_view(),
+                    "SIB scale-1 flag liveness is stale at block {block_id:?}"
+                );
+            }
+            if sib_scale1_index_fold_run_on_block(func, block_id, counts, flags) {
                 changed = true;
-                counts = FnUseDefCounts::build(func);
-                flags = X86FlagLiveness::analyze(func);
+                facts = None;
             }
         }
     }
@@ -373,18 +458,33 @@ fn run_impl(
     // `func` only when it returns `true`, so one build serves every block up
     // to the next fusion and is rebuilt the instant one fires — handing each
     // block exactly the maps a per-block build would have produced.
+    // Built lazily as above: an anchor is an `XorRR` or `AddRR`, and a block
+    // with neither returns `false` without reading the maps or tracing.
     if rmw_fuse_enabled() {
-        let mut maps = RmwFuseFnMaps::build(func);
+        let mut maps: Option<RmwFuseFnMaps> = None;
         for block_id in func.block_order.clone() {
+            if !block_has_opcode(func, block_id, X86Opcode::XorRR)
+                && !block_has_opcode(func, block_id, X86Opcode::AddRR)
+            {
+                continue;
+            }
+            let current = maps.get_or_insert_with(|| RmwFuseFnMaps::build(func));
+            // As for the rotate-var maps: a reused build must equal a fresh one.
+            #[cfg(any(test, debug_assertions))]
+            assert_eq!(
+                current.canonical_view(),
+                RmwFuseFnMaps::build(func).canonical_view(),
+                "RMW-fuse maps are stale at block {block_id:?}"
+            );
             if rmw_fuse_run_on_block_with_maps(
                 func,
                 block_id,
                 admit_reconstructed,
-                &maps,
+                current,
                 rmw_fuse_sdef_enabled(),
             ) {
                 changed = true;
-                maps = RmwFuseFnMaps::build(func);
+                maps = None;
             }
         }
     }
@@ -1065,29 +1165,50 @@ fn commute_dying_source_enabled() -> bool {
     std::env::var_os("TCG_X86_COMMUTE_DST").is_some()
 }
 
+/// Whether block `block_id` of `func` holds an instruction with `opcode`
+/// (false for an absent block).
+fn block_has_opcode(
+    func: &X86ISelFunction,
+    block_id: trust_cg_lower::instructions::Block,
+    opcode: X86Opcode,
+) -> bool {
+    func.blocks
+        .get(&block_id)
+        .is_some_and(|block| block.insts.iter().any(|inst| inst.opcode == opcode))
+}
+
 /// FUNCTION-WIDE use and def counts under [`vreg_uses_in_block`]'s exact
 /// def/use convention (operand 0 of a value-producing opcode is the def; its
 /// only reads are addressing base/index regs; every other operand is a use).
 fn function_use_def_counts(func: &X86ISelFunction) -> (FxHashMap<VReg, u32>, FxHashMap<VReg, u32>) {
-    use crate::effects::x86_produces_value;
     let mut uses = FxHashMap::default();
     let mut defs = FxHashMap::default();
     for block in func.blocks.values() {
         for inst in &block.insts {
-            let produces = x86_produces_value(inst.opcode);
-            for (idx, op) in inst.operands.iter().enumerate() {
-                if produces && idx == 0 {
-                    if let X86ISelOperand::VReg(d) = op {
-                        *defs.entry(*d).or_insert(0) += 1;
-                    }
-                    count_addressing_uses(op, &mut uses);
-                    continue;
-                }
-                count_operand_uses(op, &mut uses);
-            }
+            count_inst_uses_defs(inst, &mut uses, &mut defs);
         }
     }
     (uses, defs)
+}
+
+/// One instruction's contribution to [`function_use_def_counts`], which is
+/// the sum of these over every instruction of the function.
+fn count_inst_uses_defs(
+    inst: &X86ISelInst,
+    uses: &mut FxHashMap<VReg, u32>,
+    defs: &mut FxHashMap<VReg, u32>,
+) {
+    let produces = crate::effects::x86_produces_value(inst.opcode);
+    for (idx, op) in inst.operands.iter().enumerate() {
+        if produces && idx == 0 {
+            if let X86ISelOperand::VReg(d) = op {
+                *defs.entry(*d).or_insert(0) += 1;
+            }
+            count_addressing_uses(op, uses);
+            continue;
+        }
+        count_operand_uses(op, uses);
+    }
 }
 
 static TEST_ELIDE_ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -2050,6 +2171,32 @@ impl RotateVarFnMaps {
             fn_defs,
         }
     }
+
+    /// Every entry, rendered and sorted, so two builds compare as values.
+    #[cfg(any(test, debug_assertions))]
+    fn canonical_view(&self) -> [Vec<String>; 3] {
+        [
+            sorted_debug_entries(&self.sites),
+            sorted_debug_entries(&self.fn_uses),
+            sorted_debug_entries(&self.fn_defs),
+        ]
+    }
+}
+
+/// A map's entries rendered with `Debug` and sorted, so two builds of the
+/// same facts compare equal whatever their hash order.
+#[cfg(any(test, debug_assertions))]
+fn sorted_debug_entries<'a, K, V>(entries: impl IntoIterator<Item = (&'a K, &'a V)>) -> Vec<String>
+where
+    K: std::fmt::Debug + 'a,
+    V: std::fmt::Debug + 'a,
+{
+    let mut rendered: Vec<String> = entries
+        .into_iter()
+        .map(|(key, value)| format!("{key:?}={value:?}"))
+        .collect();
+    rendered.sort();
+    rendered
 }
 
 /// Chase `v` through single-def plain `MovRR` copies to a single-def `MovRI`
@@ -3071,10 +3218,6 @@ fn imul_fuse_t_dead_after(insts: &[X86ISelInst], j: usize, t: VReg) -> bool {
         }
         // Any mention of the id (any class) in a USE position keeps it; an
         // operand-0 def of the same id at the same class ends the range.
-        let mut mentions = FxHashSet::default();
-        for op in &w.operands {
-            collect_operand_mentions_flat(op, &mut mentions);
-        }
         let defines = crate::effects::x86_produces_value(w.opcode)
             && matches!(w.operands.first(), Some(X86ISelOperand::VReg(d)) if *d == t);
         if defines {
@@ -3086,18 +3229,36 @@ fn imul_fuse_t_dead_after(insts: &[X86ISelInst], j: usize, t: VReg) -> bool {
             {
                 return false;
             }
-            let mut src_mentions = FxHashSet::default();
-            for op in w.operands.iter().skip(1) {
-                collect_operand_mentions_flat(op, &mut src_mentions);
-            }
-            return !src_mentions.iter().any(|m: &VReg| m.id == t.id);
+            return !w
+                .operands
+                .iter()
+                .skip(1)
+                .any(|op| operand_mentions_vreg_id_flat(op, t.id));
         }
-        if mentions.iter().any(|m| m.id == t.id) {
+        if w.operands
+            .iter()
+            .any(|op| operand_mentions_vreg_id_flat(op, t.id))
+        {
             return false;
         }
         k += 1;
     }
     false
+}
+
+/// Whether `op` mentions a VReg with register id `id`, at any class: the
+/// question `imul_fuse_t_dead_after` asks of each instruction, answered
+/// without collecting the instruction's mentions into a set first. Walks the
+/// operand exactly as [`collect_operand_mentions_flat`] does.
+fn operand_mentions_vreg_id_flat(op: &X86ISelOperand, id: u32) -> bool {
+    match op {
+        X86ISelOperand::VReg(v) => v.id == id,
+        X86ISelOperand::MemAddr { base, .. } => operand_mentions_vreg_id_flat(base, id),
+        X86ISelOperand::SibMemAddr { base, index, .. } => {
+            operand_mentions_vreg_id_flat(base, id) || operand_mentions_vreg_id_flat(index, id)
+        }
+        _ => false,
+    }
 }
 
 fn collect_operand_mentions_flat(op: &X86ISelOperand, out: &mut FxHashSet<VReg>) {
@@ -3527,6 +3688,16 @@ impl RmwFuseFnMaps {
             fn_uses,
             fn_defs,
         }
+    }
+
+    /// Every entry, rendered and sorted, so two builds compare as values.
+    #[cfg(any(test, debug_assertions))]
+    fn canonical_view(&self) -> [Vec<String>; 3] {
+        [
+            sorted_debug_entries(&self.sites),
+            sorted_debug_entries(&self.fn_uses),
+            sorted_debug_entries(&self.fn_defs),
+        ]
     }
 }
 
@@ -5023,6 +5194,15 @@ impl FnUseDefCounts {
     fn use_count(&self, v: VReg) -> u32 {
         self.uses.get(&v).copied().unwrap_or(0)
     }
+
+    /// Every count, rendered and sorted, so two builds compare as values.
+    #[cfg(any(test, debug_assertions))]
+    fn canonical_view(&self) -> [Vec<String>; 2] {
+        [
+            sorted_debug_entries(&self.uses),
+            sorted_debug_entries(&self.defs),
+        ]
+    }
 }
 
 /// Whole-function VReg maps precomputed ONCE per `sib_addr_fold_run_on_block`
@@ -5042,27 +5222,47 @@ struct SibFoldVRegMaps {
     /// predicate for defs, `vreg_uses_in_block`'s convention (which reads
     /// addressing regs inside memory operands too) for uses.
     counts: FnUseDefCounts,
-    /// For each VReg, the blocks that MENTION it (any operand, per
-    /// `instruction_mentions_vreg`), kept only as far as the cross-block
-    /// escape question needs: the one block, or the fact that there are
-    /// several.
-    mention_blocks: FxHashMap<VReg, MentionBlocks>,
+    /// For each VReg, the distinct blocks that MENTION it (any operand, per
+    /// `instruction_mentions_vreg`). A VReg no block mentions has no entry or
+    /// an empty list; the two read the same.
+    mention_blocks: FxHashMap<VReg, Vec<trust_cg_lower::instructions::Block>>,
 }
 
-/// The blocks mentioning one VReg, as [`SibFoldVRegMaps::escapes`] reads them.
-#[derive(Clone, Copy)]
-enum MentionBlocks {
-    /// Every mention is in this block.
-    One(trust_cg_lower::instructions::Block),
-    /// At least two distinct blocks mention it.
-    Several,
+/// One block's part of [`SibFoldVRegMaps`]: its instructions' use and def
+/// counts, and the VRegs it mentions.
+struct SibFoldBlockPart {
+    uses: FxHashMap<VReg, u32>,
+    defs: FxHashMap<VReg, u32>,
+    mentions: FxHashSet<VReg>,
+}
+
+impl SibFoldBlockPart {
+    /// The part of `block_id` as `func` holds it now (empty for a missing
+    /// block, which contributes nothing to a build either).
+    fn of(func: &X86ISelFunction, block_id: trust_cg_lower::instructions::Block) -> Self {
+        let mut part = SibFoldBlockPart {
+            uses: FxHashMap::default(),
+            defs: FxHashMap::default(),
+            mentions: FxHashSet::default(),
+        };
+        if let Some(block) = func.blocks.get(&block_id) {
+            for inst in &block.insts {
+                count_inst_uses_defs(inst, &mut part.uses, &mut part.defs);
+                for op in &inst.operands {
+                    collect_operand_mentions_flat(op, &mut part.mentions);
+                }
+            }
+        }
+        part
+    }
 }
 
 impl SibFoldVRegMaps {
     /// Build the maps in two O(n) passes over every block/inst.
     fn build(func: &X86ISelFunction) -> Self {
         let counts = FnUseDefCounts::build(func);
-        let mut mention_blocks: FxHashMap<VReg, MentionBlocks> = FxHashMap::default();
+        let mut mention_blocks: FxHashMap<VReg, Vec<trust_cg_lower::instructions::Block>> =
+            FxHashMap::default();
         for (bid, block) in &func.blocks {
             for inst in &block.insts {
                 // Every VReg any operand mentions (same predicate as
@@ -5076,6 +5276,78 @@ impl SibFoldVRegMaps {
             counts,
             mention_blocks,
         }
+    }
+
+    /// Replace `block_id`'s part `before` by its part `after`: the maps then
+    /// equal a [`SibFoldVRegMaps::build`] of the function whose only change is
+    /// that block, up to entries that read as absent (a zero count, an empty
+    /// mention list).
+    fn replace_block_part(
+        &mut self,
+        block_id: trust_cg_lower::instructions::Block,
+        before: &SibFoldBlockPart,
+        after: &SibFoldBlockPart,
+    ) {
+        fn shift(
+            counts: &mut FxHashMap<VReg, u32>,
+            before: &FxHashMap<VReg, u32>,
+            after: &FxHashMap<VReg, u32>,
+        ) {
+            for (v, n) in before {
+                let entry = counts.entry(*v).or_insert(0);
+                *entry = entry
+                    .checked_sub(*n)
+                    .expect("a block's counts are part of the function's");
+            }
+            for (v, n) in after {
+                *counts.entry(*v).or_insert(0) += *n;
+            }
+        }
+        shift(&mut self.counts.uses, &before.uses, &after.uses);
+        shift(&mut self.counts.defs, &before.defs, &after.defs);
+        for v in before.mentions.difference(&after.mentions) {
+            if let Some(blocks) = self.mention_blocks.get_mut(v) {
+                blocks.retain(|b| *b != block_id);
+            }
+        }
+        for v in after.mentions.difference(&before.mentions) {
+            let blocks = self.mention_blocks.entry(*v).or_default();
+            if !blocks.contains(&block_id) {
+                blocks.push(block_id);
+            }
+        }
+    }
+
+    /// The maps' entries that a reader can tell apart (`use_count`,
+    /// `def_count`, `escapes`): non-zero counts and the set of mentioning
+    /// blocks, in a canonical order.
+    #[cfg(any(test, debug_assertions))]
+    fn canonical_view(&self) -> (Vec<String>, Vec<String>, Vec<String>) {
+        let counts = |m: &FxHashMap<VReg, u32>| {
+            let mut v: Vec<String> = m
+                .iter()
+                .filter(|(_, n)| **n != 0)
+                .map(|(k, n)| format!("{k:?}={n}"))
+                .collect();
+            v.sort();
+            v
+        };
+        let mut mentions: Vec<String> = self
+            .mention_blocks
+            .iter()
+            .filter(|(_, blocks)| !blocks.is_empty())
+            .map(|(k, blocks)| {
+                let mut b: Vec<u32> = blocks.iter().map(|b| b.0).collect();
+                b.sort_unstable();
+                format!("{k:?}:{b:?}")
+            })
+            .collect();
+        mentions.sort();
+        (
+            counts(&self.counts.uses),
+            counts(&self.counts.defs),
+            mentions,
+        )
     }
 
     #[inline]
@@ -5093,11 +5365,12 @@ impl SibFoldVRegMaps {
     /// .any(|i| instruction_mentions_vreg(i, v)))`.
     #[inline]
     fn escapes(&self, v: VReg, block_id: trust_cg_lower::instructions::Block) -> bool {
-        match self.mention_blocks.get(&v) {
-            None => false,
-            Some(MentionBlocks::One(only)) => *only != block_id,
-            // Two distinct blocks cannot both be `block_id`.
-            Some(MentionBlocks::Several) => true,
+        // The list holds DISTINCT blocks, so two entries cannot both be
+        // `block_id`.
+        match self.mention_blocks.get(&v).map(Vec::as_slice) {
+            None | Some([]) => false,
+            Some([only]) => *only != block_id,
+            Some(_) => true,
         }
     }
 }
@@ -5108,18 +5381,17 @@ impl SibFoldVRegMaps {
 fn collect_operand_mentions(
     op: &X86ISelOperand,
     bid: trust_cg_lower::instructions::Block,
-    mention_blocks: &mut FxHashMap<VReg, MentionBlocks>,
+    mention_blocks: &mut FxHashMap<VReg, Vec<trust_cg_lower::instructions::Block>>,
 ) {
     match op {
         X86ISelOperand::VReg(v) => {
-            mention_blocks
-                .entry(*v)
-                .and_modify(|seen| {
-                    if matches!(seen, MentionBlocks::One(first) if *first != bid) {
-                        *seen = MentionBlocks::Several;
-                    }
-                })
-                .or_insert(MentionBlocks::One(bid));
+            // A block's instructions are visited together, so the last entry
+            // is the only one that can already be `bid`: the list stays a
+            // list of distinct blocks.
+            let blocks = mention_blocks.entry(*v).or_default();
+            if blocks.last() != Some(&bid) {
+                blocks.push(bid);
+            }
         }
         X86ISelOperand::MemAddr { base, .. } => {
             collect_operand_mentions(base, bid, mention_blocks);
@@ -6263,6 +6535,23 @@ fn sib_scale1_index_fold_enabled() -> bool {
         return !*disabled;
     }
     !crate::tcg_env_flag("TCG_NO_X86_SIB_SCALE1_FOLD")
+}
+
+/// Whether block `block_id` holds an instruction the scale-1 index fold can
+/// start from: no proof origin, a register destination, and a
+/// [`sib_scale_def`] multiply by 2, 4 or 8. [`sib_scale1_index_fold_run_on_block`]
+/// skips every other instruction before reading the counts or the flags.
+fn block_has_sib_scale_candidate(
+    func: &X86ISelFunction,
+    block_id: trust_cg_lower::instructions::Block,
+) -> bool {
+    func.blocks.get(&block_id).is_some_and(|block| {
+        block.insts.iter().any(|def| {
+            def.proof_origin.is_none()
+                && matches!(def.operands.first(), Some(X86ISelOperand::VReg(_)))
+                && sib_scale_def(def).is_some_and(|(scale, _)| scale != 1)
+        })
+    })
 }
 
 /// Fold a power-of-two `imul`/`shl` scale-def INTO the scale field of a memory
@@ -10729,6 +11018,42 @@ mod tests {
         }
     }
 
+    fn sib_maps_view(maps: &SibFoldVRegMaps) -> (Vec<String>, Vec<String>, Vec<String>) {
+        maps.canonical_view()
+    }
+
+    /// The incremental refresh `run_impl` applies after a SIB fold gives the
+    /// maps a whole-function rebuild gives: the counts the fold moves, the
+    /// mentioning-block sets of the VRegs it removes from its block (`v10`,
+    /// `v11`), and those of VRegs another block also mentions (`v1`, `v3` in
+    /// block 1). A refresh that leaves the maps as they were, or forgets the
+    /// mention sets, fails here.
+    #[test]
+    fn sib_fold_maps_refresh_matches_rebuild() {
+        let mut func = foldable_store_window(X86Opcode::ImulRRI, 8);
+        func.ensure_block(Block(1));
+        func.push_inst(
+            Block(1),
+            X86ISelInst::new(X86Opcode::AddRR, vec![vreg(12), vreg(1), vreg(3)]),
+        );
+        func.push_inst(Block(1), X86ISelInst::new(X86Opcode::Ret, vec![]));
+        let mut maps = SibFoldVRegMaps::build(&func);
+        let before = SibFoldBlockPart::of(&func, Block(0));
+        let stale = sib_maps_view(&maps);
+        assert!(sib_addr_fold_run_on_block_with_maps(
+            &mut func,
+            Block(0),
+            &maps
+        ));
+        maps.replace_block_part(Block(0), &before, &SibFoldBlockPart::of(&func, Block(0)));
+        let rebuilt = sib_maps_view(&SibFoldVRegMaps::build(&func));
+        assert_ne!(
+            stale, rebuilt,
+            "the fold must change the maps for this test to bite"
+        );
+        assert_eq!(sib_maps_view(&maps), rebuilt);
+    }
+
     #[test]
     fn sib_fold_imul_load() {
         // imul v10, v1, 4 ; add v11, v2, v10 ; mov v3, [v11] -> MovRMSib
@@ -11316,6 +11641,23 @@ mod tests {
         } else {
             panic!("expected SibMemAddr");
         }
+    }
+
+    /// The full pass reaches a block whose only SIB-fold anchor is a `LeaSib`
+    /// (the SIB loop skips blocks with neither a `LeaSib` nor an `AddRR`).
+    /// Fails when `LeaSib` is missing from that block filter.
+    #[test]
+    fn sib_fold_from_leasib_load_via_run_impl() {
+        let mut func = make_func(vec![
+            X86ISelInst::new(X86Opcode::LeaSib, vec![vreg(11), sib_op(2, 1, 8, 0)]),
+            X86ISelInst::new(X86Opcode::MovRM, vec![vreg(3), mem_addr(vreg(11), 0)]),
+            X86ISelInst::new(X86Opcode::CmpRR, vec![vreg(4), vreg(5)]),
+            X86ISelInst::new(X86Opcode::Ret, vec![]),
+        ]);
+        assert!(run_impl(&mut func, |_| false, |_, _, _| false));
+        let opcodes = entry_opcodes(&func);
+        assert!(opcodes.contains(&X86Opcode::MovRMSib), "{opcodes:?}");
+        assert!(!opcodes.contains(&X86Opcode::LeaSib), "{opcodes:?}");
     }
 
     #[test]
@@ -13526,6 +13868,179 @@ mod tests {
         );
     }
 
+    /// The whole-function maps of the rotate-var and RMW loops are built only
+    /// for blocks holding an anchor (`OrRR`; `XorRR`/`AddRR`). A function whose
+    /// entry block has no anchor, an `AddRR`-anchored RMW triple in block 1
+    /// and a rotate in block 2 must still fuse both: fails when an anchor
+    /// opcode is missing from the gates (the `AddRR` arm is not reached by
+    /// the single-block kill-switch tests, which use `XorRR`).
+    #[test]
+    fn peephole_lazy_fn_maps_still_reach_every_anchor_block() {
+        crate::env_lock::with_env_overrides_removed(
+            &["TCG_NO_X86_RMW_FUSE", "TCG_NO_X86_ROTATE_VAR_IDIOM"],
+            || {
+                let mut func = make_func(vec![X86ISelInst::new(
+                    X86Opcode::MovRR,
+                    vec![vreg(20), vreg(21)],
+                )]);
+                func.ensure_block(Block(1));
+                func.block_order.push(Block(1));
+                for inst in rmw_triple(
+                    sib_op(1, 2, 8, 0),
+                    X86ISelInst::new(X86Opcode::AddRR, vec![vreg(6), vreg(5)]),
+                    sib_op(1, 2, 8, 0),
+                ) {
+                    func.push_inst(Block(1), inst);
+                }
+                // The rotate's ids, shifted clear of the RMW triple's.
+                let shift = |op: X86ISelOperand| match op {
+                    X86ISelOperand::VReg(v) => vreg(v.id + 30),
+                    other => other,
+                };
+                func.ensure_block(Block(2));
+                func.block_order.push(Block(2));
+                for inst in rotate_var_v1_shape() {
+                    let operands = inst.operands.into_iter().map(shift).collect();
+                    func.push_inst(Block(2), X86ISelInst::new(inst.opcode, operands));
+                }
+                func.next_vreg = 64;
+                X86Peephole::new(|_| true).run_on_function(&mut func);
+                let opcodes = |b: u32| -> Vec<X86Opcode> {
+                    func.blocks[&Block(b)]
+                        .insts
+                        .iter()
+                        .map(|i| i.opcode)
+                        .collect()
+                };
+                assert!(
+                    opcodes(1).contains(&X86Opcode::AddMRSib),
+                    "AddRR-anchored RMW triple in block 1 must fuse: {:?}",
+                    opcodes(1)
+                );
+                assert!(
+                    opcodes(2).contains(&X86Opcode::RolRCl),
+                    "rotate in block 2 must fuse: {:?}",
+                    opcodes(2)
+                );
+            },
+        );
+    }
+
+    /// `inst` with every register id it names, including address registers,
+    /// moved up by `by`, so copies of one shape can share a function.
+    fn shift_vreg_ids(inst: X86ISelInst, by: u32) -> X86ISelInst {
+        fn shift(op: X86ISelOperand, by: u32) -> X86ISelOperand {
+            match op {
+                X86ISelOperand::VReg(v) => X86ISelOperand::VReg(VReg::new(v.id + by, v.class)),
+                X86ISelOperand::MemAddr { base, disp } => X86ISelOperand::MemAddr {
+                    base: Box::new(shift(*base, by)),
+                    disp,
+                },
+                X86ISelOperand::SibMemAddr {
+                    base,
+                    index,
+                    scale,
+                    disp,
+                } => X86ISelOperand::SibMemAddr {
+                    base: Box::new(shift(*base, by)),
+                    index: Box::new(shift(*index, by)),
+                    scale,
+                    disp,
+                },
+                other => other,
+            }
+        }
+        let operands = inst.operands.into_iter().map(|op| shift(op, by)).collect();
+        X86ISelInst::new(inst.opcode, operands)
+    }
+
+    /// Each lazily built whole-function fact (rotate-var maps, RMW-fuse maps,
+    /// the scale-1 fold's use/def counts and flag liveness) is dropped after a
+    /// rewrite: two copies of each fold's shape in separate blocks, so the
+    /// second block reads facts built after the first block's rewrite. The
+    /// test and debug builds compare every reused build with a fresh one, so
+    /// a loop that keeps its facts across a rewrite fails here (mutations D,
+    /// E and F of the throughput-2 report).
+    #[test]
+    fn peephole_lazy_fn_facts_are_rebuilt_after_each_rewrite() {
+        crate::env_lock::with_env_overrides_removed(
+            &[
+                "TCG_NO_X86_RMW_FUSE",
+                "TCG_NO_X86_ROTATE_VAR_IDIOM",
+                "TCG_NO_X86_SIB_SCALE1_FOLD",
+            ],
+            || {
+                let scale1_window = || {
+                    vec![
+                        X86ISelInst::new(
+                            X86Opcode::ImulRRI,
+                            vec![vreg(10), vreg(1), X86ISelOperand::Imm(8)],
+                        ),
+                        X86ISelInst::new(X86Opcode::MovRMSib, vec![vreg(3), sib_of(2, 10, 1, 0)]),
+                        X86ISelInst::new(X86Opcode::CmpRR, vec![vreg(4), vreg(5)]),
+                        X86ISelInst::new(X86Opcode::Ret, vec![]),
+                    ]
+                };
+                let rmw = || {
+                    rmw_triple(
+                        sib_op(1, 2, 8, 0),
+                        X86ISelInst::new(X86Opcode::AddRR, vec![vreg(6), vreg(5)]),
+                        sib_op(1, 2, 8, 0),
+                    )
+                };
+                let shapes: [Vec<X86ISelInst>; 6] = [
+                    rotate_var_v1_shape(),
+                    rotate_var_v1_shape(),
+                    rmw(),
+                    rmw(),
+                    scale1_window(),
+                    scale1_window(),
+                ];
+                let mut func = make_func(Vec::new());
+                for (index, shape) in shapes.into_iter().enumerate() {
+                    let block = Block(index as u32);
+                    if index > 0 {
+                        func.ensure_block(block);
+                        func.block_order.push(block);
+                    }
+                    for inst in shape {
+                        func.push_inst(block, shift_vreg_ids(inst, 32 * index as u32));
+                    }
+                }
+                func.next_vreg = 512;
+                X86Peephole::new(|_| true).run_on_function(&mut func);
+                let opcodes = |b: u32| -> Vec<X86Opcode> {
+                    func.blocks[&Block(b)]
+                        .insts
+                        .iter()
+                        .map(|i| i.opcode)
+                        .collect()
+                };
+                for b in [0, 1] {
+                    assert!(
+                        opcodes(b).contains(&X86Opcode::RolRCl),
+                        "rotate in block {b} must fuse: {:?}",
+                        opcodes(b)
+                    );
+                }
+                for b in [2, 3] {
+                    assert!(
+                        opcodes(b).contains(&X86Opcode::AddMRSib),
+                        "RMW triple in block {b} must fuse: {:?}",
+                        opcodes(b)
+                    );
+                }
+                for b in [4, 5] {
+                    assert!(
+                        !opcodes(b).contains(&X86Opcode::ImulRRI),
+                        "stride in block {b} must fold into the SIB scale: {:?}",
+                        opcodes(b)
+                    );
+                }
+            },
+        );
+    }
+
     #[test]
     fn rotate_var_kill_switch_and_default_on() {
         // Full-pass runs under the lock-guarded env shim: default-ON fuses
@@ -14502,6 +15017,30 @@ mod tests {
         );
         // The SIB now scales the ORIGINAL index by 8.
         assert_eq!(only_sib(&func), (8, 1));
+    }
+
+    /// The full pass builds the fold's counts and flag liveness only for a
+    /// block with a candidate multiply; both spellings must still be found
+    /// and folded through `run_on_function`. Fails when the candidate
+    /// predicate misses a spelling the fold accepts.
+    #[test]
+    fn scale1_fold_candidate_gate_admits_both_spellings_through_the_pass() {
+        crate::env_lock::with_env_overrides_removed(&["TCG_NO_X86_SIB_SCALE1_FOLD"], || {
+            for (op, imm) in [(X86Opcode::ImulRRI, 8), (X86Opcode::ShlRI, 3)] {
+                let mut func = scale1_load_window(op, imm, 1);
+                assert!(block_has_sib_scale_candidate(&func, Block(0)));
+                X86Peephole::default().run_on_function(&mut func);
+                assert!(
+                    !entry_opcodes(&func).contains(&op),
+                    "{op:?} stride must be folded: {:?}",
+                    entry_opcodes(&func)
+                );
+                assert_eq!(only_sib(&func), (8, 1));
+            }
+            // A multiply by 1 is no candidate (the fold skips scale 1).
+            let unit = scale1_load_window(X86Opcode::ImulRRI, 1, 1);
+            assert!(!block_has_sib_scale_candidate(&unit, Block(0)));
+        });
     }
 
     #[test]

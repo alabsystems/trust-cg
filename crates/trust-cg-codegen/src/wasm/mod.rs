@@ -99,13 +99,14 @@ pub use encode::{
 };
 pub use helpers::{DIVMOD128_SYMBOL_PREFIX, divmod128_helper_name};
 pub use lower::{
-    BR_TABLE_MAX_SPAN, BR_TABLE_MAX_SPAN_PER_CASE, BR_TABLE_MIN_CASES, ISLAND_ABI_NAMESPACE,
-    ISLAND_HOST_MODULE, ISLAND_MEMORY_IMPORT, ISLAND_STACK_BASE_IMPORT, MEMORY_GROW_EXPORT,
-    MEMORY_SIZE_EXPORT, WASM_CLOSED_MIN_STACK_BYTES, WASM_COMPILE_EVIDENCE_SCHEMA,
-    WASM_STATIC_DATA_BASE, WasmCfgStructural, WasmCompileEvidence, WasmFuncImportPolicy,
-    WasmFunctionEnv, WasmLocalOptSummary, WasmLowerError, WasmMemoryGrowthPolicy, WasmModulePolicy,
-    WasmStackPolicy, WasmStaticDataPolicy, compile_module, compile_module_with_evidence,
-    compile_module_with_evidence_and_policy, compile_module_with_evidence_and_policy_optimized,
+    BOX_VALIDITY_NOT_ESTABLISHED, BR_TABLE_MAX_SPAN, BR_TABLE_MAX_SPAN_PER_CASE,
+    BR_TABLE_MIN_CASES, ISLAND_ABI_NAMESPACE, ISLAND_HOST_MODULE, ISLAND_MEMORY_IMPORT,
+    ISLAND_STACK_BASE_IMPORT, MEMORY_GROW_EXPORT, MEMORY_SIZE_EXPORT, WASM_CLOSED_MIN_STACK_BYTES,
+    WASM_COMPILE_EVIDENCE_SCHEMA, WASM_STATIC_DATA_BASE, WasmCfgStructural, WasmCompileEvidence,
+    WasmFuncImportPolicy, WasmFunctionEnv, WasmLocalOptSummary, WasmLowerError,
+    WasmMemoryGrowthPolicy, WasmModulePolicy, WasmStackPolicy, WasmStaticDataPolicy,
+    compile_module, compile_module_with_evidence, compile_module_with_evidence_and_policy,
+    compile_module_with_evidence_and_policy_optimized,
     compile_module_with_evidence_policy_and_license,
     compile_module_with_evidence_policy_license_optimized,
     compile_module_with_evidence_policy_license_options, compile_module_with_license,

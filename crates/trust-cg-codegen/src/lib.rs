@@ -740,6 +740,7 @@ pub use trust_cg_opt::x86_vectorize::set_regarg_disabled as set_x86_vec_regarg_d
 pub use trust_cg_opt::x86_vectorize::set_regarg_unroll_k as set_x86_vec_unroll_k;
 pub use trust_cg_opt::x86_vectorize::set_saxpyq_scalar_mul_enabled as set_x86_saxpyq_scalar_mul_enabled;
 pub use trust_cg_opt::x86_vectorize::set_vec_ownlen_reload_disabled as set_x86_vec_ownlen_reload_disabled;
+pub use trust_cg_opt::x86_vectorize::set_x86_rowreg_gpr_accumulators;
 pub use trust_cg_opt::x86_vectorize::set_x86_rowreg_memory_rmw_disabled;
 pub use trust_cg_opt::x86_vectorize::set_x86_rowreg_packed_mul_enabled;
 pub use trust_cg_opt::x86_vectorize::x86_rowreg_memory_rmw_withheld;
@@ -754,8 +755,12 @@ pub use trust_cg_opt::x86_vectorize::{
     set_trace_enabled as set_x86_vectorize_trace_enabled,
     set_zero_remainder_disabled as set_x86_vec_zero_remainder_disabled,
 };
+pub use trust_cg_opt::x86_vectorize::{
+    set_x86_sumq_register_seed_disabled, x86_sumq_register_seed_withheld,
+};
 pub use trust_cg_opt::x86_xorshift_demanded_bits::set_x86_xorshift_demanded_bits_disabled;
 pub use trust_cg_opt::x86_xorshift_demanded_bits::set_x86_xorshift_demanded_bits_trace_enabled;
+pub use trust_cg_opt::{set_x86_select_flag_fusion_disabled, x86_select_flag_fusion_withheld};
 pub use ty_reducer_evidence::{
     TY_REDUCER_EVIDENCE_PACKET_SCHEMA, TY_REDUCER_EVIDENCE_PACKET_SCHEMA_VERSION,
     TyReducerCallbackObservation, TyReducerEvidencePacket, TyReducerEvidenceRow,
@@ -774,11 +779,18 @@ pub use x86_64::pipeline::set_x86_licm_loads_disabled;
 pub use x86_64::pipeline::set_x86_loop_align_log_enabled;
 pub use x86_64::pipeline::set_x86_loop_align_max_body;
 pub use x86_64::pipeline::set_x86_loop_align_max_skip;
+pub use x86_64::pipeline::set_x86_loop_align_relocate_contained;
 pub use x86_64::pipeline::set_x86_loop_align_seam_pad;
 pub use x86_64::pipeline::set_x86_loop_exit_layout_disabled;
 pub use x86_64::pipeline::set_x86_loop_head_align_disabled;
 pub use x86_64::pipeline::set_x86_reload_elide_disabled;
 pub use x86_64::pipeline::set_x86_sroa_disabled;
+pub use x86_64::pipeline::x86_loop_align_relocate_contained_withheld;
+pub use x86_64::pipeline::{
+    X86AllocationQuality, set_x86_ra_abi_copy_hints_disabled, set_x86_ra_call_split_disabled,
+    set_x86_ra_caller_saved_first_disabled, set_x86_ra_cold_call_weight_disabled,
+    set_x86_ra_trace_enabled, x86_ra_quality_withheld,
+};
 
 /// The codegen license the crate's unit tests compile their hand-built
 /// fixtures under. Those fixtures carry no codegen license (`body_gate:

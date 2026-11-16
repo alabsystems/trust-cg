@@ -202,6 +202,25 @@ pub struct X86FlagLiveness {
 }
 
 impl X86FlagLiveness {
+    /// Every live-in verdict and exit edge, rendered and sorted, so two
+    /// analyses compare as values whatever their hash order.
+    #[cfg(any(test, debug_assertions))]
+    pub(crate) fn canonical_view(&self) -> [Vec<String>; 2] {
+        let mut live_in: Vec<String> = self
+            .live_in
+            .iter()
+            .map(|(block, live)| format!("{block:?}={live}"))
+            .collect();
+        live_in.sort();
+        let mut exits: Vec<String> = self
+            .exits
+            .iter()
+            .map(|(block, exit)| format!("{block:?}={exit:?}"))
+            .collect();
+        exits.sort();
+        [live_in, exits]
+    }
+
     /// Run the analysis over `func`.
     pub fn analyze(func: &X86ISelFunction) -> Self {
         let mut local: HashMap<Block, LocalScan> = HashMap::new();

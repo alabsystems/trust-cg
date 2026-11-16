@@ -53,7 +53,7 @@ def positive_accepted(text, code, artifact_exists):
 
 def debt_refusal(text, code, artifact_exists):
     """Bind the exact theorem to its semantic refusal in one error diagnostic."""
-    if code != 1 or artifact_exists:
+    if code != 101 or artifact_exists:
         return None
     # rustc may wrap Clean's own `error:` header. Source/help echoes and other
     # diagnostics cannot supply the theorem or phase for this error record.
@@ -61,10 +61,14 @@ def debt_refusal(text, code, artifact_exists):
         r"(?m)(?=^(?:error|warning|note|help)(?:\[[^\]\n]+\])?:)", text
     )
     error_prefix = r"error(?:\[[^\]\n]+\])?: (?:error: )?"
+    publish_prefix = (
+        error_prefix
+        + r"(?:Clean island batch has no source-local recovery boundary: error: )?"
+    )
     theorem = re.escape(THEOREM)
     for diagnostic in diagnostics:
         if (
-            re.match(error_prefix + r"the publish audit refused this batch; nothing was registered(?:\r?\n|$)", diagnostic)
+            re.match(publish_prefix + r"the publish audit refused this batch; nothing was registered(?:\r?\n|$)", diagnostic)
             and re.search(
                 r"(?m)^[ \t]*-[ \t]+`" + theorem
                 + r"` reaches the incomplete-proof marker `sorryAx`\.",
@@ -82,14 +86,41 @@ def debt_refusal(text, code, artifact_exists):
     return None
 
 
-def compile_case(compiler, wrapper, artifact, log_path, crate_name, timeout):
+def compile_case(compiler, targo, wrapper, out, label, log_path, crate_name, timeout):
+    package = out / (label + "-package")
+    package.mkdir()
+    manifest = package / "Cargo.toml"
+    manifest.write_text(
+        "[package]\nname = " + json.dumps(crate_name)
+        + "\nversion = \"0.0.0\"\nedition = \"2024\"\n\n"
+        + "[[bin]]\nname = " + json.dumps(crate_name)
+        + "\npath = " + json.dumps(str(wrapper.resolve()), ensure_ascii=False)
+        + "\n\n[workspace]\n"
+    )
+    target = package / "target"
+    artifact = target / "debug" / (crate_name + (".exe" if os.name == "nt" else ""))
     argv = [
-        str(compiler), "-Ztrust-verify=off", "--edition=2024",
-        "--crate-name", crate_name, str(wrapper), "-o", str(artifact),
+        str(targo), "--unverified", "rustc", "--offline",
+        "--manifest-path", str(manifest), "--target-dir", str(target),
+        "--config", "build.rustc=" + json.dumps(str(compiler)),
+        "--config", 'build.rustc-wrapper=""',
+        "--config", 'build.rustc-workspace-wrapper=""',
+        "--bin", crate_name,
     ]
+    environment = dict(os.environ)
+    for name in (
+        "RUSTC", "RUSTC_WRAPPER", "RUSTC_WORKSPACE_WRAPPER",
+        "CARGO_BUILD_RUSTC", "CARGO_BUILD_RUSTC_WRAPPER",
+        "CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER", "CARGO_TARGET_DIR",
+        "CARGO_BUILD_TARGET_DIR", "RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS",
+        "CARGO_BUILD_RUSTFLAGS",
+    ):
+        environment.pop(name, None)
+    environment["RUSTC"] = str(compiler)
     child = subprocess.Popen(
-        argv, cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-        start_new_session=True, pass_fds=resource_fds(os.environ),
+        argv, cwd=ROOT, env=environment, stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT, start_new_session=True,
+        pass_fds=resource_fds(environment),
     )
     timed_out = False
     try:
@@ -99,10 +130,10 @@ def compile_case(compiler, wrapper, artifact, log_path, crate_name, timeout):
         os.killpg(child.pid, signal.SIGKILL)
         output, _ = child.communicate()
     log_path.write_bytes(output)
-    return argv, child.returncode, output.decode(errors="replace"), timed_out
+    return argv, child.returncode, output.decode(errors="replace"), timed_out, artifact
 
 
-def campaign(compiler, out, timeout):
+def campaign(compiler, targo, out, timeout):
     out.mkdir(parents=True, exist_ok=True)
     if any(out.iterdir()):
         raise SystemExit("output directory must be empty")
@@ -125,7 +156,7 @@ def campaign(compiler, out, timeout):
     paths = [
         ORIGINAL, FIXTURE, Path(__file__).resolve(),
         ROOT / "scripts/bump_trust_ir_pin.py", ROOT / "scripts/rust_guard_transcript.py",
-        compiler, positive_source, positive_wrapper,
+        compiler, targo, positive_source, positive_wrapper,
     ]
     before = {str(path): digest(path) for path in paths}
     (out / "inputs.before.json").write_text(json.dumps(before, indent=2) + "\n")
@@ -133,9 +164,8 @@ def campaign(compiler, out, timeout):
     for label, wrapper, accept in [
         ("positive", positive_wrapper, True), ("original-negative", FIXTURE, False),
     ]:
-        artifact = out / (label + ".bin")
-        argv, code, text, timed_out = compile_case(
-            compiler, wrapper, artifact, out / (label + ".log"),
+        argv, code, text, timed_out, artifact = compile_case(
+            compiler, targo, wrapper, out, label, out / (label + ".log"),
             "proof_debt_" + label.replace("-", "_"), timeout,
         )
         reason = None if accept else debt_refusal(text, code, artifact.exists())
@@ -153,6 +183,7 @@ def campaign(compiler, out, timeout):
     unchanged = all(digest(path) == value for path, value in before.items())
     result = dict(
         scope=SCOPE, compiler=str(compiler), compiler_resolved=str(compiler.resolve()),
+        driver=str(targo), driver_resolved=str(targo.resolve()),
         original_sha256=before[str(ORIGINAL)], rows=rows, inputs_unchanged=unchanged,
         success=len(rows) == 2 and all(row["passed"] for row in rows) and unchanged,
     )
@@ -165,14 +196,21 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--out-dir", required=True, type=Path)
     parser.add_argument("--compiler", default="trustc")
+    parser.add_argument("--targo", default="targo")
     parser.add_argument("--timeout", type=float, default=120)
     args = parser.parse_args()
     compiler = shutil.which(args.compiler)
     if compiler is None:
         raise SystemExit("selected Trust compiler is unavailable")
+    targo = shutil.which(args.targo)
+    if targo is None:
+        raise SystemExit("selected Targo driver is unavailable")
     if args.timeout <= 0:
         raise SystemExit("timeout must be positive")
-    return campaign(Path(os.path.abspath(compiler)), args.out_dir.resolve(), args.timeout)
+    return campaign(
+        Path(os.path.abspath(compiler)), Path(os.path.abspath(targo)),
+        args.out_dir.resolve(), args.timeout,
+    )
 
 
 if __name__ == "__main__":

@@ -130,7 +130,6 @@ const COMPILING_FIXTURES: &[&str] = &[
     "conformance/proof_diagnostics",
     "conformance/single_inhabited_enums",
     "conformance/spec_carrier",
-    "conformance/storage_only",
     "conformance/text_directives",
     "conformance/ty_container_vtable",
     "conformance/ty_primitives",
@@ -156,7 +155,6 @@ const PRODUCER_OMITTED_GATE_FIXTURES: &[&str] = &[
     "conformance/composition",
     "conformance/import_scheme",
     "conformance/spec_carrier",
-    "conformance/storage_only",
     "conformance/text_directives",
 ];
 
@@ -220,6 +218,14 @@ const PRODUCER_OMITTED_GATE_TEXT: &str = "has a body but no codegen license";
 /// registration (`tests/dialect_legalization_corpus.rs` in trust-cg-codegen
 /// executes all three under the registrations that admit them).
 const NAMED_REFUSALS: &[(&str, &str)] = &[
+    (
+        "conformance/box_deref",
+        "function `fresh` is affirmatively ungated",
+    ),
+    (
+        "conformance/storage_only",
+        "function `root` is affirmatively ungated",
+    ),
     (
         "conformance/tensor_map_reduce_view",
         "is affirmatively ungated",

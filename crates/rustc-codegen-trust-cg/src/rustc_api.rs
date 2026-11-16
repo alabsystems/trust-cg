@@ -23,24 +23,24 @@ pub(super) fn allocation_pointer(
 
 /// Refuse new operations whose extra validity has no lowering obligation yet,
 /// before dead-local/interception shortcuts or MIR rewrites can erase them.
-pub(super) fn refuse_unmodeled_body(body: &rustc_middle::mir::Body<'_>) -> Result<(), String> {
+///
+/// A `BoxDerefTransmute` cast is decided by `box_deref_facts::plan`: refused
+/// outright unless the compiler exports Box-deref facts and its own fail-closed
+/// acceptance check admits every cast of `body`.
+pub(super) fn refuse_unmodeled_body<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    instance: rustc_middle::ty::Instance<'tcx>,
+    body: &rustc_middle::mir::Body<'tcx>,
+) -> Result<(), String> {
+    crate::box_deref_facts::plan(tcx, instance, body)?;
     #[cfg(rustc_session_split)]
     {
         use rustc_middle::mir::visit::{PlaceContext, Visitor};
-        use rustc_middle::mir::{Location, Place, ProjectionElem, Rvalue};
+        use rustc_middle::mir::{Location, Place, ProjectionElem};
         struct Check {
             refusal: Option<String>,
         }
         impl<'tcx> Visitor<'tcx> for Check {
-            fn visit_rvalue(&mut self, rvalue: &Rvalue<'tcx>, location: Location) {
-                if matches!(
-                    rvalue,
-                    Rvalue::Cast(rustc_middle::mir::CastKind::BoxDerefTransmute, ..)
-                ) {
-                    self.refusal = Some("[TCG-BOX-DEREF] BoxDerefTransmute requires an unmodeled Box validity obligation".to_owned());
-                }
-                self.super_rvalue(rvalue, location);
-            }
             fn visit_place(
                 &mut self,
                 place: &Place<'tcx>,

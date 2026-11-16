@@ -144,7 +144,7 @@
       "value_names": null,
       "scopes": null,
       "source_provenance": null,
-      "body_gate": null,
+      "body_gate": "Ungated",
       "display_path": null,
       "section": null,
       "visibility": "Default"

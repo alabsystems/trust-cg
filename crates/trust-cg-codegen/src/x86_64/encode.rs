@@ -34,10 +34,20 @@ fn zero_extending_movri_alias(dst: X86PReg, imm: i64) -> Option<X86PReg> {
         .flatten()
 }
 
-// Trust compiles this definition and checks the emitted body against it.
-// There is deliberately no handwritten Rust implementation of the computation.
+// Trust compiles these definitions and checks every emitted primitive body.
+// Rust only composes those primitives in the call graph proved in the source.
 #[path = "../../../../formal/lean/Trust/Model/RegisterBits.lean"]
 clean mod register_bits;
+
+#[inline]
+fn shared_x86_is_extended(reg: u8) -> bool {
+    trust_cg_x86_is_extended(reg) == 1
+}
+
+#[inline]
+fn shared_x86_rex_byte(w: bool, r: bool, x: bool, b: bool) -> u8 {
+    trust_cg_x86_rex_byte(u8::from(w), u8::from(r), u8::from(x), u8::from(b))
+}
 
 // ---------------------------------------------------------------------------
 // Error type
@@ -109,20 +119,7 @@ impl RexPrefix {
 
     /// Encode the REX prefix byte.
     pub fn encode(self) -> u8 {
-        let mut byte: u8 = 0x40; // REX base
-        if self.w {
-            byte |= 0x08;
-        }
-        if self.r {
-            byte |= 0x04;
-        }
-        if self.x {
-            byte |= 0x02;
-        }
-        if self.b {
-            byte |= 0x01;
-        }
-        byte
+        shared_x86_rex_byte(self.w, self.r, self.x, self.b)
     }
 }
 
@@ -224,7 +221,7 @@ impl Sib {
         Self {
             scale: 0,
             index: 0b100, // no index
-            base: base & 0x7,
+            base: trust_cg_x86_low3(base),
         }
     }
 
@@ -243,14 +240,14 @@ impl Sib {
         };
         Self {
             scale: scale_bits,
-            index: index & 0x7,
-            base: base & 0x7,
+            index: trust_cg_x86_low3(index),
+            base: trust_cg_x86_low3(base),
         }
     }
 
     /// Encode the SIB byte.
     pub fn encode(self) -> u8 {
-        (self.scale << 6) | ((self.index & 0x7) << 3) | (self.base & 0x7)
+        (self.scale << 6) | (trust_cg_x86_low3(self.index) << 3) | trust_cg_x86_low3(self.base)
     }
 }
 
@@ -484,9 +481,9 @@ impl X86Encoder {
     fn rex_rr64(reg: X86PReg, rm: X86PReg) -> RexPrefix {
         RexPrefix {
             w: true,
-            r: reg.hw_enc() >= 8,
+            r: shared_x86_is_extended(reg.hw_enc()),
             x: false,
-            b: rm.hw_enc() >= 8,
+            b: shared_x86_is_extended(rm.hw_enc()),
         }
     }
 
@@ -495,9 +492,9 @@ impl X86Encoder {
     fn rex_rr(reg: X86PReg, rm: X86PReg, w: bool) -> RexPrefix {
         RexPrefix {
             w,
-            r: reg.hw_enc() >= 8,
+            r: shared_x86_is_extended(reg.hw_enc()),
             x: false,
-            b: rm.hw_enc() >= 8,
+            b: shared_x86_is_extended(rm.hw_enc()),
         }
     }
 
@@ -508,20 +505,20 @@ impl X86Encoder {
             w: true,
             r: false,
             x: false,
-            b: rm.hw_enc() >= 8,
+            b: shared_x86_is_extended(rm.hw_enc()),
         }
     }
 
     fn low_byte_reg_needs_rex(reg: X86PReg) -> bool {
-        matches!(reg.hw_enc() & 0x7, 4..=7)
+        matches!(trust_cg_x86_low3(reg.hw_enc()), 4..=7)
     }
 
     fn emit_mem_reg_rex(&mut self, reg: X86PReg, base: X86PReg, w: bool, byte_reg: bool) {
         let rex = RexPrefix {
             w,
-            r: reg.hw_enc() >= 8,
+            r: shared_x86_is_extended(reg.hw_enc()),
             x: false,
-            b: base.hw_enc() >= 8,
+            b: shared_x86_is_extended(base.hw_enc()),
         };
         self.emit_rex_forced(rex, byte_reg && Self::low_byte_reg_needs_rex(reg));
     }
@@ -569,7 +566,7 @@ impl X86Encoder {
             w: need_w,
             r: false,
             x: false,
-            b: reg.hw_enc() >= 8,
+            b: shared_x86_is_extended(reg.hw_enc()),
         }
     }
 
@@ -944,9 +941,9 @@ impl X86Encoder {
     fn rex_xmm_rr(reg: X86PReg, rm: X86PReg) -> RexPrefix {
         RexPrefix {
             w: false,
-            r: reg.hw_enc() >= 8,
+            r: shared_x86_is_extended(reg.hw_enc()),
             x: false,
-            b: rm.hw_enc() >= 8,
+            b: shared_x86_is_extended(rm.hw_enc()),
         }
     }
 
@@ -1024,9 +1021,9 @@ impl X86Encoder {
         }
         let rex = RexPrefix {
             w: false,
-            r: dst.hw_enc() >= 8,
-            x: index.hw_enc() >= 8,
-            b: base.hw_enc() >= 8,
+            r: shared_x86_is_extended(dst.hw_enc()),
+            x: shared_x86_is_extended(index.hw_enc()),
+            b: shared_x86_is_extended(base.hw_enc()),
         };
         self.emit_rex(rex);
         self.emit_byte(0x0F);
@@ -1075,7 +1072,7 @@ impl X86Encoder {
             w: false,
             r: false,
             x: false,
-            b: dst.hw_enc() >= 8,
+            b: shared_x86_is_extended(dst.hw_enc()),
         });
         self.emit_byte(0x0F);
         self.emit_byte(group_opcode_byte);
@@ -1168,7 +1165,7 @@ impl X86Encoder {
         }
         let rex = RexPrefix {
             w: false,
-            r: dst.hw_enc() >= 8,
+            r: shared_x86_is_extended(dst.hw_enc()),
             x: false,
             b: false,
         };
@@ -1211,7 +1208,7 @@ impl X86Encoder {
         // `require_sse2_memory_shape_impl`.
         require_disp32(disp)?;
         let base_enc = base.hw_enc();
-        let base_low3 = base_enc & 0x7;
+        let base_low3 = trust_cg_x86_low3(base_enc);
         let needs_sib = base_low3 == 4; // RSP/R12 encoding
 
         if disp == 0 && base_low3 != 5 {
@@ -1219,7 +1216,7 @@ impl X86Encoder {
             if needs_sib {
                 self.emit_modrm(ModRM {
                     mode: 0b00,
-                    reg: reg_or_ext & 0x7,
+                    reg: trust_cg_x86_low3(reg_or_ext),
                     rm: 0b100, // SIB follows
                 });
                 self.emit_sib(Sib::base_only(base_enc));
@@ -1231,7 +1228,7 @@ impl X86Encoder {
             if needs_sib {
                 self.emit_modrm(ModRM {
                     mode: 0b01,
-                    reg: reg_or_ext & 0x7,
+                    reg: trust_cg_x86_low3(reg_or_ext),
                     rm: 0b100,
                 });
                 self.emit_sib(Sib::base_only(base_enc));
@@ -1244,7 +1241,7 @@ impl X86Encoder {
             if needs_sib {
                 self.emit_modrm(ModRM {
                     mode: 0b10,
-                    reg: reg_or_ext & 0x7,
+                    reg: trust_cg_x86_low3(reg_or_ext),
                     rm: 0b100,
                 });
                 self.emit_sib(Sib::base_only(base_enc));
@@ -1277,14 +1274,14 @@ impl X86Encoder {
         // FINDING #8: same disp32 fits-in-i32 guard as `emit_mem_operand`.
         require_disp32(disp)?;
         let base_enc = base.hw_enc();
-        let base_low3 = base_enc & 0x7;
+        let base_low3 = trust_cg_x86_low3(base_enc);
         let sib = Sib::scaled(base_enc, index.hw_enc(), scale);
 
         if disp == 0 && base_low3 != 5 {
             // mod=00: [base + index*scale]
             self.emit_modrm(ModRM {
                 mode: 0b00,
-                reg: reg_or_ext & 0x7,
+                reg: trust_cg_x86_low3(reg_or_ext),
                 rm: 0b100, // SIB follows
             });
             self.emit_sib(sib);
@@ -1292,7 +1289,7 @@ impl X86Encoder {
             // mod=01: [base + index*scale + disp8]
             self.emit_modrm(ModRM {
                 mode: 0b01,
-                reg: reg_or_ext & 0x7,
+                reg: trust_cg_x86_low3(reg_or_ext),
                 rm: 0b100,
             });
             self.emit_sib(sib);
@@ -1301,7 +1298,7 @@ impl X86Encoder {
             // mod=10: [base + index*scale + disp32]
             self.emit_modrm(ModRM {
                 mode: 0b10,
-                reg: reg_or_ext & 0x7,
+                reg: trust_cg_x86_low3(reg_or_ext),
                 rm: 0b100,
             });
             self.emit_sib(sib);
@@ -1340,7 +1337,7 @@ impl X86Encoder {
         require_disp32(disp)?;
         self.emit_modrm(ModRM {
             mode: 0b00,
-            reg: reg_or_ext & 0x7,
+            reg: trust_cg_x86_low3(reg_or_ext),
             rm: 0b101, // RIP-relative
         });
         self.emit_imm32(disp as i32);
@@ -1564,9 +1561,9 @@ impl X86Encoder {
                 })?;
                 let rex = RexPrefix {
                     w: true,
-                    r: dst.hw_enc() >= 8,
+                    r: shared_x86_is_extended(dst.hw_enc()),
                     x: false,
-                    b: base.hw_enc() >= 8,
+                    b: shared_x86_is_extended(base.hw_enc()),
                 };
                 self.emit_rex(rex);
                 self.emit_byte(0x85);
@@ -1627,9 +1624,9 @@ impl X86Encoder {
                 })?;
                 let rex = RexPrefix {
                     w: true,
-                    r: dst.hw_enc() >= 8,
+                    r: shared_x86_is_extended(dst.hw_enc()),
                     x: false,
-                    b: base.hw_enc() >= 8,
+                    b: shared_x86_is_extended(base.hw_enc()),
                 };
                 self.emit_rex(rex);
                 self.emit_byte(0x0F);
@@ -1650,9 +1647,9 @@ impl X86Encoder {
                 Self::validate_sib_mem_operand(opcode, index, ops.scale)?;
                 let rex = RexPrefix {
                     w: true,
-                    r: dst.hw_enc() >= 8,
-                    x: index.hw_enc() >= 8,
-                    b: base.hw_enc() >= 8,
+                    r: shared_x86_is_extended(dst.hw_enc()),
+                    x: shared_x86_is_extended(index.hw_enc()),
+                    b: shared_x86_is_extended(base.hw_enc()),
                 };
                 self.emit_rex(rex);
                 self.emit_byte(0x0F);
@@ -1770,7 +1767,7 @@ impl X86Encoder {
                 if dst.is_gpr8() {
                     let rex = Self::rex_oprd(dst, false);
                     self.emit_rex_forced(rex, Self::low_byte_reg_needs_rex(dst));
-                    self.emit_byte(0xB0 + (dst.hw_enc() & 0x7));
+                    self.emit_byte(0xB0 + trust_cg_x86_low3(dst.hw_enc()));
                     self.emit_imm8(ops.imm as i8);
                 } else {
                     if dst.is_gpr16() {
@@ -1779,7 +1776,7 @@ impl X86Encoder {
                     let is_gpr64 = dst.is_gpr64();
                     let rex = Self::rex_oprd(dst, is_gpr64);
                     self.emit_rex(rex);
-                    self.emit_byte(0xB8 + (dst.hw_enc() & 0x7));
+                    self.emit_byte(0xB8 + trust_cg_x86_low3(dst.hw_enc()));
                     if dst.is_gpr16() {
                         self.emit_u16_le(ops.imm as u16);
                     } else if dst.is_gpr32() {
@@ -1856,9 +1853,9 @@ impl X86Encoder {
                 })?;
                 let rex = RexPrefix {
                     w: true,
-                    r: dst.hw_enc() >= 8,
+                    r: shared_x86_is_extended(dst.hw_enc()),
                     x: false,
-                    b: base.hw_enc() >= 8,
+                    b: shared_x86_is_extended(base.hw_enc()),
                 };
                 self.emit_rex(rex);
                 self.emit_byte(0x8B);
@@ -1896,9 +1893,9 @@ impl X86Encoder {
                 })?;
                 let rex = RexPrefix {
                     w: true,
-                    r: src.hw_enc() >= 8,
+                    r: shared_x86_is_extended(src.hw_enc()),
                     x: false,
-                    b: base.hw_enc() >= 8,
+                    b: shared_x86_is_extended(base.hw_enc()),
                 };
                 self.emit_rex(rex);
                 self.emit_byte(0x89);
@@ -1913,9 +1910,9 @@ impl X86Encoder {
                 })?;
                 let rex = RexPrefix {
                     w: true,
-                    r: dst.hw_enc() >= 8,
+                    r: shared_x86_is_extended(dst.hw_enc()),
                     x: false,
-                    b: base.hw_enc() >= 8,
+                    b: shared_x86_is_extended(base.hw_enc()),
                 };
                 self.emit_rex(rex);
                 self.emit_byte(0x03); // ADD r64, r/m64
@@ -1928,9 +1925,9 @@ impl X86Encoder {
                 })?;
                 let rex = RexPrefix {
                     w: true,
-                    r: dst.hw_enc() >= 8,
+                    r: shared_x86_is_extended(dst.hw_enc()),
                     x: false,
-                    b: base.hw_enc() >= 8,
+                    b: shared_x86_is_extended(base.hw_enc()),
                 };
                 self.emit_rex(rex);
                 self.emit_byte(0x2B); // SUB r64, r/m64
@@ -1943,9 +1940,9 @@ impl X86Encoder {
                 })?;
                 let rex = RexPrefix {
                     w: true,
-                    r: dst.hw_enc() >= 8,
+                    r: shared_x86_is_extended(dst.hw_enc()),
                     x: false,
-                    b: base.hw_enc() >= 8,
+                    b: shared_x86_is_extended(base.hw_enc()),
                 };
                 self.emit_rex(rex);
                 self.emit_byte(0x3B); // CMP r64, r/m64
@@ -1985,7 +1982,7 @@ impl X86Encoder {
                     w: false,
                     r: false,
                     x: false,
-                    b: base.hw_enc() >= 8,
+                    b: shared_x86_is_extended(base.hw_enc()),
                 };
                 self.emit_rex(rex);
                 self.emit_byte(0xFF);
@@ -2024,14 +2021,14 @@ impl X86Encoder {
                 let dst = self.require_dst(ops, opcode)?;
                 let rex = Self::rex_oprd(dst, false);
                 self.emit_rex(rex);
-                self.emit_byte(0x50 + (dst.hw_enc() & 0x7));
+                self.emit_byte(0x50 + trust_cg_x86_low3(dst.hw_enc()));
             }
             // POP r64: 58+rd (no REX.W, only REX.B if R8-R15)
             X86Opcode::Pop => {
                 let dst = self.require_dst(ops, opcode)?;
                 let rex = Self::rex_oprd(dst, false);
                 self.emit_rex(rex);
-                self.emit_byte(0x58 + (dst.hw_enc() & 0x7));
+                self.emit_byte(0x58 + trust_cg_x86_low3(dst.hw_enc()));
             }
 
             // =================================================================
@@ -2045,9 +2042,9 @@ impl X86Encoder {
                 })?;
                 let rex = RexPrefix {
                     w: true,
-                    r: dst.hw_enc() >= 8,
+                    r: shared_x86_is_extended(dst.hw_enc()),
                     x: false,
-                    b: base.hw_enc() >= 8,
+                    b: shared_x86_is_extended(base.hw_enc()),
                 };
                 self.emit_rex(rex);
                 self.emit_byte(0x8D);
@@ -2065,9 +2062,9 @@ impl X86Encoder {
                 Self::validate_sib_mem_operand(opcode, index, ops.scale)?;
                 let rex = RexPrefix {
                     w: true,
-                    r: dst.hw_enc() >= 8,
-                    x: index.hw_enc() >= 8,
-                    b: base.hw_enc() >= 8,
+                    r: shared_x86_is_extended(dst.hw_enc()),
+                    x: shared_x86_is_extended(index.hw_enc()),
+                    b: shared_x86_is_extended(base.hw_enc()),
                 };
                 self.emit_rex(rex);
                 self.emit_byte(0x8D);
@@ -2082,7 +2079,7 @@ impl X86Encoder {
                 let dst = self.require_dst(ops, opcode)?;
                 let rex = RexPrefix {
                     w: true,
-                    r: dst.hw_enc() >= 8,
+                    r: shared_x86_is_extended(dst.hw_enc()),
                     x: false,
                     b: false,
                 };
@@ -2097,7 +2094,7 @@ impl X86Encoder {
                 let dst = self.require_dst(ops, opcode)?;
                 let rex = RexPrefix {
                     w: true,
-                    r: dst.hw_enc() >= 8,
+                    r: shared_x86_is_extended(dst.hw_enc()),
                     x: false,
                     b: false,
                 };
@@ -2238,9 +2235,9 @@ impl X86Encoder {
                 Self::validate_sib_mem_operand(opcode, index, ops.scale)?;
                 let rex = RexPrefix {
                     w: true,
-                    r: dst.hw_enc() >= 8,
-                    x: index.hw_enc() >= 8,
-                    b: base.hw_enc() >= 8,
+                    r: shared_x86_is_extended(dst.hw_enc()),
+                    x: shared_x86_is_extended(index.hw_enc()),
+                    b: shared_x86_is_extended(base.hw_enc()),
                 };
                 self.emit_rex(rex);
                 self.emit_byte(0x8B);
@@ -2260,9 +2257,9 @@ impl X86Encoder {
                 Self::validate_sib_mem_operand(opcode, index, ops.scale)?;
                 let rex = RexPrefix {
                     w: true,
-                    r: dst.hw_enc() >= 8,
-                    x: index.hw_enc() >= 8,
-                    b: base.hw_enc() >= 8,
+                    r: shared_x86_is_extended(dst.hw_enc()),
+                    x: shared_x86_is_extended(index.hw_enc()),
+                    b: shared_x86_is_extended(base.hw_enc()),
                 };
                 self.emit_rex(rex);
                 self.emit_byte(0x63);
@@ -2280,9 +2277,9 @@ impl X86Encoder {
                 Self::validate_sib_mem_operand(opcode, index, ops.scale)?;
                 let rex = RexPrefix {
                     w: true,
-                    r: src.hw_enc() >= 8,
-                    x: index.hw_enc() >= 8,
-                    b: base.hw_enc() >= 8,
+                    r: shared_x86_is_extended(src.hw_enc()),
+                    x: shared_x86_is_extended(index.hw_enc()),
+                    b: shared_x86_is_extended(base.hw_enc()),
                 };
                 self.emit_rex(rex);
                 self.emit_byte(0x89);
@@ -2302,9 +2299,9 @@ impl X86Encoder {
                 Self::validate_sib_mem_operand(opcode, index, ops.scale)?;
                 let rex = RexPrefix {
                     w: false,
-                    r: dst.hw_enc() >= 8,
-                    x: index.hw_enc() >= 8,
-                    b: base.hw_enc() >= 8,
+                    r: shared_x86_is_extended(dst.hw_enc()),
+                    x: shared_x86_is_extended(index.hw_enc()),
+                    b: shared_x86_is_extended(base.hw_enc()),
                 };
                 self.emit_rex(rex);
                 self.emit_byte(0x8B);
@@ -2329,9 +2326,9 @@ impl X86Encoder {
                 Self::validate_sib_mem_operand(opcode, index, ops.scale)?;
                 let rex = RexPrefix {
                     w: false,
-                    r: dst.hw_enc() >= 8,
-                    x: index.hw_enc() >= 8,
-                    b: base.hw_enc() >= 8,
+                    r: shared_x86_is_extended(dst.hw_enc()),
+                    x: shared_x86_is_extended(index.hw_enc()),
+                    b: shared_x86_is_extended(base.hw_enc()),
                 };
                 self.emit_rex_forced(rex, Self::low_byte_reg_needs_rex(dst));
                 self.emit_byte(0x8A);
@@ -2359,9 +2356,9 @@ impl X86Encoder {
                 Self::validate_sib_mem_operand(opcode, index, ops.scale)?;
                 let rex = RexPrefix {
                     w: false,
-                    r: dst.hw_enc() >= 8,
-                    x: index.hw_enc() >= 8,
-                    b: base.hw_enc() >= 8,
+                    r: shared_x86_is_extended(dst.hw_enc()),
+                    x: shared_x86_is_extended(index.hw_enc()),
+                    b: shared_x86_is_extended(base.hw_enc()),
                 };
                 self.emit_rex(rex);
                 self.emit_byte(0x0F);
@@ -2381,9 +2378,9 @@ impl X86Encoder {
                 Self::validate_sib_mem_operand(opcode, index, ops.scale)?;
                 let rex = RexPrefix {
                     w: false,
-                    r: src.hw_enc() >= 8,
-                    x: index.hw_enc() >= 8,
-                    b: base.hw_enc() >= 8,
+                    r: shared_x86_is_extended(src.hw_enc()),
+                    x: shared_x86_is_extended(index.hw_enc()),
+                    b: shared_x86_is_extended(base.hw_enc()),
                 };
                 self.emit_rex_forced(rex, Self::low_byte_reg_needs_rex(src));
                 self.emit_byte(0x88);
@@ -2401,9 +2398,9 @@ impl X86Encoder {
                 Self::validate_sib_mem_operand(opcode, index, ops.scale)?;
                 let rex = RexPrefix {
                     w: false,
-                    r: src.hw_enc() >= 8,
-                    x: index.hw_enc() >= 8,
-                    b: base.hw_enc() >= 8,
+                    r: shared_x86_is_extended(src.hw_enc()),
+                    x: shared_x86_is_extended(index.hw_enc()),
+                    b: shared_x86_is_extended(base.hw_enc()),
                 };
                 self.emit_rex(rex);
                 self.emit_byte(0x89);
@@ -2444,9 +2441,9 @@ impl X86Encoder {
                 Self::validate_sib_mem_operand(opcode, index, ops.scale)?;
                 let rex = RexPrefix {
                     w: true,
-                    r: src.hw_enc() >= 8,
-                    x: index.hw_enc() >= 8,
-                    b: base.hw_enc() >= 8,
+                    r: shared_x86_is_extended(src.hw_enc()),
+                    x: shared_x86_is_extended(index.hw_enc()),
+                    b: shared_x86_is_extended(base.hw_enc()),
                 };
                 self.emit_rex(rex);
                 self.emit_byte(0x31);
@@ -2464,9 +2461,9 @@ impl X86Encoder {
                 Self::validate_sib_mem_operand(opcode, index, ops.scale)?;
                 let rex = RexPrefix {
                     w: true,
-                    r: src.hw_enc() >= 8,
-                    x: index.hw_enc() >= 8,
-                    b: base.hw_enc() >= 8,
+                    r: shared_x86_is_extended(src.hw_enc()),
+                    x: shared_x86_is_extended(index.hw_enc()),
+                    b: shared_x86_is_extended(base.hw_enc()),
                 };
                 self.emit_rex(rex);
                 self.emit_byte(0x01);
@@ -2872,9 +2869,9 @@ impl X86Encoder {
                 self.emit_byte(0xF2);
                 let rex = RexPrefix {
                     w: true,
-                    r: dst.hw_enc() >= 8,
+                    r: shared_x86_is_extended(dst.hw_enc()),
                     x: false,
-                    b: src.hw_enc() >= 8,
+                    b: shared_x86_is_extended(src.hw_enc()),
                 };
                 self.emit_rex(rex);
                 self.emit_byte(0x0F);
@@ -2887,9 +2884,9 @@ impl X86Encoder {
                 self.emit_byte(0xF2);
                 let rex = RexPrefix {
                     w: true,
-                    r: dst.hw_enc() >= 8,
+                    r: shared_x86_is_extended(dst.hw_enc()),
                     x: false,
-                    b: src.hw_enc() >= 8,
+                    b: shared_x86_is_extended(src.hw_enc()),
                 };
                 self.emit_rex(rex);
                 self.emit_byte(0x0F);
@@ -2912,9 +2909,9 @@ impl X86Encoder {
                 self.emit_byte(0xF3);
                 let rex = RexPrefix {
                     w: true,
-                    r: dst.hw_enc() >= 8,
+                    r: shared_x86_is_extended(dst.hw_enc()),
                     x: false,
-                    b: src.hw_enc() >= 8,
+                    b: shared_x86_is_extended(src.hw_enc()),
                 };
                 self.emit_rex(rex);
                 self.emit_byte(0x0F);
@@ -2927,9 +2924,9 @@ impl X86Encoder {
                 self.emit_byte(0xF3);
                 let rex = RexPrefix {
                     w: true,
-                    r: dst.hw_enc() >= 8,
+                    r: shared_x86_is_extended(dst.hw_enc()),
                     x: false,
-                    b: src.hw_enc() >= 8,
+                    b: shared_x86_is_extended(src.hw_enc()),
                 };
                 self.emit_rex(rex);
                 self.emit_byte(0x0F);
@@ -3001,7 +2998,7 @@ impl X86Encoder {
                     w: false,
                     r: false,
                     x: false,
-                    b: dst.hw_enc() >= 8,
+                    b: shared_x86_is_extended(dst.hw_enc()),
                 };
                 self.emit_rex_forced(rex, Self::low_byte_reg_needs_rex(dst));
                 self.emit_byte(0x0F);
@@ -3078,7 +3075,7 @@ impl X86Encoder {
                 let rex = Self::rex_oprd(dst, true);
                 self.emit_rex(rex);
                 self.emit_byte(0x0F);
-                self.emit_byte(0xC8 + (dst.hw_enc() & 0x7));
+                self.emit_byte(0xC8 + trust_cg_x86_low3(dst.hw_enc()));
             }
 
             // =================================================================
@@ -3203,9 +3200,9 @@ impl X86Encoder {
                 self.emit_byte(0x66);
                 let rex = RexPrefix {
                     w: true,
-                    r: dst.hw_enc() >= 8,
+                    r: shared_x86_is_extended(dst.hw_enc()),
                     x: false,
-                    b: src.hw_enc() >= 8,
+                    b: shared_x86_is_extended(src.hw_enc()),
                 };
                 self.emit_rex(rex);
                 self.emit_byte(0x0F);
@@ -3219,9 +3216,9 @@ impl X86Encoder {
                 self.emit_byte(0x66);
                 let rex = RexPrefix {
                     w: true,
-                    r: src.hw_enc() >= 8,
+                    r: shared_x86_is_extended(src.hw_enc()),
                     x: false,
-                    b: dst.hw_enc() >= 8,
+                    b: shared_x86_is_extended(dst.hw_enc()),
                 };
                 self.emit_rex(rex);
                 self.emit_byte(0x0F);
@@ -4011,6 +4008,10 @@ impl Default for X86Encoder {
 // ===========================================================================
 // Tests
 // ===========================================================================
+
+#[cfg(test)]
+#[path = "encode_register_bits_tests.rs"]
+mod register_bits_tests;
 
 #[cfg(test)]
 mod tests {

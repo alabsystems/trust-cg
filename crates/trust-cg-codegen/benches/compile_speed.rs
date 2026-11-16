@@ -806,6 +806,7 @@ fn bench_e2e(module: &trust_ir::Module, name: &'static str, parallel: bool) -> E
         eh_frames_cannot_unwind: false,
         eh_nounwind_callees: Default::default(),
         link_unit_definitions: Default::default(),
+        x86_certificate_free_allocation: false,
     };
     let compiler = Compiler::new(config).with_codegen_license(permit_unlicensed());
 

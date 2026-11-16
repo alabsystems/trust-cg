@@ -111,6 +111,8 @@
 // `use rayon::prelude::*` is staged but not yet enabled).
 use rayon as _;
 
+mod proof_indexed_models;
+
 pub mod aarch64_add_sub_immediate;
 pub mod aarch64_affine_lowering;
 pub mod aarch64_atomic_effect;

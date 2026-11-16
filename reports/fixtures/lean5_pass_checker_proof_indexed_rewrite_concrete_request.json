@@ -88,7 +88,7 @@
         {
           "kind": "lean_module",
           "uri": "reports/fixtures/ProofIndexedRewriteConcrete.lean",
-          "digest": "sha256:dc5d8253a8bd0a33fd258ec6a16110c41bae9e35a881e179ee872a7fe304ce2a",
+          "digest": "sha256:c47ba63eb1a8e164c75fba1b4f38eb3744f7b34e0e7b2b100759f7c9cacff67c",
           "media_type": "text/plain",
           "placeholder_transport": null
         }
@@ -124,7 +124,7 @@
         {
           "kind": "lean_module",
           "uri": "reports/fixtures/ProofIndexedRewriteConcrete.lean",
-          "digest": "sha256:dc5d8253a8bd0a33fd258ec6a16110c41bae9e35a881e179ee872a7fe304ce2a",
+          "digest": "sha256:c47ba63eb1a8e164c75fba1b4f38eb3744f7b34e0e7b2b100759f7c9cacff67c",
           "media_type": "text/plain",
           "placeholder_transport": null
         }
@@ -156,7 +156,7 @@
     {
       "kind": "lean_module",
       "uri": "reports/fixtures/ProofIndexedRewriteConcrete.lean",
-      "digest": "sha256:dc5d8253a8bd0a33fd258ec6a16110c41bae9e35a881e179ee872a7fe304ce2a",
+      "digest": "sha256:c47ba63eb1a8e164c75fba1b4f38eb3744f7b34e0e7b2b100759f7c9cacff67c",
       "media_type": "text/plain",
       "placeholder_transport": null
     }

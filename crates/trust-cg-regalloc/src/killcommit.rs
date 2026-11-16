@@ -1376,6 +1376,7 @@ mod tests {
             hints: BTreeMap::new(),
             callee_saved_regs: Default::default(),
             coalesce_tuning: Default::default(),
+            avoid_claimed_hint_regs: false,
         };
         let _ = crate::allocate(&mut f, &config);
         assert!(

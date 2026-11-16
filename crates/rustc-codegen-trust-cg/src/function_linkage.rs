@@ -614,7 +614,11 @@ impl CguSymbols {
                     self.rename_constant(c);
                 }
             }
+            // Function identities are module-local IDs, not symbol spellings;
+            // the function definition itself is renamed above. `FnItem` is
+            // also nominal/ZST and never materializes an address here.
             Constant::FnDef(_)
+            | Constant::FnItem(_)
             | Constant::Int(_)
             | Constant::U128(_)
             | Constant::Bytes { .. }

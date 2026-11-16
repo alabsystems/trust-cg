@@ -383,18 +383,44 @@ class TrustToolchainResolutionTests(unittest.TestCase):
 
     def test_launcher_shim_size_cap(self):
         targo = self.package / "bin" / "targo"
-        body = self.build_dir_shim(targo)
-        self.assertLess(len(body.encode()), TOOLCHAIN.LAUNCHER_SHIM_MAX_BYTES)
-        head, tail = body.rsplit("exec '", 1)
-        for size, expected in ((TOOLCHAIN.LAUNCHER_SHIM_MAX_BYTES, targo),
-                               (TOOLCHAIN.LAUNCHER_SHIM_MAX_BYTES + 1, None)):
-            with self.subTest(size=size):
-                padding = size - len(body.encode()) - 2
-                padded = head + "#" + "x" * padding + "\n" + "exec '" + tail
-                self.assertEqual(len(padded.encode()), size)
-                shim = self.root / f"padded-{size}"
-                shim.write_text(padded)
+        plain = self.build_dir_shim(targo)
+        admitted = self.admission_shim(targo)
+        self.assertLess(len(plain.encode()), TOOLCHAIN.PLAIN_LAUNCHER_SHIM_MAX_BYTES)
+        self.assertLess(len(admitted.encode()), TOOLCHAIN.PLAIN_LAUNCHER_SHIM_MAX_BYTES)
+
+        def padded_before(body, marker, size):
+            head, tail = body.rsplit(marker, 1)
+            padding = size - len(body.encode()) - 2
+            self.assertGreaterEqual(padding, 0)
+            result = head + "#" + "x" * padding + "\n" + marker + tail
+            self.assertEqual(len(result.encode()), size)
+            return result
+
+        # A generic prelude gets no more room than the original bounded rule.
+        for size, expected in ((TOOLCHAIN.PLAIN_LAUNCHER_SHIM_MAX_BYTES, targo),
+                               (TOOLCHAIN.PLAIN_LAUNCHER_SHIM_MAX_BYTES + 1, None)):
+            with self.subTest(shape="plain", size=size):
+                body = padded_before(plain, "exec '", size)
+                shim = self.root / f"plain-{size}"
+                shim.write_text(body)
                 self.assertEqual(TOOLCHAIN.launcher_target(shim), expected)
+
+        # The maintained registered-build launcher measured 18,001 bytes. Its
+        # exact admission tail earns only the separate 24 KiB absolute bound.
+        for size, expected in ((18_001, targo), (TOOLCHAIN.LAUNCHER_SHIM_MAX_BYTES, targo),
+                               (TOOLCHAIN.LAUNCHER_SHIM_MAX_BYTES + 1, None)):
+            with self.subTest(shape="build-admission", size=size):
+                body = padded_before(admitted, "__atb_p=", size)
+                shim = self.root / f"admitted-{size}"
+                shim.write_text(body)
+                self.assertEqual(TOOLCHAIN.launcher_target(shim), expected)
+
+        malformed = padded_before(admitted, "__atb_p=", 18_001).replace(
+            "__build_admit --shim targo", "__build_admit --shim trustc"
+        )
+        shim = self.root / "malformed-admission-18001"
+        shim.write_text(malformed)
+        self.assertIsNone(TOOLCHAIN.launcher_target(shim))
 
     def test_shapes_that_are_not_an_atpkg_launcher_shim_are_refused(self):
         targo = self.package / "bin" / "targo"

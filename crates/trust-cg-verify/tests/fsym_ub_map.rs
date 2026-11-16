@@ -15,8 +15,9 @@
 //!   fails here until it is mapped.
 //! * `each_site_is_raised_by_exactly_the_mapped_instructions`: a call graph over
 //!   the interpreter's functions (an edge per call of a known function name —
-//!   an over-approximation), rooted at each arm of `execute_node` (one per
-//!   `Inst` variant), at `execute_function` (`<entry>`) and at
+//!   an over-approximation), rooted at each instruction arm of the split
+//!   `execute_call_node` / `execute_node_inner` dispatch (one per `Inst`
+//!   variant), at `execute_function` (`<entry>`) and at
 //!   `execute_function_inner` (`<walk>`), with a callee's execution
 //!   (`execute_callee`) a pseudo-site of its own. The instructions that reach
 //!   each site must equal the union of the site's mapped raisers. A UB newly
@@ -833,6 +834,51 @@ fn after_impl() { ub("production after a test-only impl"); }
     assert_eq!(names, ["first", "legacy_helper", "last", "after_impl"]);
     assert_eq!(ub_points(&kept.code, 0, kept.code.len()).len(), 3);
     assert!(std::panic::catch_unwind(|| non_test_source("#[cfg(test)] fn unknown() {}")).is_err());
+
+    let (_, source) = interpreter_source();
+    let code = lex(&source).code;
+    if let Some(dispatch) = functions(&code)
+        .into_iter()
+        .find(|f| f.name == "execute_call_node")
+    {
+        // Both mutations call an EXISTING UB helper. The site's census is
+        // unchanged, so only correct attribution of common/wildcard code
+        // catches the newly reachable raiser.
+        let poison = " let _ = expect_pointer(&InterpretValue { ty: Ty::Ptr, kind: InterpretValueKind::NullPtr }, block, \"census mutation\")?; ";
+        let mut prefix = source.clone();
+        prefix.insert_str(dispatch.body_start + 1, poison);
+        assert!(
+            std::panic::catch_unwind(|| derive(&prefix)).is_err(),
+            "dispatcher prefix UB was omitted"
+        );
+        let marker = b"_ => self.execute_node_inner(";
+        let at = find(&code, marker, dispatch.body_start)
+            .filter(|at| *at < dispatch.body_end)
+            .unwrap();
+        let expression = at + b"_ => ".len();
+        let mut close = expression + b"self.execute_node_inner".len();
+        let mut depth = 0i64;
+        loop {
+            match code[close] {
+                b'(' => depth += 1,
+                b')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        break;
+                    }
+                }
+                _ => {}
+            }
+            close += 1;
+        }
+        let mut wildcard = source.clone();
+        wildcard.insert_str(close + 1, " }");
+        wildcard.insert_str(expression, &format!("{{ {poison}"));
+        assert!(
+            std::panic::catch_unwind(|| derive(&wildcard)).is_err(),
+            "wildcard UB was omitted"
+        );
+    }
 }
 
 fn derive(source: &str) -> Derived {
@@ -891,90 +937,171 @@ fn derive(source: &str) -> Derived {
             .unwrap_or_else(|| panic!("the interpreter has no `{name}`"))
     };
 
-    // One root per arm of `execute_node`'s `match &node.inst`.
-    let execute_node = item("execute_node");
-    let open = find(code, b"match &node.inst {", execute_node.body_start)
-        .expect("execute_node matches on &node.inst")
-        + b"match &node.inst ".len();
-    let close = matching_brace(code, open);
-    let mut i = open + 1;
-    let mut pattern_start = i;
-    let mut depth = 0i64;
-    let mut arms = 0;
-    while i < close {
-        if depth == 0 && code[i..].starts_with(b"=>") {
-            let pattern = String::from_utf8_lossy(&code[pattern_start..i]).to_string();
-            let mut j = i + 2;
-            while code[j].is_ascii_whitespace() {
-                j += 1;
-            }
-            let (body_from, body_to) = if code[j] == b'{' {
-                let end = matching_brace(code, j);
-                (j, end + 1)
-            } else {
-                let mut k = j;
-                let mut inner = 0i64;
-                loop {
-                    match code[k] {
-                        b'(' | b'{' | b'[' => inner += 1,
-                        b')' | b'}' | b']' => inner -= 1,
-                        b',' if inner == 0 => break,
-                        _ => {}
-                    }
-                    if inner < 0 {
-                        break;
-                    }
-                    k += 1;
-                }
-                (j, k)
-            };
-            let variants = pattern
-                .split("Inst::")
-                .skip(1)
-                .map(|rest| {
-                    rest.chars()
-                        .take_while(|c| c.is_ascii_alphanumeric())
-                        .collect::<String>()
-                })
-                .collect::<Vec<_>>();
-            let direct = calls_in(code, body_from, body_to, &known);
-            let mut found = derived.reach(&direct, &["execute_node", CALLEE_FUNCTION]);
-            let own = ub_points(code, body_from, body_to)
-                .into_iter()
-                .map(|point| ("execute_node".to_string(), message_after(&lexed, point)))
-                .collect::<BTreeSet<_>>();
-            found.extend(own.iter().cloned());
-            for variant in &variants {
-                let arm = derived.arms.entry(variant.clone()).or_default();
-                arm.0.extend(direct.iter().cloned());
-                arm.1.extend(own.iter().cloned());
-            }
-            for key in found {
-                derived
-                    .raisers
-                    .entry(key)
-                    .or_default()
-                    .extend(variants.iter().cloned());
-            }
-            arms += 1;
-            i = body_to;
-            while i < close && (code[i].is_ascii_whitespace() || code[i] == b',') {
-                i += 1;
-            }
-            pattern_start = i;
-            continue;
-        }
-        match code[i] {
-            b'(' | b'{' | b'[' => depth += 1,
-            b')' | b'}' | b']' => depth -= 1,
-            _ => {}
-        }
-        i += 1;
-    }
-    assert!(
-        arms > 40,
-        "execute_node has only {arms} arms: the parse is off"
+    // One root per instruction arm. TrustIR keeps recursive call dispatch in
+    // `execute_call_node` and the large scalar dispatch in
+    // `execute_node_inner`; `execute_node` itself is now only the provenance
+    // wrapper. The first inner arm delegates the seven call variants back to
+    // `execute_call_node`, so it is deliberately not walked a second time:
+    // doing so would make every call variant reach every sibling call arm.
+    let call_variants = [
+        "Drop",
+        "DropInvoke",
+        "SeqMap",
+        "Call",
+        "Invoke",
+        "CallIndirect",
+        "InvokeIndirect",
+    ];
+    // The provenance hook remains attributed through the existing walk
+    // model. Any other wrapper work must be free of unaccounted UB.
+    let wrapper = item("execute_node");
+    let common = calls_in(code, wrapper.body_start, wrapper.body_end, &known);
+    let found = derived.reach(
+        &common,
+        &[
+            "execute_node",
+            "execute_call_node",
+            "execute_node_inner",
+            "provenance_before_node",
+            CALLEE_FUNCTION,
+        ],
     );
+    assert!(
+        found.is_empty() && ub_points(code, wrapper.body_start, wrapper.body_end).is_empty(),
+        "execute_node wrapper gained UB outside its accounted hooks: {found:?}"
+    );
+    for (dispatch, minimum_arms) in [("execute_call_node", 7), ("execute_node_inner", 40)] {
+        let execute_node = item(dispatch);
+        let open = find(code, b"match &node.inst {", execute_node.body_start)
+            .filter(|open| *open < execute_node.body_end)
+            .unwrap_or_else(|| panic!("{dispatch} matches on &node.inst"))
+            + b"match &node.inst ".len();
+        let close = matching_brace(code, open);
+        assert!(
+            close <= execute_node.body_end,
+            "{dispatch} dispatch match escaped its function body"
+        );
+        let mut common = code[execute_node.body_start..=execute_node.body_end].to_vec();
+        common[open - execute_node.body_start..=close - execute_node.body_start].fill(b' ');
+        let direct = calls_in(&common, 0, common.len(), &known);
+        let found = derived.reach(
+            &direct,
+            &[
+                "execute_node",
+                "execute_call_node",
+                "execute_node_inner",
+                "provenance_before_node",
+                CALLEE_FUNCTION,
+            ],
+        );
+        assert!(
+            found.is_empty() && ub_points(&common, 0, common.len()).is_empty(),
+            "dispatcher {dispatch} gained UB outside its opcode match: {found:?}"
+        );
+        let mut i = open + 1;
+        let mut pattern_start = i;
+        let mut depth = 0i64;
+        let mut arms = 0;
+        while i < close {
+            if depth == 0 && code[i..].starts_with(b"=>") {
+                let pattern = String::from_utf8_lossy(&code[pattern_start..i]).to_string();
+                let mut j = i + 2;
+                while code[j].is_ascii_whitespace() {
+                    j += 1;
+                }
+                let (body_from, body_to) = if code[j] == b'{' {
+                    let end = matching_brace(code, j);
+                    (j, end + 1)
+                } else {
+                    let mut k = j;
+                    let mut inner = 0i64;
+                    loop {
+                        match code[k] {
+                            b'(' | b'{' | b'[' => inner += 1,
+                            b')' | b'}' | b']' => inner -= 1,
+                            b',' if inner == 0 => break,
+                            _ => {}
+                        }
+                        if inner < 0 {
+                            break;
+                        }
+                        k += 1;
+                    }
+                    (j, k)
+                };
+                let variants = pattern
+                    .split("Inst::")
+                    .skip(1)
+                    .map(|rest| {
+                        rest.chars()
+                            .take_while(|c| c.is_ascii_alphanumeric())
+                            .collect::<String>()
+                    })
+                    .collect::<Vec<_>>();
+                let delegated_call_arm = dispatch == "execute_node_inner"
+                    && !variants.is_empty()
+                    && variants
+                        .iter()
+                        .all(|variant| call_variants.contains(&variant.as_str()));
+                if variants.is_empty() || delegated_call_arm {
+                    let direct = calls_in(code, body_from, body_to, &known);
+                    let found = derived.reach(
+                        &direct,
+                        &[
+                            "execute_node",
+                            "execute_call_node",
+                            "execute_node_inner",
+                            "provenance_before_node",
+                            CALLEE_FUNCTION,
+                        ],
+                    );
+                    assert!(
+                        found.is_empty() && ub_points(code, body_from, body_to).is_empty(),
+                        "dispatcher {dispatch} forwarding/wildcard arm gained UB: {found:?}"
+                    );
+                }
+                if !variants.is_empty() && !delegated_call_arm {
+                    let direct = calls_in(code, body_from, body_to, &known);
+                    let mut found =
+                        derived.reach(&direct, &["execute_node", dispatch, CALLEE_FUNCTION]);
+                    let own = ub_points(code, body_from, body_to)
+                        .into_iter()
+                        .map(|point| (dispatch.to_string(), message_after(&lexed, point)))
+                        .collect::<BTreeSet<_>>();
+                    found.extend(own.iter().cloned());
+                    for variant in &variants {
+                        let arm = derived.arms.entry(variant.clone()).or_default();
+                        arm.0.extend(direct.iter().cloned());
+                        arm.1.extend(own.iter().cloned());
+                    }
+                    for key in found {
+                        derived
+                            .raisers
+                            .entry(key)
+                            .or_default()
+                            .extend(variants.iter().cloned());
+                    }
+                }
+                arms += 1;
+                i = body_to;
+                while i < close && (code[i].is_ascii_whitespace() || code[i] == b',') {
+                    i += 1;
+                }
+                pattern_start = i;
+                continue;
+            }
+            match code[i] {
+                b'(' | b'{' | b'[' => depth += 1,
+                b')' | b'}' | b']' => depth -= 1,
+                _ => {}
+            }
+            i += 1;
+        }
+        assert!(
+            arms >= minimum_arms,
+            "{dispatch} has only {arms} arms: the parse is off"
+        );
+    }
 
     // `<entry>` and `<walk>`.
     for (raiser, root, cut) in [
@@ -986,7 +1113,7 @@ fn derive(source: &str) -> Derived {
         (
             RAISER_WALK,
             "execute_function_inner",
-            &["execute_node", CALLEE_FUNCTION][..],
+            &["execute_call_node", "execute_node_inner", CALLEE_FUNCTION][..],
         ),
     ] {
         let root = item(root);
@@ -1773,6 +1900,20 @@ fn catalog() -> Vec<(Inst, usize, bool)> {
             value: p("i32"),
         });
     }
+    // v67: a Box deref of the catalog's pointer under a named premise.
+    value(Inst::BoxDeref {
+        ptr_ty: Ty::Ptr,
+        pointee: trust_ir::box_validity::BoxPointee::Sized { ty: Ty::I64 },
+        operand: p("ptr"),
+        fact: Box::new(trust_ir::box_validity::BoxValidityFact::premise(
+            trust_ir::box_validity::BoxDerefSite {
+                item: [0; 16],
+                ordinal: 0,
+            },
+            trust_ir::box_validity::BoxFactSession::PROOF_SNAPSHOT,
+            trust_ir::box_validity::PremiseRoot::ParamByValue,
+        )),
+    });
     value(Inst::OpenFrame {
         def: BindingFrameDef::new(
             BindingFrameId::new(0),
@@ -2728,6 +2869,68 @@ fn confirm_claim(
     if kind != "not-raised" {
         return None;
     }
+    if reason.starts_with(
+        "bounded fsym refuses every module containing a typed signature ABI before scanning",
+    ) {
+        // Re-derive each pseudo-raiser after cutting only its typed-ABI path:
+        // entry preflight/packet transport for <entry>, and the per-node
+        // provenance wrapper for <walk>. The claimed site must disappear.
+        let key = (site.function.to_string(), site.message.to_string());
+        let items = functions(&lexed.code);
+        let known = items
+            .iter()
+            .map(|item| item.name.clone())
+            .collect::<BTreeSet<_>>();
+        let reaches_without = |root_name: &str, cut: &[&str]| {
+            let root = items
+                .iter()
+                .find(|item| item.name == root_name)
+                .expect("interpreter pseudo-raiser root");
+            let direct = calls_in(&lexed.code, root.body_start, root.body_end, &known);
+            let mut found = derived.reach(&direct, cut);
+            if let Some(own) = derived.sites_by_fn.get(root_name) {
+                found.extend(own.iter().cloned());
+            }
+            found.contains(&key)
+        };
+        let entry_safe = !by.contains(&RAISER_ENTRY)
+            || !reaches_without(
+                "execute_function",
+                &[
+                    "execute_function_inner",
+                    "preflight_typed_abi",
+                    "execute_packet_boundary",
+                ],
+            );
+        let walk_safe = !by.contains(&RAISER_WALK)
+            || !reaches_without(
+                "execute_function_inner",
+                &[
+                    "execute_call_node",
+                    "execute_node_inner",
+                    CALLEE_FUNCTION,
+                    "execute_node",
+                ],
+            );
+        let scanner = include_str!("../src/fsym_trust_ir.rs");
+        let scanner_gate = scanner.contains(".func_types")
+            && scanner.contains(".any(|signature| signature.abi.is_some())")
+            && scanner.contains("the module contains a typed signature ABI");
+        return Some(
+            match (by.iter().all(pseudo), entry_safe, walk_safe, scanner_gate) {
+                (true, true, true, true) => Ok(()),
+                (false, _, _, _) => Err(format!(
+                    "the typed-ABI module refusal speaks only for pseudo-raisers, not {by:?}"
+                )),
+                (true, entry, walk, false) => Err(format!(
+                    "bounded fsym no longer has the matching module-wide typed-ABI gate (entry_safe={entry}, walk_safe={walk})"
+                )),
+                (true, entry, walk, true) => Err(format!(
+                    "the pseudo-raiser still reaches the site without its typed-ABI path: entry_safe={entry}, walk_safe={walk}"
+                )),
+            },
+        );
+    }
     if reason.starts_with("the interpreter never removes an allocation record") {
         // True of the pointers a global's materialization makes and encodes
         // itself; any other raiser takes a pointer operand from the program,
@@ -2876,6 +3079,92 @@ fn unwind_unguarded_calls(lexed: &Lexed, needle: &[u8]) -> Vec<usize> {
 /// claim matches. Moving a claim to another site or raiser group, or changing
 /// its stance kind, therefore needs a new review.
 const REVIEWED_CLAIMS: &[(&str, &str, &[&str], &str)] = &[
+    // TrustIR 933e34fa enum byte images. decode_image and
+    // first_uninit_covered reach enum_image_variant/refuse_uninhabited only
+    // while reconstructing a Load image (including atomic readbacks) or the
+    // destination image of eval_bitcast. The scanner now refuses every such
+    // enum-containing load/cast by value before scanning. The other
+    // refuse_uninhabited callers carry an already-typed value; their failure
+    // is TypeError, not UB from an unchecked byte image.
+    (
+        "enum_image_variant",
+        "Load: enum tag value {disc} does not match any var",
+        &["Load", "AtomicLoad", "AtomicRMW", "CmpXchg", "Cast"],
+        "not-raised",
+    ),
+    (
+        "enum_image_variant",
+        "Load: enum {ty} byte image uses the untagged varia",
+        &["Load", "AtomicLoad", "AtomicRMW", "CmpXchg", "Cast"],
+        "not-raised",
+    ),
+    (
+        "refuse_uninhabited",
+        "{op}: enum {ty} variant {variant_idx} is uninhabit",
+        &["Load", "AtomicLoad", "AtomicRMW", "CmpXchg", "Cast"],
+        "not-raised",
+    ),
+    (
+        "refuse_uninhabited",
+        "{op}: enum {ty} variant {variant_idx} is uninhabit",
+        &[
+            "AtomicStore",
+            "Const",
+            "GlobalAddr",
+            "MakeAggregate",
+            "Store",
+            "Switch",
+        ],
+        "not-raised",
+    ),
+    // eval_bitcast may encode its SSA operand, but a scanned module cannot
+    // contain Constant::Uninit and no instruction otherwise produces an
+    // unwritten aggregate lane.
+    (
+        "encode_image",
+        "encoding an unwritten lane (uninit) of type {} as ",
+        &["Cast"],
+        "not-raised",
+    ),
+    // The name-only source graph merges provenance::State::access with the
+    // memory state's access/checked_access chain. eval_cast itself only
+    // encodes/decodes the SSA value and never calls MemoryState::access.
+    (
+        "checked_access",
+        "{op}: unknown allocation {}",
+        &["Cast"],
+        "not-raised",
+    ),
+    (
+        "checked_access",
+        "{op}: use after dealloc",
+        &["Cast"],
+        "not-raised",
+    ),
+    (
+        "checked_access",
+        "{op}: pointer address overflow",
+        &["Cast"],
+        "not-raised",
+    ),
+    (
+        "checked_access",
+        "{op}: pointer address {address} is not aligned to ",
+        &["Cast"],
+        "not-raised",
+    ),
+    (
+        "checked_access",
+        "{op}: access range overflow",
+        &["Cast"],
+        "not-raised",
+    ),
+    (
+        "checked_access",
+        "{op}: access [{}..{}) is out of bounds for allocat",
+        &["Cast"],
+        "not-raised",
+    ),
     // v63 flat construction, reviewed against eval_make_closure at 6d2e381:
     // no Char/handle/nested capture is admitted, every source Char binding is
     // refused, and all captures are explicit SSA values. Constant::Uninit is
@@ -4855,3 +5144,189 @@ const UNOBSERVED_RESTRICTED: &[(&str, &str, &str, &str)] = &[
         "a callee's UB is raised in the callee's own blocks, attributed to its own instruction (the oracle's attribution), never at the caller's one-instruction block",
     ),
 ];
+
+fn nonnull_abi_entry_case() -> Module {
+    use trust_ir::signature_abi::*;
+    let mut module = catalog_module();
+    let scalar = AbiScalar {
+        register: AbiRegister {
+            class: AbiRegisterClass::Integer,
+            bytes: 8,
+        },
+        source_offset: 0,
+        source_bytes: 8,
+        value_bits: 64,
+        attributes: AbiAttributes {
+            nonnull: true,
+            ..Default::default()
+        },
+    };
+    let descriptor = SignatureAbi {
+        target: AbiTarget {
+            triple: "x86_64-unknown-linux-gnu".into(),
+            data_layout: "e-p:64:64-i64:64-n8:16:32:64-S128".into(),
+            abi: "sysv64".into(),
+            cpu: "x86-64".into(),
+            features: vec![],
+            target_spec: format!("sha256:{}", "a".repeat(64)),
+            pointer_bytes: 8,
+            little_endian: true,
+        },
+        frontend: AbiFrontend {
+            name: "trustc".into(),
+            revision: "nonnull-control".into(),
+        },
+        convention: "C".into(),
+        lowered_convention: trust_ir::CallingConv::C,
+        source_abi: "C".into(),
+        can_unwind: false,
+        variadic: false,
+        fixed_count: 1,
+        arguments: vec![AbiArgument {
+            size: 8,
+            align: 8,
+            mode: AbiPassMode::Direct(scalar),
+            bindings: vec![AbiBinding {
+                place: AbiBindingPlace::Parameter(0),
+                source_offset: 0,
+                source_bytes: 8,
+                carrier_offset: 0,
+                carrier_bytes: 8,
+            }],
+        }],
+        result: AbiArgument {
+            size: 0,
+            align: 1,
+            mode: AbiPassMode::Ignore,
+            bindings: vec![],
+        },
+    };
+    module.func_types.push(FuncTy {
+        params: vec![Ty::Ptr],
+        returns: vec![],
+        is_vararg: false,
+        abi: Some(descriptor),
+    });
+    let mut function = Function::new(
+        FuncId::new(0),
+        "unused_nonnull_parameter",
+        FuncTyId::new(0),
+        BlockId::new(0),
+    );
+    function.blocks.push(Block {
+        id: BlockId::new(0),
+        params: vec![(ValueId::new(0), Ty::Ptr)],
+        body: vec![InstrNode::new(Inst::Return { values: vec![] })],
+    });
+    module.functions.push(function);
+    module
+}
+
+#[test]
+fn typed_abi_entry_ub_cannot_receive_a_body_only_verdict() {
+    let module = nonnull_abi_entry_case();
+    let signature = &module.func_types[0];
+    signature.abi.as_ref().unwrap().validate(signature).unwrap();
+    signature
+        .abi
+        .as_ref()
+        .unwrap()
+        .validate_target(module.target_info.as_ref())
+        .unwrap();
+    module.functions[0]
+        .fn_abi(&module)
+        .unwrap()
+        .expect("actual reconciled ABI");
+    let arguments = vec![InterpretValue {
+        ty: Ty::Ptr,
+        kind: InterpretValueKind::NullPtr,
+    }];
+    let options = trust_ir::InterpretOptions {
+        fuel: 10_000,
+        max_call_depth: 4,
+        panic_strategy: trust_ir::interpret::PanicStrategy::Abort,
+    };
+    assert!(
+        trust_cg_verify::fsym_trust_ir::FSYM_RUN_MODEL
+            .breach(&options, &arguments)
+            .is_none()
+    );
+    let error = trust_ir::Interpreter::with_module(&module)
+        .with_options(options)
+        .execute_func(FuncId::new(0), arguments.clone())
+        .expect_err("nonnull must reject actual null input");
+    assert_eq!(error.code, trust_ir::InterpretErrorCode::UndefinedBehavior);
+    assert!(
+        error.message.contains("typed ABI null pointer"),
+        "{error:?}"
+    );
+    let mut plain = module.clone();
+    plain.func_types[0].abi = None;
+    trust_ir::Interpreter::with_module(&plain)
+        .execute_func(FuncId::new(0), arguments)
+        .unwrap();
+    let plain_report = scan_function_in_module(&plain, &plain.functions[0]);
+    assert_eq!(plain_report.scanned_functions, 1, "{plain_report:?}");
+    assert!(plain_report.skipped_functions.is_empty() && plain_report.diagnostics.is_empty());
+    let typed_report = scan_function_in_module(&module, &module.functions[0]);
+    assert_eq!(
+        typed_report.scanned_functions, 0,
+        "body-only scanning must not certify the unmodelled ABI promise: {typed_report:?}; actual interpreter: {error:?}"
+    );
+    assert!(
+        typed_report
+            .skipped_functions
+            .iter()
+            .any(|skip| skip.detail.contains("ABI"))
+    );
+}
+
+#[test]
+fn abi_contract_boundary_includes_unused_types_and_legacy_parameters() {
+    let typed = nonnull_abi_entry_case();
+    let mut plain = typed.clone();
+    plain.func_types[0].abi = None;
+    plain.functions[0].attrs.params = vec![trust_ir::ParamAttrs::default()];
+    assert_eq!(
+        scan_function_in_module(&plain, &plain.functions[0]).scanned_functions,
+        1
+    );
+    let mut unused = plain.clone();
+    unused.func_types.push(typed.func_types[0].clone());
+    let report = scan_function_in_module(&unused, &unused.functions[0]);
+    assert_eq!(report.scanned_functions, 0);
+    assert!(
+        report
+            .skipped_functions
+            .iter()
+            .any(|skip| skip.detail.contains("typed signature ABI"))
+    );
+    let mut legacy = plain.clone();
+    legacy.functions[0].attrs.params[0].nonnull = true;
+    let report = scan_function_in_module(&legacy, &legacy.functions[0]);
+    assert_eq!(report.scanned_functions, 0);
+    assert!(
+        report
+            .skipped_functions
+            .iter()
+            .any(|skip| skip.detail.contains("legacy ABI"))
+    );
+    // An unused declaration cannot import an unmodelled contract either.
+    let mut declaration = plain.clone();
+    let mut external = Function::new(
+        FuncId::new(1),
+        "unused_contract",
+        FuncTyId::new(0),
+        BlockId::new(0),
+    );
+    external.attrs.params = legacy.functions[0].attrs.params.clone();
+    declaration.functions.push(external);
+    assert_eq!(
+        scan_function_in_module(&declaration, &declaration.functions[0]).scanned_functions,
+        0
+    );
+    assert_eq!(
+        scan_function_in_module(&plain, &plain.functions[0]).scanned_functions,
+        1
+    );
+}

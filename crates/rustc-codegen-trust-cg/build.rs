@@ -41,6 +41,7 @@ fn main() {
     println!("cargo:rustc-check-cfg=cfg(rustc_generic_args_value)");
     println!("cargo:rustc-check-cfg=cfg(rustc_super_clauses_query)");
     println!("cargo:rustc-check-cfg=cfg(rustc_own_clauses_query)");
+    println!("cargo:rustc-check-cfg=cfg(rustc_box_deref_facts)");
 
     // Integration tests must load this dylib into the compiler that built it.
     // A linked rustup `trust` may differ from the installed Trust pack on PATH.
@@ -142,6 +143,9 @@ pub fn probe(session: &EarlySession) -> &EarlySession { session }
     if probe_own_clauses_query(&compiler, probe_flags) {
         println!("cargo:rustc-cfg=rustc_own_clauses_query");
     }
+    if probe_box_deref_facts(&compiler, probe_flags) {
+        println!("cargo:rustc-cfg=rustc_box_deref_facts");
+    }
 
     // The backend's operator knobs come from the TRACKED `-Ztrust-ir-cg-args`
     // option (see `src/knobs.rs`). That option is a Trust addition, so a
@@ -173,6 +177,74 @@ pub fn probe(session: &EarlySession) -> &EarlySession { session }
     }
 
     emit_hidden_rlib_symbols();
+}
+
+/// Whether the build compiler exports Box-deref validity facts
+/// (`TyCtxt::trust_box_deref_facts`, a sited `CastKind::BoxDerefTransmute`).
+///
+/// Absence is classified exactly (the one E0599 on the query name); any other
+/// failure aborts the build. With the query absent the retained probe pins the
+/// unit spelling of the cast kind, which is what the unconditional
+/// `[TCG-BOX-DEREF]` refusal matches. With it present the retained probe pins
+/// every name the fact translation reads, so a compiler that has the query
+/// under another fact schema fails this build instead of selecting the
+/// emission path.
+fn probe_box_deref_facts(compiler: &Path, flags: &[&str]) -> bool {
+    let facts = probe::compile_probe(
+        compiler,
+        flags,
+        "box_deref_facts",
+        r#"
+#![feature(rustc_private)]
+extern crate rustc_middle;
+extern crate rustc_span;
+use rustc_middle::ty::TyCtxt;
+pub fn read<'tcx>(tcx: TyCtxt<'tcx>, id: rustc_span::def_id::DefId) -> bool { tcx.trust_box_deref_facts(id).is_some() }
+"#,
+        Some(probe::MissingApi::BoxDerefFacts),
+    );
+    let source = if facts {
+        r#"
+#![feature(rustc_private)]
+extern crate rustc_middle;
+extern crate rustc_span;
+use rustc_middle::mir::{self, trust_box_deref as facts};
+use rustc_middle::ty::TyCtxt;
+const _: () = assert!(facts::BOX_DEREF_FACT_SCHEMA == 3);
+pub fn site(kind: &mir::CastKind) -> Option<mir::BoxDerefSite> {
+    match kind { mir::CastKind::BoxDerefTransmute(site) => Some(*site), _ => None }
+}
+pub fn admit<'a>(table: &'a facts::TrustBoxDerefFacts, site: mir::BoxDerefSite) -> Result<&'a facts::BoxValidityFact, facts::BoxFactRefusal> {
+    table.admit(site, facts::BoxFactAdmission::FAIL_CLOSED)
+}
+pub fn carrier<'tcx>(tcx: TyCtxt<'tcx>, id: rustc_span::def_id::DefId) -> facts::BoxFactCarrierStatus {
+    tcx.trust_box_deref_fact_carrier(id.krate).status
+}
+pub fn roots(root: facts::BoxValidityRoot) -> u8 {
+    match root {
+        facts::BoxValidityRoot::ParamByValue => 0,
+        facts::BoxValidityRoot::AllocPostcondition => 1,
+        facts::BoxValidityRoot::ReturnedBoxDischarged => 2,
+        facts::BoxValidityRoot::ReturnedBoxAssumed => 3,
+        facts::BoxValidityRoot::ReferenceArgBoxValid => 4,
+        facts::BoxValidityRoot::ReferenceReturnedAssumed => 5,
+        facts::BoxValidityRoot::LentSlotAssumed(_) => 6,
+    }
+}
+pub fn evidence(evidence: &facts::BoxValidityEvidence) -> Option<&facts::BoxValidityPremise> {
+    match evidence { facts::BoxValidityEvidence::Premise(premise) => Some(premise), facts::BoxValidityEvidence::ZeroSized => None }
+}
+"#
+    } else {
+        r#"
+#![feature(rustc_private)]
+extern crate rustc_middle;
+use rustc_middle::mir;
+pub fn is_box_deref(kind: &mir::CastKind) -> bool { matches!(kind, mir::CastKind::BoxDerefTransmute) }
+"#
+    };
+    probe::compile_probe(compiler, flags, "retained_box_deref", source, None);
+    facts
 }
 
 /// Explicit super clauses exclude associated-type implications and transitive expansion.

@@ -805,10 +805,12 @@ theorem driftaware_rejects_drifted_even_when_discharged :
   rfl
 
 
--- Checked FNV limb definitions for the pending production computation port.
--- Rust still uses its existing wide arithmetic; native limb callability and the
--- Rust representation/serialization connection remain required. The finite Fp
--- model above is an abstraction; these definitions do not prove collision resistance.
+-- Checked FNV limb definitions for the production computation port.  The
+-- composite definitions state the proof-facing operation.  The smaller
+-- definitions below stay inside Trust's callable fragment; Rust composes them
+-- in the same order, and the two composition theorems bind that emitted path
+-- back to the composite definitions.  The finite Fp model above is an
+-- abstraction; these definitions do not prove collision resistance.
 -- The exact FNV-1a-128 byte step, represented by two UInt64 limbs.
 -- The prime is 2^88 + 315. Multiplication carries are computed in base 2^32.
 -- This is executable arithmetic, not a collision-resistance assumption.
@@ -819,7 +821,48 @@ def trust_cg_fnv128_step_hi (hi lo byte : UInt64) : UInt64 :=
   let mixed : UInt64 := lo ^^^ byte
   let lowProduct : UInt64 := (mixed &&& 4294967295) * (315 : UInt64)
   let highProduct : UInt64 := (mixed >>> 32) * (315 : UInt64) + (lowProduct >>> 32)
-  hi * (315 : UInt64) + (mixed <<< 24) + (highProduct >>> 32)
+  hi * (315 : UInt64) + mixed * (16777216 : UInt64) + (highProduct >>> 32)
+
+-- Trust currently emits one raw bit operation at a time.  Keep those
+-- operations in individual definitions and do the composition in the Rust
+-- caller rather than asking the compiler to expand a nested bitwise body.
+def trust_cg_fnv128_xor (lo byte : UInt64) : UInt64 := lo ^^^ byte
+
+def trust_cg_fnv128_mask32 (value : UInt64) : UInt64 :=
+  value &&& (4294967295 : UInt64)
+
+def trust_cg_fnv128_shift32 (value : UInt64) : UInt64 := value >>> 32
+
+def trust_cg_fnv128_mul315 (value : UInt64) : UInt64 :=
+  value * (315 : UInt64)
+
+-- Multiplication by 2^24 is the wrapping UInt64 realization of `<<< 24` and
+-- is directly emittable.  The full source-value theorem below proves the
+-- composite result, including this term, equals the FNV-1a-128 step.
+def trust_cg_fnv128_mul_2pow24 (value : UInt64) : UInt64 :=
+  value * (16777216 : UInt64)
+
+def trust_cg_fnv128_add (left right : UInt64) : UInt64 := left + right
+
+def trust_cg_fnv128_add3 (first second third : UInt64) : UInt64 :=
+  first + second + third
+
+theorem trust_cg_fnv128_step_lo_composition (lo byte : UInt64) :
+    trust_cg_fnv128_mul315 (trust_cg_fnv128_xor lo byte) =
+      trust_cg_fnv128_step_lo lo byte := by
+  rfl
+
+theorem trust_cg_fnv128_step_hi_composition (hi lo byte : UInt64) :
+    let mixed := trust_cg_fnv128_xor lo byte
+    let lowProduct := trust_cg_fnv128_mul315 (trust_cg_fnv128_mask32 mixed)
+    let highProduct := trust_cg_fnv128_add
+      (trust_cg_fnv128_mul315 (trust_cg_fnv128_shift32 mixed))
+      (trust_cg_fnv128_shift32 lowProduct)
+    trust_cg_fnv128_add3 (trust_cg_fnv128_mul315 hi)
+      (trust_cg_fnv128_mul_2pow24 mixed)
+      (trust_cg_fnv128_shift32 highProduct) =
+        trust_cg_fnv128_step_hi hi lo byte := by
+  rfl
 
 
 -- The low base-2^32 multiplication partial fits the UInt64 carrier.
@@ -1678,7 +1721,7 @@ theorem high_source_value (hi lo byte : UInt64) :
   let upperProduct : UInt64 := (mixed >>> (32 : UInt64)) * (315 : UInt64)
   let highProduct : UInt64 := upperProduct + (lowProduct >>> (32 : UInt64))
   let hiProduct : UInt64 := hi * (315 : UInt64)
-  let shifted : UInt64 := mixed <<< (24 : UInt64)
+  let shifted : UInt64 := mixed * (16777216 : UInt64)
   let firstSum : UInt64 := hiProduct + shifted
   have mixedBound : mixed.toNat < 18446744073709551616 := by
     first
@@ -1739,7 +1782,7 @@ theorem high_source_value (hi lo byte : UInt64) :
   have hiValue : hiProduct.toNat = (hi.toNat * 315) % 18446744073709551616 :=
     uint64_mul_value hi (315 : UInt64)
   have shiftedValue : shifted.toNat = (mixed.toNat * 16777216) % 18446744073709551616 :=
-    uint64_shift24_value mixed
+    uint64_mul_value mixed (16777216 : UInt64)
   have pairValue : firstSum.toNat =
       ((hi.toNat * 315) % 18446744073709551616 +
         (mixed.toNat * 16777216) % 18446744073709551616) % 18446744073709551616 := by

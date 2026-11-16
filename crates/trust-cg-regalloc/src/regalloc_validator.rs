@@ -3219,6 +3219,19 @@ fn compute_exit_states_fixpoint(
     spec_exit: Option<&BTreeMap<BlockId, Rc<PreState>>>,
     xfers: &[Xfer],
 ) -> BTreeMap<BlockId, LocState> {
+    compute_exit_states_fixpoint_with(post, locations, phi_specs, spec_exit, xfers, true)
+}
+
+/// [`compute_exit_states_fixpoint`]; `skip_unchanged = false` recomputes every
+/// block on every pass (see [`FixpointStamps`]).
+fn compute_exit_states_fixpoint_with(
+    post: &MachFunction,
+    locations: &BTreeMap<VReg, Location>,
+    phi_specs: &PhiSpecs,
+    spec_exit: Option<&BTreeMap<BlockId, Rc<PreState>>>,
+    xfers: &[Xfer],
+    skip_unchanged: bool,
+) -> BTreeMap<BlockId, LocState> {
     let mut exit_states: BTreeMap<BlockId, LocState> = BTreeMap::new();
 
     // SPARSE persistence (pure performance; observation-equivalent — see the
@@ -3241,12 +3254,24 @@ fn compute_exit_states_fixpoint(
     // why the converged point itself depends on the seeding order.
     let walk_order = cfg_reverse_post_order(post);
 
+    // A block's exit state is a deterministic function of the exit states of
+    // the blocks its entry reads (its predecessors and the realizing
+    // predecessors of its phis, see [`block_entry_inputs`]); everything else
+    // it reads is constant across passes. So a block none of whose inputs was
+    // re-inserted since it was last computed would recompute its previous
+    // value, compare equal, and change nothing: it is skipped.
+    let inputs = block_entry_inputs(post, phi_specs);
+    let mut stamps = FixpointStamps::new(post.blocks.len(), skip_unchanged);
+
     for _ in 0..max_passes {
         let mut changed = false;
         for &block_id in &walk_order {
             let Some(block) = post.blocks.get(block_id.0 as usize) else {
                 continue;
             };
+            if !stamps.needs_compute(block_id, &inputs[block_id.0 as usize]) {
+                continue;
+            }
 
             let mut state = block_entry_state(
                 block,
@@ -3280,6 +3305,7 @@ fn compute_exit_states_fixpoint(
                 Some(prev) if *prev == state => {}
                 _ => {
                     exit_states.insert(block_id, state);
+                    stamps.inserted(block_id);
                     changed = true;
                 }
             }
@@ -3290,6 +3316,78 @@ fn compute_exit_states_fixpoint(
     }
 
     exit_states
+}
+
+/// For each block (indexed by id), the blocks whose EXIT states its
+/// [`block_entry_state`] reads: its predecessors (the meet) and the realizing
+/// predecessor of every phi edge it carries (phi establishment).
+fn block_entry_inputs(post: &MachFunction, phi_specs: &PhiSpecs) -> Vec<Vec<BlockId>> {
+    post.blocks
+        .iter()
+        .enumerate()
+        .map(|(index, block)| {
+            let mut inputs = block.preds.clone();
+            if let Some(specs) = phi_specs.get(&BlockId(index as u32)) {
+                for (_, edges) in specs {
+                    inputs.extend(edges.iter().map(|edge| edge.realizing_pred));
+                }
+            }
+            inputs
+        })
+        .collect()
+}
+
+/// Change stamps for a round-robin fixpoint over per-block exit states.
+///
+/// `inserted[b]` is the clock value at which block `b`'s exit state was last
+/// (re)inserted (0: never); `computed[b]` is the clock value when `b` was last
+/// computed (`None`: never). A block must be computed when it never was, or
+/// when one of its inputs was inserted after its last computation. Skipping
+/// it otherwise is exact: its inputs are unchanged, so it would produce the
+/// value it produced last time, which is its stored exit state (or, when it
+/// stored nothing, still nothing), and the pass's `changed` flag is the same.
+struct FixpointStamps {
+    /// `false` computes every block on every pass (the unskipped walk the
+    /// decision-identity test compares against).
+    skip: bool,
+    clock: u64,
+    inserted: Vec<u64>,
+    computed: Vec<Option<u64>>,
+}
+
+impl FixpointStamps {
+    fn new(blocks: usize, skip: bool) -> Self {
+        Self {
+            skip,
+            clock: 0,
+            inserted: vec![0; blocks],
+            computed: vec![None; blocks],
+        }
+    }
+
+    /// Whether `block` must be (re)computed; records the computation when so.
+    fn needs_compute(&mut self, block: BlockId, inputs: &[BlockId]) -> bool {
+        let index = block.0 as usize;
+        let needed = match self.computed[index] {
+            _ if !self.skip => true,
+            None => true,
+            Some(at) => inputs.iter().any(|input| {
+                self.inserted
+                    .get(input.0 as usize)
+                    .is_some_and(|&stamp| stamp > at)
+            }),
+        };
+        if needed {
+            self.computed[index] = Some(self.clock);
+        }
+        needed
+    }
+
+    /// Record that `block`'s exit state was (re)inserted.
+    fn inserted(&mut self, block: BlockId) {
+        self.clock += 1;
+        self.inserted[block.0 as usize] = self.clock;
+    }
 }
 
 /// Per-block sets of locations LIVE-OUT in the validator's read/write model:
@@ -3820,6 +3918,12 @@ fn compute_pre_spec_flow(pre: &MachFunction) -> PreSpecFlow {
 }
 
 fn compute_pre_spec_flow_inner(pre: &MachFunction) -> PreSpecFlow {
+    compute_pre_spec_flow_with(pre, true)
+}
+
+/// [`compute_pre_spec_flow_inner`]; `skip_unchanged = false` recomputes every
+/// block on every pass (see [`FixpointStamps`]).
+fn compute_pre_spec_flow_with(pre: &MachFunction, skip_unchanged: bool) -> PreSpecFlow {
     // SPARSE key domains (a pure-performance restriction of the historical
     // dense walk — observation-equivalent, see the proofs on the two helpers).
     // On TY's fused-BFS parent loop (~7,300 blocks / ~65,000 insts at O0) the
@@ -3890,12 +3994,19 @@ fn compute_pre_spec_flow_inner(pre: &MachFunction) -> PreSpecFlow {
     let mut exit_states: BTreeMap<BlockId, Rc<PreState>> = BTreeMap::new();
     let max_passes = pre.block_order.len().saturating_mul(2).saturating_add(2);
     let walk_order = cfg_reverse_post_order(pre);
+    // A block's exit here is a deterministic function of its predecessors'
+    // exit states (`pre_entry_shared` reads only those); see
+    // [`FixpointStamps`] for why skipping an unchanged-input block is exact.
+    let mut stamps = FixpointStamps::new(pre.blocks.len(), skip_unchanged);
     for _ in 0..max_passes {
         let mut changed = false;
         for &block_id in &walk_order {
             let Some(block) = pre.blocks.get(block_id.0 as usize) else {
                 continue;
             };
+            if !stamps.needs_compute(block_id, &block.preds) {
+                continue;
+            }
             let exit: Rc<PreState> = if !block_writes_tracked[block_id.0 as usize] {
                 // SHARE: exit == entry (no tracked write => no-op transfer, and the
                 // entry is already observable-only => no-op retain).
@@ -3931,6 +4042,7 @@ fn compute_pre_spec_flow_inner(pre: &MachFunction) -> PreSpecFlow {
                 Some(prev) if Rc::ptr_eq(prev, &exit) || **prev == *exit => {}
                 _ => {
                     exit_states.insert(block_id, exit);
+                    stamps.inserted(block_id);
                     changed = true;
                 }
             }
@@ -9604,6 +9716,60 @@ mod tests {
         assert!(interference_errors > 0, "corpus never fired interference");
         assert!(value_flow_errors > 0, "corpus never fired value-flow");
         assert!(phi_errors > 0, "corpus never fired a phi check");
+    }
+
+    /// Skipping a block none of whose inputs changed since it was last computed
+    /// (`FixpointStamps`) must give the same converged states as recomputing
+    /// every block on every pass, in both value-flow fixpoints (with and without
+    /// the generalized phi-edge spec obligation). Fails when the skip loses a
+    /// dependency: e.g. with the re-insert stamp removed, or the predecessor
+    /// inputs dropped.
+    #[test]
+    fn fixpoint_skip_of_unchanged_blocks_matches_full_recompute() {
+        use super::{compile_xfers, compute_exit_states_fixpoint_with, compute_pre_spec_flow_with};
+        let mut rng = XorShift(0x0dd_ba11_5eed_f00d);
+        let mut multi_pass_cases = 0usize;
+        for case in 0..800 {
+            let (pre, post, result) = random_triple(&mut rng);
+            let locations = build_location_map(&result);
+            let phi_specs = collect_phi_specs(&pre, &post);
+            let xfers = compile_xfers(&pre, &post, &locations);
+
+            let pre_skip = compute_pre_spec_flow_with(&pre, true);
+            let pre_full = compute_pre_spec_flow_with(&pre, false);
+            assert_eq!(
+                pre_skip.expected, pre_full.expected,
+                "case {case}: PRE expected map diverged\npre={pre:#?}"
+            );
+            assert_eq!(
+                pre_skip.exit_states, pre_full.exit_states,
+                "case {case}: PRE exit states diverged\npre={pre:#?}"
+            );
+
+            for spec_exit in [None, Some(&pre_full.exit_states)] {
+                let skip = compute_exit_states_fixpoint_with(
+                    &post, &locations, &phi_specs, spec_exit, &xfers, true,
+                );
+                let full = compute_exit_states_fixpoint_with(
+                    &post, &locations, &phi_specs, spec_exit, &xfers, false,
+                );
+                assert_eq!(
+                    skip, full,
+                    "case {case}: POST exit states diverged\npre={pre:#?}\npost={post:#?}"
+                );
+            }
+            if post
+                .blocks
+                .iter()
+                .enumerate()
+                .any(|(b, block)| block.preds.iter().any(|p| p.0 as usize >= b))
+            {
+                multi_pass_cases += 1;
+            }
+        }
+        // Vacuity guard: back edges (a later or self predecessor) force second
+        // passes, where the skip decides something.
+        assert!(multi_pass_cases > 100, "corpus has too few cyclic CFGs");
     }
 
     /// Directed TEETH for the CT-3 shared-state (`Rc<PreState>`) rewrite of

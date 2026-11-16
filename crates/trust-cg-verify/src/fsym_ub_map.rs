@@ -280,6 +280,8 @@ const CLASS_TENSOR_COORDINATES: &str = "tensor gather/scatter coordinates and ex
 pub const CLASS_REFUSED: &str =
     "undef, ARC, binding frames, dialect ops, indirect calls, SeqMap, unwinding, coroutines";
 pub const CLASS_HOST: &str = "host runtime handles and host models";
+pub const CLASS_TYPED_ABI: &str = "typed ABI attributes and provenance";
+pub const CLASS_ENUM_IMAGE: &str = "enum byte-image validity";
 
 // ---------------------------------------------------------------------------
 // Shared raiser groups and reasons
@@ -340,8 +342,28 @@ const PAD_BINDS_ONLY_UNDER_UNWIND: &str = "a landing pad binds its exception and
 const REFUSED_DROPS_AND_UNWIND_TWINS: &[&str] = &["Drop", "DropInvoke", "InvokeIndirect", "Resume"];
 /// trust-ir v55 (amendment D): a resolved drop runs its glue as a call.
 const REFUSED_DROPS: &[&str] = &["Drop", "DropInvoke"];
+/// trust-ir v67: `Inst::BoxDeref`, refused at admission. fsym models no Box
+/// validity conjunct, so the instruction's own UB (a null, misaligned or
+/// non-dereferenceable box pointer) has no verdict kind and no function
+/// holding one is scanned.
+const REFUSED_BOX_DEREF: &[&str] = &["BoxDeref"];
 /// trust-ir v49: an entry argument carrying an unwritten lane.
 const ENTRY_UNWRITTEN_LANE: &str = "an unwritten aggregate lane in the harness's entry arguments: outside the run model (`FsymRunModel::breach`), where fsym's claims are not made";
+/// The source call graph reaches these sites only through TrustIR's typed-ABI
+/// entry boundary or per-node provenance wrapper. Bounded fsym does not model
+/// either contract and refuses a module carrying ANY typed signature ABI
+/// before scanning, so those pseudo-raiser paths cannot arise in a scan.
+const TYPED_ABI_MODULE_REFUSAL: &str = "bounded fsym refuses every module containing a typed signature ABI before scanning; the pseudo-raiser's source path is only through TrustIR's typed-ABI entry boundary or per-node provenance wrapper";
+/// The scanner refuses a load/RMW/CmpXchg, or either side of a cast, whose
+/// byte representation can contain an enum. It therefore never scans an
+/// instruction that asks the interpreter to recover an active variant from
+/// an unchecked byte image.
+const ENUM_IMAGE_ADMISSION_REFUSAL: &str = "the instruction's admission gate refuses an enum-containing byte-image load or cast before scanning, because fsym has no discriminant-validity obligation";
+/// These interpreter sites are `TypeError`, not undefined behaviour, when an
+/// already-typed value names an uninhabited enum variant. They do not arise
+/// from decoding an unchecked byte image.
+const ENUM_TYPED_VALUE_TYPE_ERROR: &str = "the raiser carries an already-typed enum value; an uninhabited variant is rejected as TypeError rather than undefined behaviour, while byte-image reconstruction is separately refused at admission";
+const CAST_DOES_NOT_ACCESS_MEMORY: &str = "the source-only call graph merges the typed-ABI provenance method `access` with the interpreter memory helper of the same name; an ordinary Cast only encodes/decodes its SSA operand and performs no MemoryState checked access";
 
 const fn owed(
     by: &'static [&'static str],
@@ -404,11 +426,45 @@ use FsymTrustIrDiagnosticKind as K;
 /// revision can raise (its non-test code), plus the
 /// [`CALLEE_BODY`] pseudo-site for a callee's execution.
 pub const FSYM_INTERPRETER_UB_SITES: &[FsymInterpreterUbSite] = &[
+    // trust-ir v67 `Inst::BoxDeref`: the validity rule's own three failures
+    // and the address read it makes. Refused at admission.
+    site(
+        "check_box_validity",
+        "BoxDeref: NonNull is false: the box pointer is nul",
+        CLASS_NULL,
+        &[refused(REFUSED_BOX_DEREF)],
+    ),
+    site(
+        "check_box_validity",
+        "BoxDeref: Aligned is false: address {address} is n",
+        CLASS_MISALIGNED,
+        &[refused(REFUSED_BOX_DEREF)],
+    ),
+    site(
+        "check_box_validity",
+        "BoxDeref: Dereferenceable is false: pointer value ",
+        CLASS_BOUNDS,
+        &[refused(REFUSED_BOX_DEREF)],
+    ),
+    site(
+        "pointer_address",
+        "{op}: unknown allocation {}",
+        CLASS_BOUNDS,
+        &[refused(REFUSED_BOX_DEREF)],
+    ),
+    site(
+        "pointer_address",
+        "{op}: pointer address overflow",
+        CLASS_BOUNDS,
+        &[refused(REFUSED_BOX_DEREF)],
+    ),
     site(
         "check_char_validity",
         "`char` value {:#x} is not a Unicode scalar value (",
         CLASS_CHAR_VALIDITY,
         &[
+            // v67: refused at admission, so nothing it reaches is owed.
+            refused(REFUSED_BOX_DEREF),
             not_raised(CHAR_BINDING_RAISERS, CHAR_BINDINGS_REFUSED),
             // Flat construction excludes Char captures; every Char SSA binding
             // is separately refused by validate_char_binding_scope.
@@ -493,9 +549,169 @@ pub const FSYM_INTERPRETER_UB_SITES: &[FsymInterpreterUbSite] = &[
         CLASS_HOST,
         &[outside(&[RAISER_ENTRY], HOST_MODEL)],
     ),
+    // TrustIR's typed-ABI boundary has its own byte transport and provenance
+    // semantics. Bounded fsym refuses every module containing such a
+    // signature. These raiser rows come from the exact source census.
+    site(
+        "abi_pointer_attributes",
+        "typed ABI pointer alignment is not satisfied",
+        CLASS_TYPED_ABI,
+        &[not_raised(&[RAISER_ENTRY], TYPED_ABI_MODULE_REFUSAL)],
+    ),
+    site(
+        "abi_scalar_attributes",
+        "typed ABI dereferenceable pointer has no live allo",
+        CLASS_TYPED_ABI,
+        &[not_raised(&[RAISER_ENTRY], TYPED_ABI_MODULE_REFUSAL)],
+    ),
+    site(
+        "abi_scalar_attributes",
+        "typed ABI null pointer contradicts its nonnull/der",
+        CLASS_TYPED_ABI,
+        &[not_raised(&[RAISER_ENTRY], TYPED_ABI_MODULE_REFUSAL)],
+    ),
+    site(
+        "abi_scalar_attributes",
+        "typed ABI pointer alignment is not satisfied",
+        CLASS_TYPED_ABI,
+        &[not_raised(&[RAISER_ENTRY], TYPED_ABI_MODULE_REFUSAL)],
+    ),
+    site(
+        "abi_scalar_attributes",
+        "typed ABI pointer is not initialized",
+        CLASS_TYPED_ABI,
+        &[not_raised(&[RAISER_ENTRY], TYPED_ABI_MODULE_REFUSAL)],
+    ),
+    site(
+        "abi_value",
+        "typed ABI has uninitialized live aggregate carrier",
+        CLASS_TYPED_ABI,
+        &[not_raised(&[RAISER_ENTRY], TYPED_ABI_MODULE_REFUSAL)],
+    ),
+    site(
+        "access",
+        "typed ABI access uses provenance whose capture per",
+        CLASS_TYPED_ABI,
+        &[not_raised(
+            &[RAISER_ENTRY, RAISER_WALK],
+            TYPED_ABI_MODULE_REFUSAL,
+        )],
+    ),
+    site(
+        "access",
+        "typed ABI based-on access violates readonly/nofree",
+        CLASS_TYPED_ABI,
+        &[not_raised(
+            &[RAISER_ENTRY, RAISER_WALK],
+            TYPED_ABI_MODULE_REFUSAL,
+        )],
+    ),
+    site(
+        "access",
+        "typed ABI noalias has conflicting based-on and ind",
+        CLASS_TYPED_ABI,
+        &[not_raised(
+            &[RAISER_ENTRY, RAISER_WALK],
+            TYPED_ABI_MODULE_REFUSAL,
+        )],
+    ),
+    site(
+        "capture_exit",
+        "typed ABI captures(none) returns the pointer's add",
+        CLASS_TYPED_ABI,
+        &[not_raised(&[RAISER_ENTRY], TYPED_ABI_MODULE_REFUSAL)],
+    ),
+    site(
+        "cast_register",
+        "typed ABI noundef cast has uninitialized live byte",
+        CLASS_TYPED_ABI,
+        &[not_raised(&[RAISER_ENTRY], TYPED_ABI_MODULE_REFUSAL)],
+    ),
+    site(
+        "execute_packet_boundary",
+        "capture exit unavailable; original: {:?}; refusal:",
+        CLASS_TYPED_ABI,
+        &[not_raised(&[RAISER_ENTRY], TYPED_ABI_MODULE_REFUSAL)],
+    ),
+    site(
+        "fresh_result",
+        "typed ABI noalias result is already accessible thr",
+        CLASS_TYPED_ABI,
+        &[not_raised(&[RAISER_ENTRY], TYPED_ABI_MODULE_REFUSAL)],
+    ),
+    site(
+        "provenance_before_node",
+        "typed ABI return exposes a retired captures(none) ",
+        CLASS_TYPED_ABI,
+        &[not_raised(&[RAISER_WALK], TYPED_ABI_MODULE_REFUSAL)],
+    ),
+    site(
+        "scalar_register",
+        "typed ABI scalar has uninitialized value bits",
+        CLASS_TYPED_ABI,
+        &[not_raised(&[RAISER_ENTRY], TYPED_ABI_MODULE_REFUSAL)],
+    ),
+    site(
+        "transport_values",
+        "typed ABI Bool value bit is uninitialized",
+        CLASS_TYPED_ABI,
+        &[not_raised(&[RAISER_ENTRY], TYPED_ABI_MODULE_REFUSAL)],
+    ),
+    // A loaded enum image must name an inhabited variant. Initialized-byte
+    // coverage alone does not establish that discriminant fact.
+    site(
+        "enum_image_variant",
+        "Load: enum tag value {disc} does not match any var",
+        CLASS_ENUM_IMAGE,
+        &[
+            not_raised(&[RAISER_ENTRY], TYPED_ABI_MODULE_REFUSAL),
+            not_raised(
+                &["Load", "AtomicLoad", "AtomicRMW", "CmpXchg", "Cast"],
+                ENUM_IMAGE_ADMISSION_REFUSAL,
+            ),
+            refused(&["SeqMap", "TensorMap"]),
+        ],
+    ),
+    site(
+        "enum_image_variant",
+        "Load: enum {ty} byte image uses the untagged varia",
+        CLASS_ENUM_IMAGE,
+        &[
+            not_raised(&[RAISER_ENTRY], TYPED_ABI_MODULE_REFUSAL),
+            not_raised(
+                &["Load", "AtomicLoad", "AtomicRMW", "CmpXchg", "Cast"],
+                ENUM_IMAGE_ADMISSION_REFUSAL,
+            ),
+            refused(&["SeqMap", "TensorMap"]),
+        ],
+    ),
+    site(
+        "refuse_uninhabited",
+        "{op}: enum {ty} variant {variant_idx} is uninhabit",
+        CLASS_ENUM_IMAGE,
+        &[
+            not_raised(&[RAISER_ENTRY], TYPED_ABI_MODULE_REFUSAL),
+            not_raised(
+                &["Load", "AtomicLoad", "AtomicRMW", "CmpXchg", "Cast"],
+                ENUM_IMAGE_ADMISSION_REFUSAL,
+            ),
+            not_raised(
+                &[
+                    "AtomicStore",
+                    "Const",
+                    "GlobalAddr",
+                    "MakeAggregate",
+                    "Store",
+                    "Switch",
+                ],
+                ENUM_TYPED_VALUE_TYPE_ERROR,
+            ),
+            refused(&["CoroSuspend", "SeqMap", "TensorMap"]),
+        ],
+    ),
     // Control flow.
     site(
-        "execute_node",
+        "execute_node_inner",
         "executed unreachable",
         CLASS_UNREACHABLE,
         &[owed_always(&["Unreachable"], K::UnreachableReached)],
@@ -503,32 +719,32 @@ pub const FSYM_INTERPRETER_UB_SITES: &[FsymInterpreterUbSite] = &[
     // v56 (amendment D Part 2, §21 rule 6): under `Unwind`, `Resume` of a
     // value that is no exception object a pad produced.
     site(
-        "execute_node",
+        "execute_node_inner",
         "resume: the value is not an exception object a lan",
         CLASS_REFUSED,
         &[refused(&["Resume"])],
     ),
     // Binding frames.
     site(
-        "execute_node",
+        "execute_node_inner",
         "OpenFrame: frame id overflow",
         CLASS_REFUSED,
         &[refused(&["OpenFrame"])],
     ),
     site(
-        "execute_node",
+        "execute_node_inner",
         "BindSlot: slot {slot} out of range for frame of {}",
         CLASS_REFUSED,
         &[refused(&["BindSlot"])],
     ),
     site(
-        "execute_node",
+        "execute_node_inner",
         "LoadSlot: slot {slot} out of range for frame of {}",
         CLASS_REFUSED,
         &[refused(&["LoadSlot"])],
     ),
     site(
-        "execute_node",
+        "execute_node_inner",
         "CloseFrame: frame is not open (double close)",
         CLASS_REFUSED,
         &[refused(&["CloseFrame"])],
@@ -616,6 +832,7 @@ pub const FSYM_INTERPRETER_UB_SITES: &[FsymInterpreterUbSite] = &[
             // v56: a failed check's exception object, under `Unwind` only.
             not_raised(&["Assert"], UNWIND_RAISE_ONLY),
             refused(&["AssertInvoke"]),
+            not_raised(&[RAISER_ENTRY], TYPED_ABI_MODULE_REFUSAL),
         ],
     ),
     // Loads.
@@ -653,6 +870,9 @@ pub const FSYM_INTERPRETER_UB_SITES: &[FsymInterpreterUbSite] = &[
             not_raised(GLOBAL_MATERIALIZERS, NO_UNWRITTEN_LANE),
             not_raised(&["Switch"], NO_UNWRITTEN_LANE),
             refused(REFUSED_MEMORY),
+            not_raised(&[RAISER_ENTRY], TYPED_ABI_MODULE_REFUSAL),
+            not_raised(&["Cast"], NO_UNWRITTEN_LANE),
+            refused(&["TensorMap"]),
         ],
     ),
     site(
@@ -683,6 +903,7 @@ pub const FSYM_INTERPRETER_UB_SITES: &[FsymInterpreterUbSite] = &[
                 "TensorGather",
                 "TensorScatter",
             ]),
+            refused(REFUSED_BOX_DEREF),
             outside(&[RAISER_ENTRY], ENTRY_UNWRITTEN_LANE),
             not_raised(&["MakeClosure"], NO_UNWRITTEN_LANE),
             FsymUbRaise {
@@ -799,7 +1020,10 @@ pub const FSYM_INTERPRETER_UB_SITES: &[FsymInterpreterUbSite] = &[
         "bulk_byte_count",
         "{op}: byte count {} exceeds u64",
         CLASS_BOUNDS,
-        &[owed_always(&["MemCopy", "MemSet"], K::OutOfBounds)],
+        &[
+            owed_always(&["MemCopy", "MemSet"], K::OutOfBounds),
+            not_raised(&[RAISER_WALK], TYPED_ABI_MODULE_REFUSAL),
+        ],
     ),
     // Casts.
     site(
@@ -957,13 +1181,21 @@ pub const FSYM_INTERPRETER_UB_SITES: &[FsymInterpreterUbSite] = &[
         "is_unique",
         "IsUnique: pointer does not reference a known alloc",
         CLASS_REFUSED,
-        &[refused(&["IsUnique"]), outside(&[RAISER_ENTRY], HOST_MODEL)],
+        &[
+            refused(&["IsUnique"]),
+            outside(&[RAISER_ENTRY], HOST_MODEL),
+            not_raised(&[RAISER_WALK], TYPED_ABI_MODULE_REFUSAL),
+        ],
     ),
     site(
         "is_unique",
         "IsUnique: pointer references a freed allocation",
         CLASS_REFUSED,
-        &[refused(&["IsUnique"]), outside(&[RAISER_ENTRY], HOST_MODEL)],
+        &[
+            refused(&["IsUnique"]),
+            outside(&[RAISER_ENTRY], HOST_MODEL),
+            not_raised(&[RAISER_WALK], TYPED_ABI_MODULE_REFUSAL),
+        ],
     ),
     site(
         "arc_allocation_mut",
@@ -991,13 +1223,21 @@ pub const FSYM_INTERPRETER_UB_SITES: &[FsymInterpreterUbSite] = &[
         "is_unique",
         "IsUnique: pointer addresses {actual}, not a refere",
         CLASS_REFUSED,
-        &[refused(&["IsUnique"]), outside(&[RAISER_ENTRY], HOST_MODEL)],
+        &[
+            refused(&["IsUnique"]),
+            outside(&[RAISER_ENTRY], HOST_MODEL),
+            not_raised(&[RAISER_WALK], TYPED_ABI_MODULE_REFUSAL),
+        ],
     ),
     site(
         "is_unique",
         "IsUnique: pointer is at offset {} of its cell, not",
         CLASS_REFUSED,
-        &[refused(&["IsUnique"]), outside(&[RAISER_ENTRY], HOST_MODEL)],
+        &[
+            refused(&["IsUnique"]),
+            outside(&[RAISER_ENTRY], HOST_MODEL),
+            not_raised(&[RAISER_WALK], TYPED_ABI_MODULE_REFUSAL),
+        ],
     ),
     site(
         "arc_allocation_mut",
@@ -1022,19 +1262,28 @@ pub const FSYM_INTERPRETER_UB_SITES: &[FsymInterpreterUbSite] = &[
         "dealloc",
         "Dealloc: pointer must reference allocation base",
         CLASS_INVALID_FREE,
-        &[owed_always(&["Dealloc"], K::InvalidFree)],
+        &[
+            owed_always(&["Dealloc"], K::InvalidFree),
+            not_raised(&[RAISER_ENTRY], TYPED_ABI_MODULE_REFUSAL),
+        ],
     ),
     site(
         "dealloc",
         "Dealloc: unknown allocation {}",
         CLASS_INVALID_FREE,
-        &[owed_always(&["Dealloc"], K::InvalidFree)],
+        &[
+            owed_always(&["Dealloc"], K::InvalidFree),
+            not_raised(&[RAISER_ENTRY], TYPED_ABI_MODULE_REFUSAL),
+        ],
     ),
     site(
         "dealloc",
         "Dealloc: allocation is already dead",
         CLASS_UAF,
-        &[owed_always(&["Dealloc"], K::UseAfterFree)],
+        &[
+            owed_always(&["Dealloc"], K::UseAfterFree),
+            not_raised(&[RAISER_ENTRY], TYPED_ABI_MODULE_REFUSAL),
+        ],
     ),
     // trust-ir `bf7ee706`: a reference-counted (`SwiftHeap` / `CleanHeap`)
     // cell is released by `Release`, never by `Dealloc`. fsym's InvalidFree
@@ -1043,7 +1292,10 @@ pub const FSYM_INTERPRETER_UB_SITES: &[FsymInterpreterUbSite] = &[
         "dealloc",
         "Dealloc of a {origin:?} cell: a reference-counted ",
         CLASS_INVALID_FREE,
-        &[owed_always(&["Dealloc"], K::InvalidFree)],
+        &[
+            owed_always(&["Dealloc"], K::InvalidFree),
+            not_raised(&[RAISER_ENTRY], TYPED_ABI_MODULE_REFUSAL),
+        ],
     ),
     // trust-ir `c06a487f`: freeing an allocation under a live borrow (a thin
     // `Borrow` / `BorrowMut` of an address inside its requested bytes not yet
@@ -1056,7 +1308,10 @@ pub const FSYM_INTERPRETER_UB_SITES: &[FsymInterpreterUbSite] = &[
         "dealloc",
         "Dealloc: allocation is under a live borrow ({} Bor",
         CLASS_INVALID_FREE,
-        &[owed_always(&["Dealloc"], K::InvalidFree)],
+        &[
+            owed_always(&["Dealloc"], K::InvalidFree),
+            not_raised(&[RAISER_ENTRY], TYPED_ABI_MODULE_REFUSAL),
+        ],
     ),
     // Addresses.
     site(
@@ -1073,6 +1328,7 @@ pub const FSYM_INTERPRETER_UB_SITES: &[FsymInterpreterUbSite] = &[
             // v56: a failed check's exception object, under `Unwind` only.
             not_raised(&["Assert"], UNWIND_RAISE_ONLY),
             refused(&["AssertInvoke", "Resume"]),
+            not_raised(&[RAISER_ENTRY], TYPED_ABI_MODULE_REFUSAL),
         ],
     ),
     site(
@@ -1111,6 +1367,7 @@ pub const FSYM_INTERPRETER_UB_SITES: &[FsymInterpreterUbSite] = &[
             // v56: a failed check's exception object, under `Unwind` only.
             not_raised(&["Assert"], UNWIND_RAISE_ONLY),
             refused(&["AssertInvoke", "Resume"]),
+            not_raised(&[RAISER_ENTRY], TYPED_ABI_MODULE_REFUSAL),
         ],
     ),
     site(
@@ -1146,6 +1403,7 @@ pub const FSYM_INTERPRETER_UB_SITES: &[FsymInterpreterUbSite] = &[
             ),
             not_raised(&["Switch"], INTEGER_SWITCH),
             refused(REFUSED_MEMORY),
+            not_raised(&[RAISER_ENTRY], TYPED_ABI_MODULE_REFUSAL),
         ],
     ),
     // Accesses.
@@ -1154,6 +1412,8 @@ pub const FSYM_INTERPRETER_UB_SITES: &[FsymInterpreterUbSite] = &[
         "{op}: unknown allocation {}",
         CLASS_BOUNDS,
         &[
+            // v67: refused at admission, so nothing it reaches is owed.
+            refused(REFUSED_BOX_DEREF),
             outside(ACCESSES, FORGED_ENTRY_POINTER),
             not_raised(GLOBAL_MATERIALIZERS, RECORDS_NEVER_REMOVED),
             not_raised(ALLOCATORS, PLACEMENT_BUILDS_ITS_IMAGE),
@@ -1162,6 +1422,9 @@ pub const FSYM_INTERPRETER_UB_SITES: &[FsymInterpreterUbSite] = &[
             // v56: a failed check's exception object, under `Unwind` only.
             not_raised(&["Assert"], UNWIND_RAISE_ONLY),
             refused(&["AssertInvoke"]),
+            not_raised(&[RAISER_ENTRY, RAISER_WALK], TYPED_ABI_MODULE_REFUSAL),
+            not_raised(&["Cast"], CAST_DOES_NOT_ACCESS_MEMORY),
+            refused(&["TensorMap"]),
         ],
     ),
     site(
@@ -1169,6 +1432,8 @@ pub const FSYM_INTERPRETER_UB_SITES: &[FsymInterpreterUbSite] = &[
         "{op}: use after dealloc",
         CLASS_UAF,
         &[
+            // v67: refused at admission, so nothing it reaches is owed.
+            refused(REFUSED_BOX_DEREF),
             owed_always(ACCESSES, K::UseAfterFree),
             not_raised(GLOBAL_MATERIALIZERS, GLOBAL_INIT_WRITE),
             not_raised(ALLOCATORS, PLACEMENT_BUILDS_ITS_IMAGE),
@@ -1177,6 +1442,9 @@ pub const FSYM_INTERPRETER_UB_SITES: &[FsymInterpreterUbSite] = &[
             // v56: a failed check's exception object, under `Unwind` only.
             not_raised(&["Assert"], UNWIND_RAISE_ONLY),
             refused(&["AssertInvoke"]),
+            not_raised(&[RAISER_ENTRY, RAISER_WALK], TYPED_ABI_MODULE_REFUSAL),
+            not_raised(&["Cast"], CAST_DOES_NOT_ACCESS_MEMORY),
+            refused(&["TensorMap"]),
         ],
     ),
     site(
@@ -1184,6 +1452,8 @@ pub const FSYM_INTERPRETER_UB_SITES: &[FsymInterpreterUbSite] = &[
         "{op}: pointer address overflow",
         CLASS_BOUNDS,
         &[
+            // v67: refused at admission, so nothing it reaches is owed.
+            refused(REFUSED_BOX_DEREF),
             owed_always(ACCESSES, K::OutOfBounds),
             not_raised(GLOBAL_MATERIALIZERS, GLOBAL_INIT_WRITE),
             not_raised(ALLOCATORS, PLACEMENT_BUILDS_ITS_IMAGE),
@@ -1192,6 +1462,9 @@ pub const FSYM_INTERPRETER_UB_SITES: &[FsymInterpreterUbSite] = &[
             // v56: a failed check's exception object, under `Unwind` only.
             not_raised(&["Assert"], UNWIND_RAISE_ONLY),
             refused(&["AssertInvoke"]),
+            not_raised(&[RAISER_ENTRY, RAISER_WALK], TYPED_ABI_MODULE_REFUSAL),
+            not_raised(&["Cast"], CAST_DOES_NOT_ACCESS_MEMORY),
+            refused(&["TensorMap"]),
         ],
     ),
     site(
@@ -1199,6 +1472,8 @@ pub const FSYM_INTERPRETER_UB_SITES: &[FsymInterpreterUbSite] = &[
         "{op}: pointer address {address} is not aligned to ",
         CLASS_MISALIGNED,
         &[
+            // v67: refused at admission, so nothing it reaches is owed.
+            refused(REFUSED_BOX_DEREF),
             owed_always(SCALAR_ACCESSES, K::Misaligned),
             not_raised(
                 &["MemCopy", "MemSet"],
@@ -1211,6 +1486,9 @@ pub const FSYM_INTERPRETER_UB_SITES: &[FsymInterpreterUbSite] = &[
             // v56: a failed check's exception object, under `Unwind` only.
             not_raised(&["Assert"], UNWIND_RAISE_ONLY),
             refused(&["AssertInvoke"]),
+            not_raised(&[RAISER_ENTRY, RAISER_WALK], TYPED_ABI_MODULE_REFUSAL),
+            not_raised(&["Cast"], CAST_DOES_NOT_ACCESS_MEMORY),
+            refused(&["TensorMap"]),
         ],
     ),
     site(
@@ -1218,6 +1496,8 @@ pub const FSYM_INTERPRETER_UB_SITES: &[FsymInterpreterUbSite] = &[
         "{op}: access range overflow",
         CLASS_BOUNDS,
         &[
+            // v67: refused at admission, so nothing it reaches is owed.
+            refused(REFUSED_BOX_DEREF),
             owed_always(ACCESSES, K::OutOfBounds),
             not_raised(GLOBAL_MATERIALIZERS, GLOBAL_INIT_WRITE),
             not_raised(ALLOCATORS, PLACEMENT_BUILDS_ITS_IMAGE),
@@ -1226,6 +1506,9 @@ pub const FSYM_INTERPRETER_UB_SITES: &[FsymInterpreterUbSite] = &[
             // v56: a failed check's exception object, under `Unwind` only.
             not_raised(&["Assert"], UNWIND_RAISE_ONLY),
             refused(&["AssertInvoke"]),
+            not_raised(&[RAISER_ENTRY, RAISER_WALK], TYPED_ABI_MODULE_REFUSAL),
+            not_raised(&["Cast"], CAST_DOES_NOT_ACCESS_MEMORY),
+            refused(&["TensorMap"]),
         ],
     ),
     site(
@@ -1233,6 +1516,8 @@ pub const FSYM_INTERPRETER_UB_SITES: &[FsymInterpreterUbSite] = &[
         "{op}: access [{}..{}) is out of bounds for allocat",
         CLASS_BOUNDS,
         &[
+            // v67: refused at admission, so nothing it reaches is owed.
+            refused(REFUSED_BOX_DEREF),
             owed_always(ACCESSES, K::OutOfBounds),
             not_raised(GLOBAL_MATERIALIZERS, GLOBAL_INIT_WRITE),
             not_raised(ALLOCATORS, PLACEMENT_BUILDS_ITS_IMAGE),
@@ -1241,6 +1526,9 @@ pub const FSYM_INTERPRETER_UB_SITES: &[FsymInterpreterUbSite] = &[
             // v56: a failed check's exception object, under `Unwind` only.
             not_raised(&["Assert"], UNWIND_RAISE_ONLY),
             refused(&["AssertInvoke"]),
+            not_raised(&[RAISER_ENTRY, RAISER_WALK], TYPED_ABI_MODULE_REFUSAL),
+            not_raised(&["Cast"], CAST_DOES_NOT_ACCESS_MEMORY),
+            refused(&["TensorMap"]),
         ],
     ),
     site(
@@ -1252,6 +1540,7 @@ pub const FSYM_INTERPRETER_UB_SITES: &[FsymInterpreterUbSite] = &[
             owed_always(&["GEP", "Borrow", "BorrowMut"], K::NullDeref),
             owed_always(&["Dealloc"], K::InvalidFree),
             refused(&["Retain", "Release", "IsUnique", "CoroSuspend", "SeqMap"]),
+            not_raised(&[RAISER_ENTRY, RAISER_WALK], TYPED_ABI_MODULE_REFUSAL),
         ],
     ),
     site(
@@ -1267,6 +1556,7 @@ pub const FSYM_INTERPRETER_UB_SITES: &[FsymInterpreterUbSite] = &[
                 "eval_gep handles a no-provenance base before expect_pointer (GEP on one is defined)",
             ),
             refused(&["Retain", "Release", "IsUnique", "CoroSuspend", "SeqMap"]),
+            not_raised(&[RAISER_ENTRY, RAISER_WALK], TYPED_ABI_MODULE_REFUSAL),
         ],
     ),
     // Integer arithmetic.
@@ -1446,6 +1736,7 @@ pub const FSYM_INTERPRETER_UB_SITES: &[FsymInterpreterUbSite] = &[
                 "TensorGather",
                 "TensorScatter",
             ]),
+            refused(REFUSED_BOX_DEREF),
             FsymUbRaise {
                 by: &["MakeClosure"],
                 stance: FsymUbStance::AtSource {
@@ -1618,6 +1909,7 @@ pub fn fsym_inst_variant_name(inst: &Inst) -> &'static str {
         Inst::AssertInvoke { .. } => "AssertInvoke",
         Inst::DropInvoke { .. } => "DropInvoke",
         Inst::InvokeIndirect { .. } => "InvokeIndirect",
+        Inst::BoxDeref { .. } => "BoxDeref",
     }
 }
 
@@ -1713,6 +2005,10 @@ pub const FSYM_INST_VARIANTS: &[(&str, bool)] = &[
     // unwind edge; no callee summary and no host-unwind model, as
     // `CallIndirect` and `Invoke`).
     ("InvokeIndirect", false),
+    // v67: refused at admission (a Box deref is undefined behaviour unless its
+    // operand is valid as a Box; fsym has no obligation kind for the carried
+    // validity fact).
+    ("BoxDeref", false),
 ];
 
 /// The map's refusal of `inst`, if any: a site the instruction can raise

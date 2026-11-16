@@ -1834,6 +1834,13 @@ fn encode_constant<S: Sink>(encoder: &mut Encoder<'_, S>, constant: &Constant) {
                 encoder.u64(*dim);
             }
         }
+        // trust-ir v73's nominal, zero-sized function-item identity.  Keep it
+        // distinct from the address-bearing `FnDef` spelling even though both
+        // carry a `FuncId`.
+        Constant::FnItem(func) => {
+            encoder.u16(18);
+            encoder.u32(func.index());
+        }
     }
 }
 
@@ -1851,6 +1858,29 @@ mod tests {
     use trust_cg_ir::function::{DebugLocalVariable, DebugVariableStorage, EhTypeTable};
     use trust_cg_ir::provenance::{TrustIrInstId, TrustIrVarId};
     use trust_ir::value::ValueId;
+
+    #[test]
+    fn nominal_function_item_identity_is_not_a_pointer_or_another_item() {
+        #[derive(Default)]
+        struct Bytes(Vec<u8>);
+        impl Sink for Bytes {
+            fn write(&mut self, bytes: &[u8]) {
+                self.0.extend_from_slice(bytes);
+            }
+            fn fail(&mut self, reason: RetainedIdentityError) {
+                panic!("{reason:?}");
+            }
+        }
+        let encode = |value| {
+            let mut bytes = Bytes::default();
+            encode_constant(&mut Encoder(&mut bytes), &value);
+            bytes.0
+        };
+        let nominal = encode(Constant::FnItem(trust_ir::FuncId::new(3)));
+        assert_ne!(nominal, encode(Constant::FnItem(trust_ir::FuncId::new(4))));
+        assert_ne!(nominal, encode(Constant::FnDef(trust_ir::FuncId::new(3))));
+        assert_ne!(nominal, encode(Constant::PhantomData));
+    }
 
     #[test]
     fn tensor_blob_identity_binds_content_address_and_ordered_shape() {

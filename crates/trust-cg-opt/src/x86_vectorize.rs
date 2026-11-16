@@ -187,6 +187,11 @@ pub struct X86Vectorize {
     /// An override rather than a plain flag because a `OnceLock` cannot be flipped
     /// twice in one process, and the tests must exercise BOTH arms.
     bound_remat: Option<bool>,
+    /// Per-instance OVERRIDE of how many c-row elements the row tier's
+    /// IN-MEMORY route keeps in GPR accumulators across the k loop (see
+    /// [`set_x86_rowreg_gpr_accumulators`]). `None` follows the installed
+    /// count, which is 0 where nothing is installed.
+    rowreg_gpr_accs: Option<usize>,
 }
 
 impl X86Vectorize {
@@ -227,6 +232,17 @@ impl X86Vectorize {
         self
     }
 
+    /// Keep the first `count` c-row elements of the row tier's in-memory
+    /// route in GPR accumulators, without touching process-global state.
+    pub fn with_rowreg_gpr_accumulators(mut self, count: usize) -> Self {
+        self.rowreg_gpr_accs = Some(count);
+        self
+    }
+
+    fn rowreg_gpr_accs(&self) -> usize {
+        self.rowreg_gpr_accs.unwrap_or_else(rowreg_gpr_accumulators)
+    }
+
     /// The row-register emission route for this instance. An explicit
     /// per-instance choice wins. Otherwise a request for the packed product
     /// route selects it, since that request names an XMM-accumulator route;
@@ -261,6 +277,7 @@ impl X86Vectorize {
             self.saxpyq_scalar_mul
                 .unwrap_or_else(saxpyq_scalar_mul_enabled),
             self.rowreg_route(),
+            self.rowreg_gpr_accs(),
         )
     }
 }
@@ -284,6 +301,7 @@ impl X86MachinePass for X86Vectorize {
             self.saxpyq_scalar_mul
                 .unwrap_or_else(saxpyq_scalar_mul_enabled),
             self.rowreg_route(),
+            self.rowreg_gpr_accs(),
         )
     }
 }
@@ -536,6 +554,7 @@ fn run_impl(
     ownlen_reload: bool,
     saxpyq_scalar_mul: bool,
     rowreg_route: RowRegRoute,
+    rowreg_gpr_accs: usize,
 ) -> bool {
     if func.block_order.len() < 2 {
         return false;
@@ -644,7 +663,7 @@ fn run_impl(
                 trace_accept(&func.name, lp.header, "saxpyq-rowreg");
                 plans.push(LoopPlan::SaxpyQRowReg(plan));
             } else if let Some(plan) = memory_tiers
-                .then(|| recognize_saxpyq_loop(&recognition, &preds, &idom))
+                .then(|| recognize_saxpyq_loop_once(&recognition, &preds, &idom))
                 .flatten()
             {
                 trace_accept(&func.name, lp.header, "saxpyq");
@@ -926,7 +945,7 @@ fn run_impl(
             LoopPlan::SaxpyQRowReg(plan) => {
                 // The ROW tier's own route, not the inner tier's: their
                 // measured defaults differ (see [`RowRegRoute`]).
-                apply_saxpyq_rowreg_plan(func, &plan, rowreg_route);
+                apply_saxpyq_rowreg_plan(func, &plan, rowreg_route, rowreg_gpr_accs);
                 if trace_enabled() {
                     eprintln!(
                         "x86-vectorize: fn `{}` VECTORIZED saxpy-Q ROW-REGISTER nest \
@@ -1166,8 +1185,11 @@ enum Prov {
 /// before plans mutate ISel.
 struct FunctionRecognition<'a> {
     func: &'a X86ISelFunction,
-    defs: std::cell::OnceCell<DefIndex>,
+    defs: std::cell::OnceCell<DefIndex<'a>>,
     loop_state: std::cell::OnceCell<LoopStateIndex<'a, X86ISelFunction>>,
+    /// [`recognize_saxpyq_loop`] answers of this function state, keyed by the
+    /// address of the loop's [`LoopInfo`] (see [`recognize_saxpyq_loop_once`]).
+    saxpyq: std::cell::RefCell<FxHashMap<usize, Option<SaxpyQPlan>>>,
 }
 
 impl<'a> FunctionRecognition<'a> {
@@ -1176,6 +1198,7 @@ impl<'a> FunctionRecognition<'a> {
             func,
             defs: std::cell::OnceCell::new(),
             loop_state: std::cell::OnceCell::new(),
+            saxpyq: std::cell::RefCell::new(FxHashMap::default()),
         }
     }
 
@@ -1193,7 +1216,7 @@ impl<'a> FunctionRecognition<'a> {
 struct LoopRecognition<'a> {
     function: &'a FunctionRecognition<'a>,
     lp: &'a LoopInfo,
-    defs: std::cell::OnceCell<DefIndex>,
+    defs: std::cell::OnceCell<DefIndex<'a>>,
 }
 
 impl<'a> LoopRecognition<'a> {
@@ -1205,7 +1228,7 @@ impl<'a> LoopRecognition<'a> {
         }
     }
 
-    fn defs(&self) -> &DefIndex {
+    fn defs(&self) -> &DefIndex<'a> {
         self.defs.get_or_init(|| {
             self.function
                 .defs
@@ -1217,17 +1240,35 @@ impl<'a> LoopRecognition<'a> {
 }
 
 /// Single-def index over the whole function (only vregs with exactly one def).
+///
+/// The index borrows the function it was built from for its whole lifetime
+/// (`'f`), so the borrow checker refuses any in-place mutation of that
+/// function while an index over it — or a clone of it — is alive. Every
+/// cached answer ([`DefIndex::single`], [`DefIndex::id_def_sites`]) relies on
+/// that: none of them is re-derived after construction.
 #[derive(Clone)]
-struct DefIndex {
+struct DefIndex<'f> {
     /// vreg -> its unique defining (block, inst-index), if def count == 1.
     single: std::rc::Rc<FxHashMap<VReg, (Block, usize)>>,
     /// Loop whose current IV an IV-derived provenance fact must describe.
     /// Missing context withholds derived facts.
     loop_body: Option<BTreeSet<Block>>,
+    /// The function this index was built from, held by shared borrow so it
+    /// cannot change while the index lives. [`DefIndex::id_def_sites`] also
+    /// checks by address that a reader passes this same function, and
+    /// otherwise answers `None` (the caller then scans).
+    built_from: &'f X86ISelFunction,
+    /// Class-blind def sites per register id, built on first use (see
+    /// [`DefIndex::id_def_sites`]). Shared by every clone of this index.
+    id_defs: std::rc::Rc<std::cell::OnceCell<IdDefSites>>,
 }
 
-impl DefIndex {
-    fn build(func: &X86ISelFunction) -> Self {
+/// Register id -> the `(block, index)` of every instruction that defines it,
+/// class-blind (see [`DefIndex::id_def_sites`]).
+type IdDefSites = FxHashMap<u32, Vec<(Block, usize)>>;
+
+impl<'f> DefIndex<'f> {
+    fn build(func: &'f X86ISelFunction) -> Self {
         let mut counts: FxHashMap<VReg, u32> = FxHashMap::default();
         let mut single: FxHashMap<VReg, (Block, usize)> = FxHashMap::default();
         for block_id in &func.block_order {
@@ -1249,7 +1290,54 @@ impl DefIndex {
         DefIndex {
             single: std::rc::Rc::new(single),
             loop_body: None,
+            built_from: func,
+            id_defs: std::rc::Rc::new(std::cell::OnceCell::new()),
         }
+    }
+
+    /// Every `(block, index)` whose instruction [`inst_defines_vreg_id`]-defines
+    /// register id `id`, in `func.block_order` order and instruction order,
+    /// each instruction once: exactly the instructions, in exactly the order, a
+    /// scan of `func.block_order` testing `inst_defines_vreg_id(inst, v)` with
+    /// `v.id == id` visits. `None` when `func` is not the function this index
+    /// was built from, and the caller then scans.
+    ///
+    /// Sound to keep for the index's lifetime for the same reason
+    /// [`DefIndex::single`] is: the index borrows the function it was built
+    /// from (`'f`), so the function cannot change while the index is alive. The answer replaces a
+    /// whole-function scan that [`iv_enters_as_zero`] and [`is_counter`] made
+    /// once per recognizer per loop.
+    fn id_def_sites<'s>(&'s self, func: &X86ISelFunction, id: u32) -> Option<&'s [(Block, usize)]> {
+        if !std::ptr::eq(self.built_from, func) {
+            return None;
+        }
+        let sites = self.id_defs.get_or_init(|| {
+            let mut sites: IdDefSites = FxHashMap::default();
+            let mut ids: Vec<u32> = Vec::new();
+            for block_id in &func.block_order {
+                let Some(block) = func.blocks.get(block_id) else {
+                    continue;
+                };
+                for (idx, inst) in block.insts.iter().enumerate() {
+                    // The ids `inst_defines_vreg_id` answers `true` for: every
+                    // may-defined id, and operand 0 of a value producer.
+                    ids.clear();
+                    ids.extend(crate::effects::x86_may_defined_vregs(inst).map(|d| d.id));
+                    if x86_produces_value(inst.opcode)
+                        && let Some(X86ISelOperand::VReg(d)) = inst.operands.first()
+                    {
+                        ids.push(d.id);
+                    }
+                    ids.sort_unstable();
+                    ids.dedup();
+                    for &d in &ids {
+                        sites.entry(d).or_default().push((*block_id, idx));
+                    }
+                }
+            }
+            sites
+        });
+        Some(sites.get(&id).map_or(&[], Vec::as_slice))
     }
 
     fn with_loop_body(mut self, body: &BTreeSet<Block>) -> Self {
@@ -1271,7 +1359,7 @@ impl DefIndex {
 }
 
 /// Follow `MovRR`/`MovRR32` single-def copy chains to a canonical root vreg.
-fn canon(func: &X86ISelFunction, defs: &DefIndex, mut v: VReg) -> VReg {
+fn canon(func: &X86ISelFunction, defs: &DefIndex<'_>, mut v: VReg) -> VReg {
     for _ in 0..64 {
         let Some(inst) = defs.def_inst(func, v) else {
             return v;
@@ -1293,7 +1381,7 @@ fn canon(func: &X86ISelFunction, defs: &DefIndex, mut v: VReg) -> VReg {
 /// Symbolic provenance of `v` relative to `iv` (memoized, bounded recursion).
 fn prov(
     func: &X86ISelFunction,
-    defs: &DefIndex,
+    defs: &DefIndex<'_>,
     iv: VReg,
     v: VReg,
     memo: &mut HashMap<VReg, Prov>,
@@ -1662,7 +1750,7 @@ fn unique_in_body_succ(succs: &[Block], body: &BTreeSet<Block>) -> Option<Block>
 /// an in-bounds bounds check (not, e.g., an overflow trap).
 fn block_has_iv_bound_compare(
     func: &X86ISelFunction,
-    defs: &DefIndex,
+    defs: &DefIndex<'_>,
     iv: VReg,
     memo: &mut HashMap<VReg, Prov>,
     block_id: Block,
@@ -1716,7 +1804,7 @@ fn block_has_iv_bound_compare(
 /// discipline.
 fn is_safe_iv_bounds_carrier(
     func: &X86ISelFunction,
-    defs: &DefIndex,
+    defs: &DefIndex<'_>,
     iv: VReg,
     memo: &mut HashMap<VReg, Prov>,
     inst: &X86ISelInst,
@@ -1754,7 +1842,7 @@ fn is_safe_iv_bounds_carrier(
 /// not the control rule.
 fn header_test_exits(
     func: &X86ISelFunction,
-    defs: &DefIndex,
+    defs: &DefIndex<'_>,
     lp: &LoopInfo,
     iv: VReg,
     n_trip: i64,
@@ -2122,7 +2210,7 @@ fn prune_unreachable_blocks(func: &mut X86ISelFunction) -> usize {
 /// header's in-body successor.
 fn recognize_header(
     func: &X86ISelFunction,
-    defs: &DefIndex,
+    defs: &DefIndex<'_>,
     header: Block,
     body: &BTreeSet<Block>,
     preheader: Block,
@@ -2193,7 +2281,7 @@ fn recognize_header(
 /// to 0, or the increment was not `iv + 1`.
 fn report_header_counter_decline(
     func: &X86ISelFunction,
-    defs: &DefIndex,
+    defs: &DefIndex<'_>,
     iv: VReg,
     body: &BTreeSet<Block>,
     header: Block,
@@ -2232,7 +2320,7 @@ fn report_header_counter_decline(
 /// Trace-only: it runs under [`trace_enabled`] and never affects a build.
 fn counter_decline_reason(
     func: &X86ISelFunction,
-    defs: &DefIndex,
+    defs: &DefIndex<'_>,
     iv: VReg,
     body: &BTreeSet<Block>,
     preheader: Block,
@@ -2279,7 +2367,7 @@ fn counter_decline_reason(
     )
 }
 
-fn const_of(func: &X86ISelFunction, defs: &DefIndex, v: VReg) -> Option<i64> {
+fn const_of(func: &X86ISelFunction, defs: &DefIndex<'_>, v: VReg) -> Option<i64> {
     match defs.def_inst(func, v)?.opcode {
         X86Opcode::MovRI => match defs.def_inst(func, v)?.operands.get(1) {
             Some(X86ISelOperand::Imm(c)) => Some(*c),
@@ -2307,7 +2395,7 @@ fn const_of(func: &X86ISelFunction, defs: &DefIndex, v: VReg) -> Option<i64> {
 /// per-access bounds-check diamonds deliberately elided in the packed loop.
 fn is_counter(
     func: &X86ISelFunction,
-    defs: &DefIndex,
+    defs: &DefIndex<'_>,
     iv: VReg,
     body: &BTreeSet<Block>,
     preheader: Block,
@@ -2315,15 +2403,26 @@ fn is_counter(
     if !iv_enters_as_zero(func, defs, iv, body, preheader) {
         return false;
     }
+    // The in-body defs of `iv`'s register id, in scan order: from the index
+    // when it describes `func`, else by the scan the index replaces.
+    let in_body_defs: Vec<&X86ISelInst> = match defs.id_def_sites(func, iv.id) {
+        Some(sites) => sites
+            .iter()
+            .filter(|(block_id, _)| body.contains(block_id))
+            .map(|(block_id, idx)| &func.blocks[block_id].insts[*idx])
+            .collect(),
+        None => func
+            .block_order
+            .iter()
+            .filter(|block_id| body.contains(*block_id))
+            .filter_map(|block_id| func.blocks.get(block_id))
+            .flat_map(|block| block.insts.iter())
+            .filter(|inst| inst_defines_vreg_id(inst, iv))
+            .collect(),
+    };
     let mut saw_unit_increment_inside = false;
-    for block_id in &func.block_order {
-        let Some(block) = func.blocks.get(block_id) else {
-            continue;
-        };
-        if !body.contains(block_id) {
-            continue;
-        }
-        for inst in &block.insts {
+    {
+        for inst in in_body_defs {
             // Detected CLASS-BLIND so no def is missed, then accepted only in a
             // class-EXACT unit-increment spelling: a narrow-view write to the
             // counter is a write to the counter, and it is not `iv + 1`.
@@ -2365,7 +2464,7 @@ fn is_counter(
 /// truncates, so it does not carry a 64-bit counter's value.
 fn in_body_def_is_unit_increment(
     func: &X86ISelFunction,
-    defs: &DefIndex,
+    defs: &DefIndex<'_>,
     iv: VReg,
     inst: &X86ISelInst,
 ) -> bool {
@@ -2452,7 +2551,7 @@ fn in_body_def_is_unit_increment(
 /// repaired by review; this reader exists so the address arm cannot repeat it.
 fn const_of_through_copies_class_checked(
     func: &X86ISelFunction,
-    defs: &DefIndex,
+    defs: &DefIndex<'_>,
     v: VReg,
 ) -> Option<i64> {
     let mut cur = v;
@@ -2478,7 +2577,7 @@ fn const_of_through_copies_class_checked(
     None
 }
 
-fn const_of_through_copies(func: &X86ISelFunction, defs: &DefIndex, v: VReg) -> Option<i64> {
+fn const_of_through_copies(func: &X86ISelFunction, defs: &DefIndex<'_>, v: VReg) -> Option<i64> {
     let mut cur = v;
     for _ in 0..64 {
         let inst = defs.def_inst(func, cur)?;
@@ -2501,21 +2600,35 @@ fn const_of_through_copies(func: &X86ISelFunction, defs: &DefIndex, v: VReg) -> 
 
 fn iv_enters_as_zero(
     func: &X86ISelFunction,
-    defs: &DefIndex,
+    defs: &DefIndex<'_>,
     iv: VReg,
     body: &BTreeSet<Block>,
     preheader: Block,
 ) -> bool {
     let mut outside_defs = 0usize;
     let mut preheader_zero_init = false;
-    for block_id in &func.block_order {
-        if body.contains(block_id) {
-            continue;
-        }
-        let Some(block) = func.blocks.get(block_id) else {
-            continue;
-        };
-        for inst in &block.insts {
+    // The out-of-body defs of `iv`'s register id, in scan order: from the
+    // index when it describes `func`, else by the scan the index replaces.
+    let outside: Vec<(Block, &X86ISelInst)> = match defs.id_def_sites(func, iv.id) {
+        Some(sites) => sites
+            .iter()
+            .filter(|(block_id, _)| !body.contains(block_id))
+            .map(|(block_id, idx)| (*block_id, &func.blocks[block_id].insts[*idx]))
+            .collect(),
+        None => func
+            .block_order
+            .iter()
+            .filter(|block_id| !body.contains(*block_id))
+            .filter_map(|block_id| func.blocks.get(block_id).map(|block| (*block_id, block)))
+            .flat_map(|(block_id, block)| block.insts.iter().map(move |inst| (block_id, inst)))
+            .filter(|(_, inst)| inst_defines_vreg_id(inst, iv))
+            .collect(),
+    };
+    {
+        for (block_id, inst) in outside {
+            let block_id = &block_id;
+            // Every listed instruction defines `iv`'s id; the test below is
+            // kept so both sources of the list are read by the same code.
             // Counted CLASS-BLIND over the audited def positions: this gate requires
             // EXACTLY ONE def outside the body, so a def the scan does not see makes
             // the count too SMALL and admits an entry value the packed tail argument
@@ -2549,7 +2662,7 @@ fn iv_enters_as_zero(
 
 /// True if `v` is defined by `AddRR [v, iv, one]` (or `iv, MovRI 1` in either
 /// order) — i.e. `v == iv + 1`.
-fn is_iv_plus_one(func: &X86ISelFunction, defs: &DefIndex, iv: VReg, v: VReg) -> bool {
+fn is_iv_plus_one(func: &X86ISelFunction, defs: &DefIndex<'_>, iv: VReg, v: VReg) -> bool {
     let Some(inst) = defs.def_inst(func, v) else {
         return false;
     };
@@ -4164,6 +4277,7 @@ fn recognize_saxpy_loop(
 ///   b)) << 32)` — bit-for-bit the scalar wrapping IMUL (all ops mod 2^64) —
 ///   and PADDQ is the wrapping 64-bit lane add. Every emitted packed op
 ///   (MOVDQU, PMULUDQ, PSLLQ, PSRLQ, PADDQ) is proof-covered.
+#[derive(Clone)]
 struct SaxpyQPlan {
     /// Every bounds-check exit the recognizer classified (static `iv <u c`
     /// with `c >= n_trip`, or invariant-offset under a runtime obligation):
@@ -4228,7 +4342,7 @@ enum GuardClass {
 /// iff the index is in range".
 fn classify_guard_compare(
     func: &X86ISelFunction,
-    defs: &DefIndex,
+    defs: &DefIndex<'_>,
     iv: VReg,
     memo: &mut HashMap<VReg, Prov>,
     block_id: Block,
@@ -4323,7 +4437,7 @@ fn classify_guard_compare(
 /// rejects the loop.
 fn classify_guard_carrier(
     func: &X86ISelFunction,
-    defs: &DefIndex,
+    defs: &DefIndex<'_>,
     iv: VReg,
     memo: &mut HashMap<VReg, Prov>,
     inst: &X86ISelInst,
@@ -4383,6 +4497,38 @@ fn vreg_defined_in_body(func: &X86ISelFunction, body: &BTreeSet<Block>, v: VReg)
         }
     }
     false
+}
+
+/// [`recognize_saxpyq_loop`], answered once per loop of one function state.
+///
+/// The tier dispatch asks it of a loop directly, and
+/// [`recognize_saxpyq_rowreg_loop`] asks it of the inner loop of a nest, so
+/// the inner loop of a matmul nest was recognized twice on identical inputs:
+/// the same immutable function ([`FunctionRecognition`]), the same
+/// [`LoopInfo`] (both callers take it from the one `loops` slice, so the
+/// address identifies it) and the same `preds`/`idom` (computed once per run
+/// before any recognition). The recognizer reads nothing else that varies
+/// within a run, so the second answer equals the first. With a bail trace on,
+/// every call still runs, so the trace output is unchanged.
+fn recognize_saxpyq_loop_once(
+    recognition: &LoopRecognition<'_>,
+    preds: &crate::fast_hash::FxHashMap<Block, Vec<Block>>,
+    idom: &crate::fast_hash::FxHashMap<Block, Block>,
+) -> Option<SaxpyQPlan> {
+    if bail_trace_enabled("TCG_DBG_REGARG") || trace_enabled() {
+        return recognize_saxpyq_loop(recognition, preds, idom);
+    }
+    let key = std::ptr::from_ref(recognition.lp) as usize;
+    if let Some(answer) = recognition.function.saxpyq.borrow().get(&key) {
+        return answer.clone();
+    }
+    let answer = recognize_saxpyq_loop(recognition, preds, idom);
+    recognition
+        .function
+        .saxpyq
+        .borrow_mut()
+        .insert(key, answer.clone());
+    answer
 }
 
 /// Recognizer for the i64 read-modify-write saxpy-accumulate shape at
@@ -4535,7 +4681,7 @@ fn recognize_saxpyq_loop(
     let mut loads: Vec<(VReg, QAccess)> = Vec::new(); // (canonical dst, access)
     let mut store: Option<(QAccess, VReg)> = None; // (access, canonical stored src)
     let classify_addr = |func: &X86ISelFunction,
-                         defs: &DefIndex,
+                         defs: &DefIndex<'_>,
                          memo: &mut HashMap<VReg, Prov>,
                          mem: Option<&X86ISelOperand>|
      -> Option<QAccess> {
@@ -5029,7 +5175,7 @@ fn recognize_saxpyq_rowreg_loop<'a>(
     if inner_lp.body.contains(&k_header) {
         bail!("inner_lp.body.contains(&k_header)");
     }
-    let Some(inner) = recognize_saxpyq_loop(
+    let Some(inner) = recognize_saxpyq_loop_once(
         &LoopRecognition::new(recognition.function, inner_lp),
         preds,
         idom,
@@ -6097,7 +6243,7 @@ const WIDE_COPY_CHAIN_MAX_HOPS: usize = 8;
 /// - the producer the chain ends at satisfies the same two conditions.
 fn wide_copy_chain_producer(
     func: &X86ISelFunction,
-    defs: &DefIndex,
+    defs: &DefIndex<'_>,
     order: &[Block],
     src: VReg,
     user: (usize, usize),
@@ -6249,7 +6395,7 @@ fn body_def_read_outside(
 /// and the tier declines. Resolving through the increment recovers the real
 /// counter, whose element addresses and zero-init the rest of the tier is
 /// written against.
-fn unit_increment_source(func: &X86ISelFunction, defs: &DefIndex, v: VReg) -> Option<VReg> {
+fn unit_increment_source(func: &X86ISelFunction, defs: &DefIndex<'_>, v: VReg) -> Option<VReg> {
     // This new bottom-tested dialect requires the actual wide counter as input.
     // Generic copy canonicalization also follows truncating MovRR32 copies.
     if v.class != RegClass::Gpr64 {
@@ -6304,7 +6450,7 @@ fn unit_increment_source(func: &X86ISelFunction, defs: &DefIndex, v: VReg) -> Op
 /// fall-through must enter it.
 fn preheader_zero_trip_guard(
     func: &X86ISelFunction,
-    _defs: &DefIndex,
+    _defs: &DefIndex<'_>,
     iv: VReg,
     bound: VReg,
     body: &BTreeSet<Block>,
@@ -6327,7 +6473,7 @@ fn preheader_zero_trip_guard(
 /// a pointer parameter, a loaded pointer, arithmetic — is `None` (fail-safe).
 fn resolve_slot_disp(
     func: &X86ISelFunction,
-    defs: &DefIndex,
+    defs: &DefIndex<'_>,
     v: VReg,
     depth: u32,
 ) -> Option<(u32, i64)> {
@@ -6396,7 +6542,7 @@ fn resolve_slot_disp(
 /// where `base` is a stack-slot address per [`resolve_slot_disp`].
 fn resolve_mem_slot_disp(
     func: &X86ISelFunction,
-    defs: &DefIndex,
+    defs: &DefIndex<'_>,
     mem: Option<&X86ISelOperand>,
 ) -> Option<(u32, i64)> {
     match mem? {
@@ -6414,7 +6560,11 @@ fn resolve_mem_slot_disp(
 
 /// If `v` canonicalizes to a 64-bit load of a stack-slot field, return the
 /// canonical dst plus `(slot, disp)`.
-fn slot_field_load(func: &X86ISelFunction, defs: &DefIndex, v: VReg) -> Option<(VReg, u32, i64)> {
+fn slot_field_load(
+    func: &X86ISelFunction,
+    defs: &DefIndex<'_>,
+    v: VReg,
+) -> Option<(VReg, u32, i64)> {
     let c = canon(func, defs, v);
     let inst = defs.def_inst(func, c)?;
     if inst.opcode != X86Opcode::MovRM {
@@ -6596,7 +6746,7 @@ fn chase_below_branch_either(
 /// base pointer). This is the raw-isel heap element address `ptr + iv*8`.
 fn heap_elem_base(
     func: &X86ISelFunction,
-    defs: &DefIndex,
+    defs: &DefIndex<'_>,
     iv: VReg,
     memo: &mut HashMap<VReg, Prov>,
     mem: Option<&X86ISelOperand>,
@@ -7369,7 +7519,7 @@ fn recognize_heap_sumq_loop(
 /// stepping one `elem_size` element per `iv`, so it is rejected (fail-safe).
 fn elem_addr_slot(
     func: &X86ISelFunction,
-    defs: &DefIndex,
+    defs: &DefIndex<'_>,
     iv: VReg,
     memo: &mut HashMap<VReg, Prov>,
     mem: Option<&X86ISelOperand>,
@@ -7434,7 +7584,7 @@ fn loop_invariant_vreg(func: &X86ISelFunction, v: VReg, body: &BTreeSet<Block>) 
 
 /// Find the single-def vreg that holds `Lea r, [StackSlot(slot)]` (the base
 /// address of a distinct local allocation). This is the array's base pointer.
-fn slot_base_vreg(func: &X86ISelFunction, defs: &DefIndex, slot: u32) -> Option<VReg> {
+fn slot_base_vreg(func: &X86ISelFunction, defs: &DefIndex<'_>, slot: u32) -> Option<VReg> {
     let mut found: Option<VReg> = None;
     for block_id in &func.block_order {
         let block = func.blocks.get(block_id)?;
@@ -9310,10 +9460,15 @@ fn apply_saxpyq_plan(func: &mut X86ISelFunction, plan: &SaxpyQPlan, scalar_mul: 
 /// contiguous by construction (every block is unconditionally emitted).
 ///
 /// The sketch above is the XMM-accumulator routes'. On
-/// [`RowRegRoute::MemoryRmw`] RVPB loads no accumulator, RVS stores nothing,
-/// and RVB is, per element `j` in ascending order after the one `aik` load,
+/// [`RowRegRoute::MemoryRmw`] RVPB loads no XMM accumulator, and RVB is,
+/// per element `j` in ascending order after the one `aik` load,
 /// `b = [pxrow+8j]; b *= aik; t = [pc+8j]; s = b + t; [pc+8j] = s`, followed
-/// by the same advances and bottom test.
+/// by the same advances and bottom test. With a GPR prefix of `r` elements
+/// (`set_x86_rowreg_gpr_accumulators`, 0 where nothing is installed) RVPB
+/// loads `c[0..r)` into GPRs, RVB updates those in place
+/// (`b = [pxrow+8j]; b *= aik; g_j += b`) and RVS stores them back once; the
+/// fail checks all precede RVPB and RVB leaves only to RVS, so the row in
+/// memory is complete whenever the nest is left.
 ///
 /// Emitted opcodes, XMM routes: MovRI, MovRM, MovdquRM/MovdquMR, LeaSib,
 /// ImulRR, MovqToXmm, Punpcklqdq, Paddq, AddRI, MovRR, CmpRR, Jcc, Jmp (plus
@@ -9330,6 +9485,7 @@ fn apply_saxpyq_rowreg_plan(
     func: &mut X86ISelFunction,
     plan: &SaxpyQRowRegPlan,
     route: RowRegRoute,
+    gpr_accs: usize,
 ) {
     let mem_rmw = route == RowRegRoute::MemoryRmw;
     let scalar_mul = route != RowRegRoute::XmmPackedMul;
@@ -9486,6 +9642,25 @@ fn apply_saxpyq_rowreg_plan(
     // store/reload through private, non-aliased slot_c memory is elided.
     // The in-memory route hoists nothing: `accs` stays empty, so RVS stores
     // nothing either.
+    // The in-memory route's GPR prefix: c[0..r) is held in GPR accumulators
+    // across the k loop and written back once in RVS, like the XMM routes'
+    // whole row, on the same argument (the row's per-(k, j) store and reload
+    // are through private, non-aliased slot_c memory). The rest of the row is
+    // updated in memory.
+    let r_gpr = if mem_rmw {
+        usize::try_from(inner.n_trip).map_or(0, |n| gpr_accs.min(n))
+    } else {
+        0
+    };
+    let mut gaccs: Vec<VReg> = Vec::new();
+    for j in 0..r_gpr {
+        let g = new_gpr64(func);
+        rvpb_insts.push(X86ISelInst::new(
+            X86Opcode::MovRM,
+            vec![vr(g), mem_disp(pc, j as i64)],
+        ));
+        gaccs.push(g);
+    }
     let mut accs: Vec<VReg> = Vec::new();
     for g in 0..if mem_rmw { 0 } else { n_acc } {
         let acc = new_fpr128(func);
@@ -9564,6 +9739,24 @@ fn apply_saxpyq_rowreg_plan(
     // this route three instructions per element.
     if mem_rmw {
         for j in 0..inner.n_trip {
+            if let Some(g) = usize::try_from(j).ok().and_then(|j| gaccs.get(j)) {
+                // `g = g + aik * x[j]` (or `aik * x[j] + g`): the same
+                // wrapping add, in place on the accumulator.
+                let b = new_gpr64(func);
+                rvb_insts.push(X86ISelInst::new(
+                    X86Opcode::MovRM,
+                    vec![vr(b), mem_disp(pxrow, j)],
+                ));
+                rvb_insts.push(X86ISelInst::new(
+                    X86Opcode::ImulRR,
+                    vec![vr(b), vr(b), vr(aik)],
+                ));
+                rvb_insts.push(X86ISelInst::new(
+                    X86Opcode::AddRR,
+                    vec![vr(*g), vr(*g), vr(b)],
+                ));
+                continue;
+            }
             let b = new_gpr64(func);
             let t = new_gpr64(func);
             rvb_insts.push(X86ISelInst::new(
@@ -9702,6 +9895,12 @@ fn apply_saxpyq_rowreg_plan(
     // RVS: the row sink — write the finished row back once, then leave the
     // nest through the ORIGINAL k exit.
     let mut rvs_insts: Vec<X86ISelInst> = Vec::new();
+    for (j, g) in gaccs.iter().enumerate() {
+        rvs_insts.push(X86ISelInst::new(
+            X86Opcode::MovMR,
+            vec![mem_disp(pc, j as i64), vr(*g)],
+        ));
+    }
     for (g, acc) in accs.iter().enumerate() {
         rvs_insts.push(X86ISelInst::new(
             X86Opcode::MovdquMR,
@@ -10203,7 +10402,7 @@ fn byte_sum_enabled() -> bool {
 /// still needs the `Movzx`.
 fn traces_to_zero_extended_byte(
     func: &X86ISelFunction,
-    defs: &DefIndex,
+    defs: &DefIndex<'_>,
     v: VReg,
     load: VReg,
 ) -> bool {
@@ -11487,7 +11686,7 @@ fn byte_eq_count_enabled() -> bool {
 /// `start == 0` over `n in [16,2000)`.
 fn is_counter_any_init(
     func: &X86ISelFunction,
-    defs: &DefIndex,
+    defs: &DefIndex<'_>,
     iv: VReg,
     body: &BTreeSet<Block>,
 ) -> bool {
@@ -11525,7 +11724,7 @@ fn is_counter_any_init(
 /// with `iv` a unit counter of ANY initial value.
 fn recognize_header_any_init(
     func: &X86ISelFunction,
-    defs: &DefIndex,
+    defs: &DefIndex<'_>,
     header: Block,
     body: &BTreeSet<Block>,
 ) -> Option<(VReg, i64)> {
@@ -11821,7 +12020,7 @@ fn recognize_byte_eq_count_loop(
 /// same `merge` and `acc`.
 fn arm_increment_pair(
     func: &X86ISelFunction,
-    defs: &DefIndex,
+    defs: &DefIndex<'_>,
     inc: Block,
     nop: Block,
 ) -> Option<(VReg, VReg)> {
@@ -12550,6 +12749,10 @@ fn apply_crc_table(func: &mut X86ISelFunction, plan: &CrcTablePlan) {
 ///             `VB: vacc = PADDQ(vacc, [ptr + iv*8 .. +16)); iv += 2; -> VH`;
 ///             `VR: acc += lane0(vacc) + lane1(vacc); -> header`.
 fn apply_heap_sumq_plan(func: &mut X86ISelFunction, plan: &HeapSumQPlan) {
+    apply_heap_sumq_plan_with(func, plan, sumq_register_seed_enabled());
+}
+
+fn apply_heap_sumq_plan_with(func: &mut X86ISelFunction, plan: &HeapSumQPlan, register_seed: bool) {
     // 4-WIDE, FRESH-IV emission. Two changes, one
     // measured cause (2026-08-28 recon): (a) the hot loop advances a FRESH
     // vector-local IV instead of the ORIGINAL `plan.iv` — the original vreg is
@@ -12732,22 +12935,39 @@ fn apply_heap_sumq_plan(func: &mut X86ISelFunction, plan: &HeapSumQPlan) {
         X86Opcode::MovRI,
         vec![vr(rz), X86ISelOperand::Imm(0)],
     ));
-    for disp in [0, ELEM_SIZE_Q as i32] {
+    if register_seed {
+        // `[0;2]` straight from the zero GPR: MOVQ zero-extends the 64-bit
+        // source through bit 127. The stored-lanes route below makes each
+        // 16-byte load span two 8-byte stores still in flight, which the
+        // store buffer cannot forward (measured on h4_vec_dropper's sum,
+        // `set_x86_sumq_register_seed_disabled`). The scratch slot keeps its
+        // only other use, VR's spill of `vacc`, which writes it first.
         vps_insts.push(X86ISelInst::new(
-            X86Opcode::MovMR,
-            vec![mem_d(rs, disp), vr(rz)],
+            X86Opcode::MovqToXmm,
+            vec![vr(vacc), vr(rz)],
+        ));
+        vps_insts.push(X86ISelInst::new(
+            X86Opcode::MovqToXmm,
+            vec![vr(vacc1), vr(rz)],
+        ));
+    } else {
+        for disp in [0, ELEM_SIZE_Q as i32] {
+            vps_insts.push(X86ISelInst::new(
+                X86Opcode::MovMR,
+                vec![mem_d(rs, disp), vr(rz)],
+            ));
+        }
+        vps_insts.push(X86ISelInst::new(
+            X86Opcode::MovdquRM,
+            vec![vr(vacc), mem_d(rs, 0)],
+        ));
+        // Second accumulator seeded from the same still-zero scratch bytes
+        // (the spill reuse happens only in VR, after the loop).
+        vps_insts.push(X86ISelInst::new(
+            X86Opcode::MovdquRM,
+            vec![vr(vacc1), mem_d(rs, 0)],
         ));
     }
-    vps_insts.push(X86ISelInst::new(
-        X86Opcode::MovdquRM,
-        vec![vr(vacc), mem_d(rs, 0)],
-    ));
-    // Second accumulator seeded from the same still-zero scratch bytes
-    // (the spill reuse happens only in VR, after the loop).
-    vps_insts.push(X86ISelInst::new(
-        X86Opcode::MovdquRM,
-        vec![vr(vacc1), mem_d(rs, 0)],
-    ));
     // The fresh loop-local IV. The recognizer proved the original iv is a
     // zero-init counter, so `viv = 0` matches the value the elided
     // iterations would have seen.
@@ -13012,6 +13232,67 @@ static SAXPYQ_SCALAR_MUL: std::sync::OnceLock<bool> = std::sync::OnceLock::new()
 static ROWREG_SCALAR_MUL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
 
 static ROWREG_MEMORY_RMW_DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+static SUMQ_REGISTER_SEED_DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+static ROWREG_GPR_ACCS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+
+/// Install how many c-row elements the row tier's IN-MEMORY route holds in
+/// GPR accumulators across the k loop, from a TRACKED compiler option, once
+/// (`-Ztrust-ir-cg-args=x86-rowreg-gpr-accumulators=<n>`). Returns whether
+/// the installed value agrees with `count`.
+///
+/// The in-memory route itself is reachable only under an installed policy
+/// that keeps no proof certificates (`x86_rowreg_memory_rmw_withheld`), and
+/// so is this. Where nothing is installed the count is 0: every element is
+/// updated in memory, as before this existed. Measured on `p4_matmul` O3 by
+/// hand-editing the linked binary (`reports/2026-11-15-x86-runtime-2/`):
+/// four GPR-held elements took it from 1.033 to 1.004 of LLVM against a
+/// layout control.
+pub fn set_x86_rowreg_gpr_accumulators(count: usize) -> bool {
+    match ROWREG_GPR_ACCS.set(count) {
+        Ok(()) => true,
+        Err(requested) => ROWREG_GPR_ACCS.get() == Some(&requested),
+    }
+}
+
+fn rowreg_gpr_accumulators() -> usize {
+    ROWREG_GPR_ACCS.get().copied().unwrap_or(0)
+}
+
+/// Whether a compile withholds the heap i64 sum tier's register seed of its
+/// two accumulators: when it was opted out of, or when the compile keeps
+/// proof certificates.
+///
+/// EVIDENCE BOUNDARY. The register seed emits two `MovqToXmm` where the
+/// stored-lanes route emits two `MovMR` and two `MovdquRM`; it has been
+/// measured and differentially tested only with proof certificates off
+/// (x86-64 Linux, 2026-11-15), so a certificate-keeping compile keeps the
+/// stored-lanes route.
+pub fn x86_sumq_register_seed_withheld(opted_out: bool, proof_certificates: bool) -> bool {
+    opted_out || proof_certificates
+}
+
+/// Install the register seed's policy from a TRACKED compiler option, once
+/// (`-Ztrust-ir-cg-args=no-x86-sumq-register-seed`, or a compile that keeps
+/// proof certificates; [`x86_sumq_register_seed_withheld`]). Returns whether
+/// the installed value agrees with `disabled`.
+pub fn set_x86_sumq_register_seed_disabled(disabled: bool) -> bool {
+    match SUMQ_REGISTER_SEED_DISABLED.set(disabled) {
+        Ok(()) => true,
+        Err(requested) => SUMQ_REGISTER_SEED_DISABLED.get() == Some(&requested),
+    }
+}
+
+/// Only an installed `false` enables the register seed; with no installed
+/// policy (a driver that may keep certificates) it is withheld.
+fn sumq_register_seed_enabled_from(installed_disabled: Option<bool>) -> bool {
+    installed_disabled.is_some_and(|disabled| !disabled)
+}
+
+fn sumq_register_seed_enabled() -> bool {
+    sumq_register_seed_enabled_from(SUMQ_REGISTER_SEED_DISABLED.get().copied())
+}
 
 /// How [`apply_saxpyq_rowreg_plan`] emits the k body of a recognized
 /// row-register nest. Recognition, the runtime row checks and the fail path
@@ -13486,7 +13767,7 @@ fn regarg_unroll_k() -> i64 {
 /// previously refused.
 fn is_reg_loop_invariant(
     func: &X86ISelFunction,
-    defs: &DefIndex,
+    defs: &DefIndex<'_>,
     body: &BTreeSet<Block>,
     v: VReg,
 ) -> bool {
@@ -13541,7 +13822,7 @@ fn operand_references_vreg_id(op: &X86ISelOperand, v: VReg) -> bool {
 /// enforces this), so nothing can mutate the address between iterations.
 fn invariant_load_addr(
     func: &X86ISelFunction,
-    defs: &DefIndex,
+    defs: &DefIndex<'_>,
     body: &BTreeSet<Block>,
     mem: Option<&X86ISelOperand>,
 ) -> Option<(VReg, i64)> {
@@ -13565,7 +13846,7 @@ fn invariant_load_addr(
 /// copy-canonical form equals `target`.
 fn operand_refs_canon(
     func: &X86ISelFunction,
-    defs: &DefIndex,
+    defs: &DefIndex<'_>,
     op: &X86ISelOperand,
     target: VReg,
 ) -> bool {
@@ -13642,7 +13923,7 @@ fn operand_refs_canon(
 /// `false`.
 fn address_value_is_loop_invariant(
     func: &X86ISelFunction,
-    defs: &DefIndex,
+    defs: &DefIndex<'_>,
     body: &BTreeSet<Block>,
     v: VReg,
     depth: u32,
@@ -13694,7 +13975,7 @@ fn address_value_is_loop_invariant(
 /// agree at runtime. Bounded recursion; `false` on anything unrecognized.
 fn address_exprs_equal(
     func: &X86ISelFunction,
-    defs: &DefIndex,
+    defs: &DefIndex<'_>,
     a: VReg,
     b: VReg,
     depth: u32,
@@ -13752,7 +14033,7 @@ fn address_exprs_equal(
 /// [`same_ownlen_by_pointer_reload`].
 fn invariant_value_load_addr(
     func: &X86ISelFunction,
-    defs: &DefIndex,
+    defs: &DefIndex<'_>,
     body: &BTreeSet<Block>,
     mem: Option<&X86ISelOperand>,
 ) -> Option<(VReg, i64)> {
@@ -13806,7 +14087,7 @@ fn invariant_value_load_addr(
 /// class, which would alias the value this proof reads.
 fn same_len_by_equal_immediate(
     func: &X86ISelFunction,
-    defs: &DefIndex,
+    defs: &DefIndex<'_>,
     header_bound: VReg,
     guard_bound: VReg,
 ) -> Result<(), String> {
@@ -13874,7 +14155,7 @@ fn aliasing_def_in_another_class(func: &X86ISelFunction, v: VReg) -> Option<RegC
 
 fn same_ownlen_by_pointer_reload(
     func: &X86ISelFunction,
-    defs: &DefIndex,
+    defs: &DefIndex<'_>,
     body: &BTreeSet<Block>,
     header_bound: VReg,
     guard_bound: VReg,
@@ -14089,7 +14370,7 @@ fn collect_remat_operand_vregs(op: &X86ISelOperand, out: &mut Vec<VReg>) {
 /// Build the replayable header prefix that computes `bound`, or `None`.
 fn bound_remat_slice(
     func: &X86ISelFunction,
-    defs: &DefIndex,
+    defs: &DefIndex<'_>,
     idom: &crate::fast_hash::FxHashMap<Block, Block>,
     body: &BTreeSet<Block>,
     header: Block,
@@ -15476,7 +15757,7 @@ fn chase_below_branch_cc(
 /// copy/mask set, or at a vreg with no unique def).
 fn chase_bool_test(
     func: &X86ISelFunction,
-    defs: &DefIndex,
+    defs: &DefIndex<'_>,
     block_id: Block,
 ) -> Option<(VReg, Block, Block)> {
     let block = func.blocks.get(&block_id)?;
@@ -15562,7 +15843,7 @@ fn chase_bool_test(
 /// map, stopping the plain copy chase. When a multi-def vreg's defs are
 /// EXACTLY one `MovRR v, s` plus identity trap carriers (`dst == src == v`),
 /// the value is still the copy source — continue the chase through `s`.
-fn canon_through_carrier(func: &X86ISelFunction, defs: &DefIndex, mut v: VReg) -> VReg {
+fn canon_through_carrier(func: &X86ISelFunction, defs: &DefIndex<'_>, mut v: VReg) -> VReg {
     for _ in 0..64 {
         v = canon(func, defs, v);
         if defs.def_inst(func, v).is_some() {
@@ -16634,6 +16915,76 @@ mod tests {
         let d = DefIndex::build(&f);
         let why = same_len_by_equal_immediate(&f, &d, g64(13), g64(23)).unwrap_err();
         assert!(why.contains("not a single-def immediate"), "{why}");
+    }
+
+    /// [`DefIndex::id_def_sites`] lists exactly the instructions, in exactly
+    /// the order, that a `block_order` scan with [`inst_defines_vreg_id`]
+    /// visits, for every register id the function mentions, and declines for
+    /// a function it was not built from. The fixture adds an `Xchg` (both
+    /// operands defined, at two classes of one id) and a narrow-view write, so
+    /// an index that only records operand 0, or records by full `VReg`,
+    /// fails here.
+    #[test]
+    fn id_def_sites_match_the_class_blind_scan() {
+        for LoopShape { mut func, .. } in [
+            build_loop_split_init(16, Some(3)),
+            build_loop_split_init(16, None),
+        ] {
+            let tail = *func.block_order.last().expect("fixture has blocks");
+            let block = func.blocks.get_mut(&tail).expect("tail block exists");
+            block.insts.insert(
+                0,
+                inst(
+                    X86Opcode::Xchg,
+                    vec![vr(g64(40)), vr(VReg::new(41, RegClass::Gpr32))],
+                ),
+            );
+            block.insts.insert(
+                1,
+                inst(
+                    X86Opcode::MovRI,
+                    vec![vr(VReg::new(40, RegClass::Gpr32)), imm(1)],
+                ),
+            );
+            block
+                .insts
+                .insert(2, inst(X86Opcode::MovRI, vec![vr(g64(41)), imm(2)]));
+            let defs = DefIndex::build(&func);
+            let mut ids: BTreeSet<u32> = BTreeSet::new();
+            for block in func.blocks.values() {
+                for inst in &block.insts {
+                    for op in &inst.operands {
+                        if let X86ISelOperand::VReg(v) = op {
+                            ids.insert(v.id);
+                        }
+                    }
+                }
+            }
+            assert!(ids.contains(&40) && ids.contains(&41));
+            for id in ids {
+                let probe = VReg::new(id, RegClass::Gpr64);
+                let scanned: Vec<(Block, usize)> = func
+                    .block_order
+                    .iter()
+                    .filter_map(|b| func.blocks.get(b).map(|block| (*b, block)))
+                    .flat_map(|(b, block)| {
+                        block
+                            .insts
+                            .iter()
+                            .enumerate()
+                            .filter(move |(_, inst)| inst_defines_vreg_id(inst, probe))
+                            .map(move |(i, _)| (b, i))
+                    })
+                    .collect();
+                assert_eq!(
+                    defs.id_def_sites(&func, id),
+                    Some(scanned.as_slice()),
+                    "id {id}"
+                );
+            }
+            let other = func.clone();
+            assert_eq!(defs.id_def_sites(&other, 40), None);
+        }
     }
 
     fn vr(v: VReg) -> X86ISelOperand {
@@ -22548,6 +22899,68 @@ mod tests {
         assert!(count_op(&func, X86Opcode::ImulRR) >= 1);
     }
 
+    /// The heap sum tier's register seed: both accumulators from the zero
+    /// GPR by `MovqToXmm`, no seed stores or seed loads. Without an installed
+    /// policy the pass keeps the stored-lanes seed
+    /// (`vectorizes_heap_sumq_positive`).
+    #[test]
+    fn heap_sumq_register_seed_replaces_the_stored_lanes() {
+        let LoopShape { mut func, .. } = build_heap_sumq_loop(HKnobs::default());
+        let cfg = CfgAnalysis::compute(&func);
+        let loops = loops_from_cfg_analysis(&func, &cfg.loops);
+        let plan = loops
+            .iter()
+            .find_map(|lp| {
+                recognize_heap_sumq_loop(
+                    &LoopRecognition::new(&FunctionRecognition::new(&func), lp),
+                    &cfg.preds,
+                    &cfg.idom,
+                )
+            })
+            .expect("the positive shape qualifies");
+        let mut stored = func.clone();
+        apply_heap_sumq_plan_with(&mut stored, &plan, false);
+        apply_heap_sumq_plan_with(&mut func, &plan, true);
+        assert_eq!(count_op(&stored, X86Opcode::MovqToXmm), 0);
+        assert_eq!(count_op(&stored, X86Opcode::MovdquRM), 4);
+        assert_eq!(count_op(&func, X86Opcode::MovqToXmm), 2);
+        assert_eq!(count_op(&func, X86Opcode::MovdquRM), 2); // the two element loads
+        assert_eq!(
+            count_op(&stored, X86Opcode::MovMR) - count_op(&func, X86Opcode::MovMR),
+            2
+        );
+        // Both seeds read the zero constant.
+        let zero: Vec<VReg> = func
+            .blocks
+            .values()
+            .flat_map(|b| b.insts.iter())
+            .filter(|i| {
+                i.opcode == X86Opcode::MovRI
+                    && matches!(i.operands.get(1), Some(X86ISelOperand::Imm(0)))
+            })
+            .filter_map(|i| match i.operands.first() {
+                Some(X86ISelOperand::VReg(v)) => Some(*v),
+                _ => None,
+            })
+            .collect();
+        for seed in func
+            .blocks
+            .values()
+            .flat_map(|b| b.insts.iter())
+            .filter(|i| i.opcode == X86Opcode::MovqToXmm)
+        {
+            assert!(
+                matches!(seed.operands.get(1), Some(X86ISelOperand::VReg(v)) if zero.contains(v))
+            );
+        }
+        assert!(!sumq_register_seed_enabled_from(None));
+        assert!(!sumq_register_seed_enabled_from(Some(true)));
+        assert!(sumq_register_seed_enabled_from(Some(false)));
+        assert!(x86_sumq_register_seed_withheld(false, true));
+        assert!(x86_sumq_register_seed_withheld(true, false));
+        assert!(!x86_sumq_register_seed_withheld(false, false));
+    }
+
     #[test]
     fn vectorizes_heap_sumq_with_bounds_carrier() {
         // The inline `TrapBoundsCheckExact` carrier re-checking the header's
@@ -24954,6 +25367,84 @@ mod tests {
         X86Vectorize::default().with_rowreg_memory_rmw(false)
     }
 
+    /// One [`FunctionRecognition`] answers [`recognize_saxpyq_loop_once`] per
+    /// loop: on the row-register nest, whose inner loop is a saxpy-Q and whose
+    /// outer loop is not, every answer through the shared memo (in either
+    /// order, and inside the row-register tier) equals a fresh direct
+    /// recognition of the same loop. Fails if the memo key conflates loops.
+    #[test]
+    fn saxpyq_memo_answers_each_loop_as_a_fresh_recognition() {
+        let env_scope = crate::env_lock::override_scope();
+        let _on = crate::env_lock::ScopedEnvVar::set(&env_scope, "TCG_X86_SAXPYQ_ROWREG", "1");
+        let LoopShape { func, .. } = build_saxpyq_rowreg_nest(RowKnobs::default());
+        let cfg = CfgAnalysis::compute(&func);
+        let loops = loops_from_cfg_analysis(&func, &cfg.loops);
+        assert!(loops.len() >= 2, "the fixture is a nest");
+        let fresh = |lp: &LoopInfo| {
+            recognize_saxpyq_loop(
+                &LoopRecognition::new(&FunctionRecognition::new(&func), lp),
+                &cfg.preds,
+                &cfg.idom,
+            )
+            .map(|plan| (plan.header, plan.iv, plan.n_trip))
+        };
+        let expected: Vec<_> = loops.iter().map(fresh).collect();
+        assert!(
+            expected.iter().any(Option::is_some),
+            "the inner loop is a saxpy-Q"
+        );
+        assert!(
+            expected.iter().any(Option::is_none),
+            "the outer loop is not"
+        );
+        for reversed in [false, true] {
+            let shared = FunctionRecognition::new(&func);
+            let mut indices: Vec<usize> = (0..loops.len()).collect();
+            if reversed {
+                indices.reverse();
+            }
+            for _ in 0..2 {
+                for &i in &indices {
+                    let got = recognize_saxpyq_loop_once(
+                        &LoopRecognition::new(&shared, &loops[i]),
+                        &cfg.preds,
+                        &cfg.idom,
+                    )
+                    .map(|plan| (plan.header, plan.iv, plan.n_trip));
+                    assert_eq!(got, expected[i], "loop {i}, reversed={reversed}");
+                }
+            }
+            // The row-register tier reads the inner answer through the memo.
+            fn rowreg<'a>(
+                function: &'a FunctionRecognition<'a>,
+                loops: &'a [LoopInfo],
+                cfg: &CfgAnalysis<Block>,
+            ) -> Vec<bool> {
+                loops
+                    .iter()
+                    .map(|lp| {
+                        recognize_saxpyq_rowreg_loop(
+                            &LoopRecognition::new(function, lp),
+                            &cfg.preds,
+                            &cfg.idom,
+                            loops,
+                        )
+                        .is_some()
+                    })
+                    .collect()
+            }
+            let through_memo = rowreg(&shared, &loops, &cfg);
+            assert_eq!(
+                through_memo,
+                rowreg(&FunctionRecognition::new(&func), &loops, &cfg)
+            );
+            assert!(
+                through_memo.contains(&true),
+                "the nest is a row-register shape"
+            );
+        }
+    }
+
     /// The in-memory route: the c row is updated in memory, element by
     /// element. (It is the default only under an installed policy, which no
     /// test installs; `rowreg_route_selection` covers the selection.)
@@ -25047,6 +25538,121 @@ mod tests {
             blk.successors.contains(id) && blk.insts.iter().any(|i| i.opcode == X86Opcode::MovdquRM)
         }));
         assert_block_ids_contiguous(&func);
+    }
+
+    /// The in-memory route with a GPR prefix: c[0..4) is loaded once before
+    /// the k loop, accumulated in place in GPRs, stored once after it; the
+    /// other 20 elements keep the load/add/store form. Nothing installed
+    /// means a prefix of 0 (`rowreg_memory_route_updates_the_row_in_memory`).
+    #[test]
+    fn rowreg_memory_route_holds_a_gpr_prefix_of_the_row() {
+        let env_scope = crate::env_lock::override_scope();
+        let _on = crate::env_lock::ScopedEnvVar::set(&env_scope, "TCG_X86_SAXPYQ_ROWREG", "1");
+        assert!(ROWREG_GPR_ACCS.get().is_none());
+        assert_eq!(X86Vectorize::default().rowreg_gpr_accs(), 0);
+        let LoopShape { mut func, .. } = build_saxpyq_rowreg_nest(RowKnobs::default());
+        assert!(
+            X86Vectorize::default()
+                .with_rowreg_memory_rmw(true)
+                .with_rowreg_gpr_accumulators(4)
+                .run_on_function(&mut func)
+        );
+        let rvb = func
+            .blocks
+            .iter()
+            .find(|(id, blk)| {
+                blk.successors.contains(id)
+                    && blk
+                        .insts
+                        .iter()
+                        .filter(|i| i.opcode == X86Opcode::ImulRR)
+                        .count()
+                        == 24
+            })
+            .map(|(id, _)| *id)
+            .expect("in-memory k body present");
+        // aik + 24 x loads + 20 c loads; 24 adds; 20 stores.
+        assert_eq!(rowreg_count_in(&func, rvb, X86Opcode::MovRM), 45);
+        assert_eq!(rowreg_count_in(&func, rvb, X86Opcode::AddRR), 24);
+        assert_eq!(rowreg_count_in(&func, rvb, X86Opcode::MovMR), 20);
+        let body = &func.blocks[&rvb].insts;
+        let aik = match body[0].operands.first() {
+            Some(X86ISelOperand::VReg(v)) => *v,
+            other => panic!("aik load: {other:?}"),
+        };
+        // The four in-place accumulates come first, in ascending j.
+        let mut accs = Vec::new();
+        for j in 0..4usize {
+            let [xl, mul, add] = &body[1 + 3 * j..4 + 3 * j] else {
+                unreachable!()
+            };
+            assert_eq!(
+                [xl.opcode, mul.opcode, add.opcode],
+                [X86Opcode::MovRM, X86Opcode::ImulRR, X86Opcode::AddRR]
+            );
+            let (Some(X86ISelOperand::VReg(b)), Some(X86ISelOperand::VReg(g))) =
+                (xl.operands.first(), add.operands.first())
+            else {
+                panic!("operands");
+            };
+            assert!(matches!(
+                xl.operands.get(1),
+                Some(X86ISelOperand::MemAddr { disp, .. }) if *disp == 8 * j as i32
+            ));
+            assert_eq!(mul.operands, vec![vr(*b), vr(*b), vr(aik)]);
+            assert_eq!(add.operands, vec![vr(*g), vr(*g), vr(*b)]);
+            accs.push(*g);
+        }
+        // Each accumulator is loaded from c[j] before the loop and stored back
+        // to c[j] after it, and appears nowhere else.
+        for (j, g) in accs.iter().enumerate() {
+            let mentions: Vec<(Block, X86Opcode)> = func
+                .blocks
+                .iter()
+                .flat_map(|(id, blk)| {
+                    blk.insts
+                        .iter()
+                        .filter(|i| i.operands.iter().any(|o| *o == vr(*g)))
+                        .map(move |i| (*id, i.opcode))
+                })
+                .collect();
+            let loads = mentions
+                .iter()
+                .filter(|(b, op)| *b != rvb && *op == X86Opcode::MovRM);
+            let stores = mentions
+                .iter()
+                .filter(|(b, op)| *b != rvb && *op == X86Opcode::MovMR);
+            assert_eq!(loads.count(), 1, "c[{j}] hoisted once");
+            assert_eq!(stores.count(), 1, "c[{j}] sunk once");
+            assert_eq!(mentions.len(), 3, "load, in-loop add, store for c[{j}]");
+        }
+        // A prefix longer than the row is the whole row: no c load or store
+        // is left in the k body.
+        let LoopShape {
+            func: mut whole, ..
+        } = build_saxpyq_rowreg_nest(RowKnobs::default());
+        assert!(
+            X86Vectorize::default()
+                .with_rowreg_memory_rmw(true)
+                .with_rowreg_gpr_accumulators(99)
+                .run_on_function(&mut whole)
+        );
+        let whole_rvb = whole
+            .blocks
+            .iter()
+            .find(|(id, blk)| {
+                blk.successors.contains(id)
+                    && blk
+                        .insts
+                        .iter()
+                        .filter(|i| i.opcode == X86Opcode::ImulRR)
+                        .count()
+                        == 24
+            })
+            .map(|(id, _)| *id)
+            .expect("in-memory k body present");
+        assert_eq!(rowreg_count_in(&whole, whole_rvb, X86Opcode::MovMR), 0);
+        assert_eq!(rowreg_count_in(&whole, whole_rvb, X86Opcode::MovRM), 25);
     }
 
     /// An explicit request for the packed product route names an XMM route,

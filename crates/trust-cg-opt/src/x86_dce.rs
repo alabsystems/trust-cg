@@ -323,11 +323,10 @@ fn window_step(w: &X86ISelInst, v: VReg) -> WindowStep {
     // id but a DIFFERENT class is an aliased width view of the same
     // underlying register. Any such mention in the window — def OR use —
     // makes per-def reasoning on `v` unsound here; bail.
-    let mut mentions = HashSet::default();
-    for op in &w.operands {
-        collect_operand_vregs(op, &mut mentions);
-    }
-    if mentions.iter().any(|m| m.id == v.id && m.class != v.class) {
+    if w.operands
+        .iter()
+        .any(|op| operand_mentions(op, |m| m.id == v.id && m.class != v.class))
+    {
         return WindowStep::Keep;
     }
     let redefines = x86_produces_value(w.opcode)
@@ -347,22 +346,43 @@ fn window_step(w: &X86ISelInst, v: VReg) -> WindowStep {
         // do not — `redef_reads_operand0` is the per-form precise answer, and
         // any read of v through a NON-first operand (e.g. `AddRI v, v, 8`
         // three-op) is caught by the explicit scan of operands[1..].
-        let mut src_uses = HashSet::default();
-        for operand in w.operands.iter().skip(1) {
-            collect_operand_vregs(operand, &mut src_uses);
-        }
-        if redef_reads_operand0(w) || src_uses.contains(&v) {
+        if redef_reads_operand0(w)
+            || w.operands
+                .iter()
+                .skip(1)
+                .any(|operand| operand_mentions(operand, |m| m == v))
+        {
             return WindowStep::Keep;
         }
         return WindowStep::Shadowed;
     }
     // A use of v anywhere in the window keeps the def.
-    let mut uses = HashSet::default();
-    inst_uses(w, &mut uses);
-    if uses.contains(&v) {
+    if inst_uses_vreg(w, v) {
         return WindowStep::Keep;
     }
     WindowStep::Continue
+}
+
+/// Whether a register `operand` names ([`for_each_operand_vreg`]) satisfies
+/// `pred`.
+fn operand_mentions(operand: &X86ISelOperand, pred: impl Fn(VReg) -> bool) -> bool {
+    let mut hit = false;
+    for_each_operand_vreg(operand, &mut |m| hit |= pred(m));
+    hit
+}
+
+/// `v` is in the set [`inst_uses`] collects for `inst`.
+fn inst_uses_vreg(inst: &X86ISelInst, v: VReg) -> bool {
+    let operand0_is_pure_def = x86_produces_value(inst.opcode) && !x86_operand0_may_be_read(inst);
+    inst.operands.iter().enumerate().any(|(index, operand)| {
+        let mut hit = false;
+        if index == 0 && operand0_is_pure_def {
+            for_each_address_vreg(operand, &mut |m| hit |= m == v);
+        } else {
+            for_each_operand_vreg(operand, &mut |m| hit |= m == v);
+        }
+        hit
+    })
 }
 
 /// One sweep of the per-def local tier over a block. Deletes at most many
@@ -385,32 +405,41 @@ fn window_step(w: &X86ISelInst, v: VReg) -> WindowStep {
 /// verdicts are [`local_per_def_dce_on_block_reference`]'s; a test holds
 /// the two equal.
 fn local_per_def_dce_on_block(insts: &mut Vec<X86ISelInst>) -> bool {
+    // The candidates (a classified def of a register), and the index of
+    // mentions restricted to their register ids: a scan looks up only its
+    // candidate's id, so mentions of any other id are never read.
+    let candidates: Vec<(usize, LocalDceClass, VReg)> = insts
+        .iter()
+        .enumerate()
+        .filter_map(|(i, inst)| Some((i, local_dce_class(inst)?, get_def_vreg(inst)?)))
+        .collect();
+    if candidates.is_empty() {
+        return false;
+    }
+    let candidate_ids: HashSet<u32> = candidates.iter().map(|&(_, _, v)| v.id).collect();
     let mut barriers: Vec<usize> = Vec::new();
     let mut mentions_of: FxHashMap<u32, Vec<usize>> = FxHashMap::default();
-    let mut scratch = HashSet::default();
+    let mut ids: Vec<u32> = Vec::new();
     for (index, inst) in insts.iter().enumerate() {
         if is_window_barrier(inst) {
             barriers.push(index);
         }
-        scratch.clear();
+        ids.clear();
         for op in &inst.operands {
-            collect_operand_vregs(op, &mut scratch);
+            for_each_operand_vreg(op, &mut |reg| {
+                if candidate_ids.contains(&reg.id) {
+                    ids.push(reg.id);
+                }
+            });
         }
-        let mut ids: Vec<u32> = scratch.iter().map(|reg| reg.id).collect();
         ids.sort_unstable();
         ids.dedup();
-        for id in ids {
+        for &id in &ids {
             mentions_of.entry(id).or_default().push(index);
         }
     }
     let mut delete = vec![false; insts.len()];
-    for i in 0..insts.len() {
-        let Some(class) = local_dce_class(&insts[i]) else {
-            continue;
-        };
-        let Some(v) = get_def_vreg(&insts[i]) else {
-            continue;
-        };
+    for (i, class, v) in candidates {
         // The first barrier after `i` ends the window (no later redef in
         // the block either: the value may be live-out).
         let stop = barriers[barriers.partition_point(|&b| b <= i)..]
@@ -2511,6 +2540,51 @@ mod tests {
             1,
             "the first bit test dies through the partial writer"
         );
+    }
+
+    /// A register read only as the address base of a value-producing
+    /// opcode's operand 0 is a use: operand 0 is skipped as a pure def, but
+    /// the address registers inside it are still read. No selector emits that
+    /// shape today, so this directed case is what keeps the check from being
+    /// dropped (the fail-open direction).
+    #[test]
+    fn operand0_address_base_of_a_value_def_is_a_use() {
+        assert!(x86_produces_value(X86Opcode::MovRR));
+        let base = VReg::new(3, RegClass::Gpr64);
+        let index = VReg::new(4, RegClass::Gpr64);
+        let source = VReg::new(2, RegClass::Gpr64);
+        let defined = VReg::new(1, RegClass::Gpr64);
+        let through_base = X86ISelInst::new(
+            X86Opcode::MovRR,
+            vec![
+                X86ISelOperand::MemAddr {
+                    base: Box::new(vreg(3)),
+                    disp: 0,
+                },
+                vreg(2),
+            ],
+        );
+        assert!(!x86_operand0_may_be_read(&through_base));
+        assert!(inst_uses_vreg(&through_base, base));
+        assert!(inst_uses_vreg(&through_base, source));
+        let through_index = X86ISelInst::new(
+            X86Opcode::MovRR,
+            vec![
+                X86ISelOperand::SibMemAddr {
+                    base: Box::new(vreg(3)),
+                    index: Box::new(vreg(4)),
+                    scale: 8,
+                    disp: 0,
+                },
+                vreg(2),
+            ],
+        );
+        assert!(inst_uses_vreg(&through_index, base));
+        assert!(inst_uses_vreg(&through_index, index));
+        // A plain register operand 0 of the same opcode is a pure def.
+        let plain = X86ISelInst::new(X86Opcode::MovRR, vec![vreg(1), vreg(2)]);
+        assert!(!inst_uses_vreg(&plain, defined));
+        assert!(inst_uses_vreg(&plain, source));
     }
 
     /// The indexed per-def sweep against the reference scan over generated

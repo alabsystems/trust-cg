@@ -61,9 +61,10 @@ is parsed, and no ground is re-derived here.
    binary whose bytes changed (`<tool>-cache-tampered`). Builds of one
    revision are not byte-identical, so the digest is recorded, not required:
    the report says whether it is one of the rule's `certifying_sha256`
-   (`certifying_bytes`). The banner must name the revision (AY) or equal
-   `clean <version>` (Clean;
-   its banner names no revision, so the build record carries it). The caches
+   (`certifying_bytes`). The AY banner names its revision. Clean accepts the
+   exact legacy version, that version with the full rule revision, or its
+   source-owned literal unknown-provenance suffix for an archive. Unknown stays
+   unknown; the exact export and build recipe bind its source. The caches
    follow trust-cg's private-cache rule (scripts/private_cache.py): every
    directory created in them is 0700 and every file 0600 (the binary 0500)
    whatever the umask, the build runs under umask 077, and nothing that exists
@@ -158,6 +159,7 @@ from pathlib import Path
 import re
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import tarfile
@@ -180,6 +182,22 @@ def _load_private_cache():
 
 
 private_cache = _load_private_cache()
+
+
+def _load_resource_transport():
+    """Reuse the canonical pin owner's numeric transport without adding sys.path."""
+    name = "trust_cg_certificate_pin_resources"
+    spec = importlib.util.spec_from_file_location(
+        name, Path(__file__).resolve().parent / "bump_trust_ir_pin.py")
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    # Dataclass annotation resolution needs its actual defining module.
+    sys.modules[name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+pin_resources = _load_resource_transport()
 SCHEMA = "trust-cg.x86-icmp-certificates.v2"
 QUERY_MANIFEST_SCHEMA = "trust-cg.x86-icmp-cell-queries.v2"
 CACHE_SCHEMAS = {"ay": "trust-cg.ay-cli-build.v3", "clean": "trust-cg.clean-cli-build.v2"}
@@ -553,12 +571,15 @@ def banner_names(banner: str, rev: str, version: str) -> bool:
 
 
 def banner_is_the_rules(tool: Tool, banner: str) -> bool:
-    """AY's banner names its revision and version; Clean's names no revision,
-    so it must be exactly `clean <version>` and the build record carries the
-    revision."""
+    """Exact source-owned spellings; an archive's unknown label is not identity."""
     if tool.package == "ay":
         return banner_names(banner, tool.rev, tool.version)
-    return banner == f"{tool.package} {tool.version}"
+    prefix = f"{tool.package} {tool.version}"
+    return banner in {
+        prefix,
+        prefix + "+g" + tool.rev,
+        prefix + " (git sha unknown: built without git provenance)",
+    }
 
 
 def resolve_targo() -> Path:
@@ -615,7 +636,8 @@ def heavy_gate_admission(clean: Tool, clean_source: Optional[Path]) -> Admission
         gate.mkdir()
         export_tree(repo, clean.rev, gate, ("scripts",))
         script = gate / "scripts" / "heavy_gate.sh"
-        weight = f"auto:x86-icmp-{tool.package}-build-cold:{TOOL_BUILD_FALLBACK_GB[tool.package]}"
+        phase = "resume" if label.startswith(f"x86-icmp-{tool.package}-resume-") else "cold"
+        weight = f"auto:x86-icmp-{tool.package}-build-{phase}:{TOOL_BUILD_FALLBACK_GB[tool.package]}"
         return [str(script), "run", weight, label, "--"]
 
     return admit
@@ -673,7 +695,7 @@ def require_private_slot(slot: Path, binary: Path, identity_file: Path, package:
 
 
 def obtain_build(tool: Tool, cache_dir: Path, source: Optional[Path], keep_build: bool,
-                 admission: Admission) -> dict:
+                 admission: Admission, resume_work: Optional[Path] = None) -> dict:
     """The cached build of `tool` at its revision, building it on a miss
     (under `admission`). Returns its identity record, with `path`: the binary
     to execute, named below the CANONICAL cache directory the privacy rule
@@ -690,6 +712,8 @@ def obtain_build(tool: Tool, cache_dir: Path, source: Optional[Path], keep_build
     with os.fdopen(private_cache.open_lock_file(cache_dir / f"{tool.rev}.lock"), "r+") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         if identity_file.exists():
+            if resume_work is not None:
+                raise Finding(f"{package}-resume-already-published", "use the normal verified warm cache hit")
             if not binary.is_file():
                 raise Finding(f"{package}-cache-tampered", f"{identity_file} names a binary that is gone: {binary}")
             require_private_slot(slot, binary, identity_file, package)
@@ -718,7 +742,62 @@ def obtain_build(tool: Tool, cache_dir: Path, source: Optional[Path], keep_build
         # export, Cargo's target directory, the slot) is created under umask
         # 077, and the export's entries carry 0600/0700 (tar.umask).
         with private_cache.private_umask():
-            return build_tool(tool, cache_dir, slot, binary, identity_file, repo, targo, keep_build, admission)
+            return build_tool(tool, cache_dir, slot, binary, identity_file, repo, targo,
+                              keep_build, admission, resume_work=resume_work)
+
+
+def export_entries(root: Path) -> dict:
+    """Exact private source namespace, without following any exported symlink."""
+    entries = {}
+    for directory, dirs, files in os.walk(root, followlinks=False):
+        for name in dirs + files:
+            path = Path(directory) / name
+            relative = str(path.relative_to(root))
+            info = path.lstat()
+            mode = stat.S_IMODE(info.st_mode)
+            if stat.S_ISLNK(info.st_mode):
+                value = ("link", mode, os.readlink(path))
+            elif stat.S_ISDIR(info.st_mode):
+                value = ("dir", mode)
+            elif stat.S_ISREG(info.st_mode):
+                value = ("file", mode, sha256_file(path))
+            else:
+                raise Finding("resume-source-not-regular", f"unsupported source entry {relative}")
+            entries[relative] = value
+    return entries
+
+
+def check_resumed_export(tool: Tool, cache_dir: Path, work: Path, repo: Path) -> dict:
+    """Resume DATA is not a build receipt: authenticate it, then actually build."""
+    if (not work.is_absolute() or work.parent != cache_dir
+            or not work.name.startswith(f"build-{tool.rev[:12]}-")
+            or require_private_ancestry(work, tool.package) != work):
+        raise Finding(f"{tool.package}-resume-work-invalid", "resume must name this tool's private original work directory")
+    for name in ("src", "target"):
+        path = work / name
+        if path.is_symlink() or not path.is_dir():
+            raise Finding(f"{tool.package}-resume-work-invalid", f"{name} must be an original regular directory")
+    try:
+        target = work / "target"
+        if Path(private_cache.require_private_tree(target)) != target:
+            raise PermissionError("resume target is not canonical")
+    except OSError as error:
+        raise Finding(f"{tool.package}-resume-target-not-private", str(error)) from error
+    with private_cache.private_umask(), tempfile.TemporaryDirectory(prefix="resume-source-", dir=work) as temporary:
+        expected = Path(temporary) / "src"
+        expected.mkdir()
+        export_tree(repo, tool.rev, expected)
+        manifest = expected / "Cargo.toml"
+        derived, record = unverified_tool_export(manifest.read_bytes(), tool.package)
+        manifest.write_bytes(derived)
+        expected_entries, actual_entries = export_entries(expected), export_entries(work / "src")
+        if expected_entries != actual_entries:
+            changed = [name for name in sorted(expected_entries.keys() | actual_entries.keys())
+                       if expected_entries.get(name) != actual_entries.get(name)]
+            raise Finding(f"{tool.package}-resume-source-mismatch",
+                          "retained export differs from exact immutable source and recipe: "
+                          + ", ".join(changed[:8]))
+        return record
 
 
 def obtain_ay(rev: str, version: str, cache_dir: Path, source: Optional[Path], keep_build: bool,
@@ -827,7 +906,12 @@ def run_admitted_build(command: list, cwd: Path, env: dict, log_handle, timeout:
         descendants(os.getpid())
     except (OSError, subprocess.SubprocessError) as error:
         raise Finding("process-supervision-unavailable", str(error)) from error
-    process = subprocess.Popen(command, cwd=cwd, env=env, stdout=log_handle, stderr=subprocess.STDOUT)
+    try:
+        descriptors = pin_resources.resource_fds(env)
+    except pin_resources.Refusal as error:
+        raise Finding("inherited-resources-invalid", str(error)) from error
+    process = subprocess.Popen(command, cwd=cwd, env=env, stdout=log_handle,
+                               stderr=subprocess.STDOUT, pass_fds=descriptors)
     try:
         return process.wait(timeout=timeout)
     except subprocess.TimeoutExpired:
@@ -839,17 +923,21 @@ def run_admitted_build(command: list, cwd: Path, env: dict, log_handle, timeout:
 
 
 def build_tool(tool: Tool, cache_dir: Path, slot: Path, binary: Path, identity_file: Path, repo: Path,
-               targo: Path, keep_build: bool, admission: Admission) -> dict:
+               targo: Path, keep_build: bool, admission: Admission,
+               resume_work: Optional[Path] = None) -> dict:
     """Build `tool` at its revision into `slot` (the caller holds the
     revision's lock)."""
     package, rev = tool.package, tool.rev
-    work = Path(tempfile.mkdtemp(prefix=f"build-{rev[:12]}-", dir=cache_dir))
+    resumed_export = (check_resumed_export(tool, cache_dir, resume_work, repo)
+                      if resume_work is not None else None)
+    work = resume_work or Path(tempfile.mkdtemp(prefix=f"build-{rev[:12]}-", dir=cache_dir))
     started = time.monotonic()
     try:
         src = work / "src"
-        src.mkdir()
-        log(f"exporting {package} {rev} from {repo}")
-        export_tree(repo, rev, src)
+        if resume_work is None:
+            src.mkdir()
+            log(f"exporting {package} {rev} from {repo}")
+            export_tree(repo, rev, src)
         env = build_environment()
         env.update(CARGO_TARGET_DIR=str(work / "target"), SOURCE_DATE_EPOCH=commit_time(repo, rev))
         recipe_env = {"SOURCE_DATE_EPOCH": env["SOURCE_DATE_EPOCH"]}
@@ -860,17 +948,25 @@ def build_tool(tool: Tool, cache_dir: Path, slot: Path, binary: Path, identity_f
         manifest = src / "Cargo.toml"
         original = manifest.read_bytes()
         derived, export_record = unverified_tool_export(original, package)
+        if resumed_export is not None:
+            export_record = resumed_export
         if derived != original:
             manifest.write_bytes(derived)
             log(f"{package} unverified-build export: retired clock-only policy removed; "
                 f"manifest {export_record['original_sha256']} -> {export_record['build_sha256']}; "
                 f"removed {export_record[REMOVED_CLOCK_FIELDS[package]]}; source and proof rule unchanged")
         command = [str(targo), "--unverified", "build", "--release", "--locked", *tool.build_args]
-        label = f"x86-icmp-{package}-{rev[:12]}"
-        prefix = admission(tool, label, work)
+        label = f"x86-icmp-{package}-{'resume-' if resume_work is not None else ''}{rev[:12]}"
+        admission_work = (Path(tempfile.mkdtemp(prefix="resume-admission-", dir=work))
+                          if resume_work is not None else work)
+        prefix = admission(tool, label, admission_work)
         log(f"building: {' '.join(command)} (in {src}; admitted by {' '.join(prefix[:4]) or 'nothing'}; "
             "no proof claim for the build)")
         build_log = work / "build.log"
+        if resume_work is not None:
+            descriptor, name = tempfile.mkstemp(prefix="resume-build-", suffix=".log", dir=work)
+            os.close(descriptor)
+            build_log = Path(name)
         with open(build_log, "w") as handle:
             returncode = run_admitted_build(prefix + command, src, env, handle, BUILD_TIMEOUT_SECONDS)
         built = work / "target" / "release" / package
@@ -882,7 +978,14 @@ def build_tool(tool: Tool, cache_dir: Path, slot: Path, binary: Path, identity_f
         if returncode != 0 or not built.is_file():
             tail = build_log.read_text(errors="replace").splitlines()[-30:]
             raise Finding(f"{package}-build-failed", f"exit {returncode}; last lines:\n  " + "\n  ".join(tail))
+        if resume_work is not None:
+            if check_resumed_export(tool, cache_dir, work, repo) != resumed_export:
+                raise Finding(f"{package}-resume-source-mismatch", "source recipe changed during resumed build")
         staged = work / package
+        if resume_work is not None:
+            descriptor, name = tempfile.mkstemp(prefix="resume-tool-", dir=work)
+            os.close(descriptor)
+            staged = Path(name)
         shutil.copy2(built, staged)
         staged.chmod(0o500)
         digest = sha256_file(staged)
@@ -898,6 +1001,9 @@ def build_tool(tool: Tool, cache_dir: Path, slot: Path, binary: Path, identity_f
             "built_at": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
             "build_seconds": round(time.monotonic() - started, 1),
         }
+        if resume_work is not None:
+            identity["resumed_build"] = {"work": str(work), "log": str(build_log),
+                                         "source_checked_before_and_after": True}
         identity["recipe"]["unverified_export"] = export_record
         if slot.exists():
             shutil.rmtree(slot)
@@ -910,7 +1016,7 @@ def build_tool(tool: Tool, cache_dir: Path, slot: Path, binary: Path, identity_f
         identity.update(cache="cold", path=str(binary))
         return identity
     finally:
-        if keep_build:
+        if keep_build or resume_work is not None:
             log(f"kept the build directory {work}")
         else:
             shutil.rmtree(work, ignore_errors=True)
@@ -1212,7 +1318,9 @@ def obtain_tools(args, rule: dict, report: dict) -> tuple[dict, list[MissingInpu
     for tool, cache_dir, source in ((rule["clean"], args.clean_cache_dir, args.clean_source),
                                     (rule["ay"], args.cache_dir, args.ay_source)):
         try:
-            identity = obtain_build(tool, cache_dir, source, args.keep_build, admission)
+            resume = getattr(args, "resume_tool_build", {}).get(tool.package)
+            options = {"resume_work": resume} if resume is not None else {}
+            identity = obtain_build(tool, cache_dir, source, args.keep_build, admission, **options)
         except MissingInput as absent:
             missing.append(absent)
             continue
@@ -1384,9 +1492,18 @@ def main(argv: Optional[list[str]] = None) -> int:
                         help="an ABSENT toolchain input is a stated SKIP (exit 3) instead of a failure")
     parser.add_argument("--jobs", type=int, default=4, help="cells certified concurrently (default: %(default)s)")
     parser.add_argument("--keep-build", action="store_true", help="keep each cold build's export and target directory")
+    parser.add_argument("--resume-tool-build", action="append", default=[], metavar="TOOL=/ABS/WORK",
+                        help="revalidate a retained exact export and rerun its normal build in the same private target")
     parser.add_argument("--keep-work", default=None, help="write queries, proofs and certificates here and keep them")
     parser.add_argument("--json-out", type=Path, default=None, help="write the run's report as JSON")
     args = parser.parse_args(argv)
+    resumes = {}
+    for entry in args.resume_tool_build:
+        tool, separator, path = entry.partition("=")
+        if not separator or tool not in {"ay", "clean"} or tool in resumes or not Path(path).is_absolute():
+            parser.error("--resume-tool-build requires one unique ay|clean=/absolute/work per tool")
+        resumes[tool] = Path(path)
+    args.resume_tool_build = resumes
     if args.jobs < 1:
         parser.error("--jobs must be positive")
     if args.command == "tools-path" and args.queries:

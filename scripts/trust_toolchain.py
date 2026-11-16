@@ -35,9 +35,11 @@ other `exec`, except the exact build-admission tail described by
 `launcher_target`. Most are that one command; aterm's `targo` and
 `targo-tippy` shims (aterm 8d02fb9be, atpkg
 `build_cache.rs`) first run a block of shell builtins that may put
-`--config build.build-dir=...` in front of "$@". When the PATH `trustc` and
-`targo` are both launcher shims, each is followed to the file its final exec
-names, and those files must then pass every package rule above; the two must
+`--config build.build-dir=...` in front of "$@". The current registered-build
+launcher is larger, but keeps the exact admission tail described below. When
+the PATH `trustc` and `targo` are both launcher shims, each final exec is
+followed to the file it names, and those files must then pass every package
+rule above; the two must
 both be shims or both be package files, and must exec one package. Following
 a shim with a prelude is sound because no gate runs the shim. It is only read
 here, never run, and only locates the package. Every consumer of `resolve`
@@ -95,10 +97,13 @@ LANE_LABEL = (
     "compiles, targo --unverified for builds); no Trust-verified compilation claim"
 )
 PROBE_TIMEOUT_SECONDS = 60
-# atpkg launcher shims are small: aterm's build-dir `targo` shim is about
-# 2.7 KB. The cap bounds what is read and leaves that block room to grow;
-# anything larger is not that shape.
-LAUNCHER_SHIM_MAX_BYTES = 16 * 1024
+# A plain atpkg launcher prelude stays under the original 16 KiB bound. The
+# maintained registered-build launcher measured 18,001 bytes on 2026-11-16,
+# so an exact BUILD-ADMIT-tail form gets a separate, still-small 24 KiB hard
+# bound. A larger arbitrary prelude does not inherit that room merely because
+# it ends in the ordinary package exec.
+PLAIN_LAUNCHER_SHIM_MAX_BYTES = 16 * 1024
+LAUNCHER_SHIM_MAX_BYTES = 24 * 1024
 LAUNCHER_SHIM_EXEC_RE = re.compile(r"exec '([^'\n]+)' \"\$@\"")
 LAUNCHER_SHIM_EXEC_WORD_RE = re.compile(r"\bexec\b")
 # A command line ending in one of these continues into the next line.
@@ -309,7 +314,9 @@ def _executable_file(path: Path, what: str) -> Path:
 def launcher_target(path: Path) -> Optional[Path]:
     """Return the absolute file an atpkg launcher shim execs, else None.
 
-    The atpkg shape: a `#!/bin/sh` file of at most `LAUNCHER_SHIM_MAX_BYTES`
+    The atpkg shape: a `#!/bin/sh` file of at most
+    `PLAIN_LAUNCHER_SHIM_MAX_BYTES`, or at most `LAUNCHER_SHIM_MAX_BYTES`
+    only when it carries the exact BUILD-ADMIT tail below,
     whose last command (comments and blank lines aside) is
     `exec '<absolute path>' "$@"`, on a line of its own that no earlier line
     continues into (a trailing `\\`, `|`, `||` or `&&`), in a file with no
@@ -324,9 +331,14 @@ def launcher_target(path: Path) -> Optional[Path]:
     is not a shim.
     """
     try:
-        if path.stat().st_size > LAUNCHER_SHIM_MAX_BYTES:
+        # Read at most the absolute hard bound even if the file changes between
+        # metadata and content reads. The classifier never needs an unbounded
+        # shell file in memory in order to refuse it.
+        with path.open("rb") as handle:
+            raw = handle.read(LAUNCHER_SHIM_MAX_BYTES + 1)
+        if len(raw) > LAUNCHER_SHIM_MAX_BYTES:
             return None
-        text = path.read_text(encoding="utf-8")
+        text = raw.decode("utf-8")
     except (OSError, UnicodeDecodeError):
         return None
     lines = text.splitlines()
@@ -342,6 +354,7 @@ def launcher_target(path: Path) -> Optional[Path]:
     match = LAUNCHER_SHIM_EXEC_RE.fullmatch(last)
     if match is None:
         return None
+    has_admission_tail = False
     if len(prelude) >= 6:
         assignment, placement, select, dispatch, refusal, exit_line = prelude[-6:]
         hop = LAUNCHER_ADMISSION_HOP_RE.fullmatch(dispatch)
@@ -351,6 +364,9 @@ def launcher_target(path: Path) -> Optional[Path]:
                 and hop is not None and Path(hop.group(1)).is_absolute()
                 and refusal == LAUNCHER_ADMISSION_REFUSAL and exit_line == "exit 75"):
             prelude = prelude[:-6]
+            has_admission_tail = True
+    if len(raw) > PLAIN_LAUNCHER_SHIM_MAX_BYTES and not has_admission_tail:
+        return None
     if any(LAUNCHER_SHIM_EXEC_WORD_RE.search(line) or "<<" in line for line in prelude):
         return None
     if prelude and prelude[-1].endswith(LAUNCHER_SHIM_CONTINUATIONS):

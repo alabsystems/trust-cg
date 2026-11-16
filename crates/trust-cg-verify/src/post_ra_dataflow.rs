@@ -138,6 +138,13 @@ pub(crate) const WINDOWS_X64_CALLER_SAVED_GPRS: [X86PReg; 7] = [RAX, RCX, RDX, R
 
 use crate::post_regalloc_recheck::PostRegallocRecheckMode;
 
+/// A post-RA register allocation: each virtual register's physical register.
+///
+/// Uses the fixed-seed Fx hasher (the checks and the x86 pipeline look
+/// registers up in it for every operand); nothing iterates it in an order
+/// that reaches a verdict or emitted code.
+pub type X86Allocation = trust_cg_ir::fast_hash::FxHashMap<VReg, X86PReg>;
+
 // ---------------------------------------------------------------------------
 // Violations
 // ---------------------------------------------------------------------------
@@ -608,7 +615,7 @@ enum Resolved {
     NotAReg,
 }
 
-fn resolve_reg(op: &X86ISelOperand, alloc: &HashMap<VReg, X86PReg>) -> Resolved {
+fn resolve_reg(op: &X86ISelOperand, alloc: &X86Allocation) -> Resolved {
     match op {
         X86ISelOperand::VReg(v) => match alloc.get(v) {
             Some(p) => Resolved::Preg(*p),
@@ -769,7 +776,7 @@ impl InstAccess {
 
     /// Read a direct register operand (a `VReg`/`PReg`); every other operand
     /// kind carries no direct register read.
-    fn read_reg(&mut self, op: &X86ISelOperand, alloc: &HashMap<VReg, X86PReg>) {
+    fn read_reg(&mut self, op: &X86ISelOperand, alloc: &X86Allocation) {
         if let X86ISelOperand::VReg(v) = op {
             self.vreg_reads.push(*v);
         }
@@ -785,7 +792,7 @@ impl InstAccess {
     /// post-frame-resolution bases are `PReg(RBP)`); register operands read
     /// their root; `Imm`/`FImm`/`Block`/`CondCode`/`Symbol`/`StackSlot`/
     /// `ConstPoolEntry` carry no register dataflow.
-    fn read_reg_or_mem(&mut self, op: &X86ISelOperand, alloc: &HashMap<VReg, X86PReg>) {
+    fn read_reg_or_mem(&mut self, op: &X86ISelOperand, alloc: &X86Allocation) {
         match op {
             X86ISelOperand::MemAddr { base, .. } => self.read_reg(base, alloc),
             X86ISelOperand::SibMemAddr { base, index, .. } => {
@@ -797,7 +804,7 @@ impl InstAccess {
     }
 
     /// Define a direct register operand.
-    fn def_reg(&mut self, op: &X86ISelOperand, alloc: &HashMap<VReg, X86PReg>) {
+    fn def_reg(&mut self, op: &X86ISelOperand, alloc: &X86Allocation) {
         if let X86ISelOperand::VReg(v) = op {
             self.vreg_defs.push(*v);
         }
@@ -809,7 +816,7 @@ impl InstAccess {
     }
 
     /// Read AND define a direct register operand (in-place forms).
-    fn read_def_reg(&mut self, op: &X86ISelOperand, alloc: &HashMap<VReg, X86PReg>) {
+    fn read_def_reg(&mut self, op: &X86ISelOperand, alloc: &X86Allocation) {
         if let X86ISelOperand::VReg(v) = op {
             self.vreg_reads.push(*v);
             self.vreg_defs.push(*v);
@@ -847,7 +854,7 @@ fn malformed(inst: &X86ISelInst, why: &str) -> String {
 /// memory, unallocated `VReg`s, an untrackable register, or an inadmissible
 /// operand count) returns `None` and keeps the exact read+tied
 /// classification, so no discharge path opens for non-identical operands.
-fn post_ra_zero_idiom_dst(inst: &X86ISelInst, alloc: &HashMap<VReg, X86PReg>) -> Option<X86PReg> {
+fn post_ra_zero_idiom_dst(inst: &X86ISelInst, alloc: &X86Allocation) -> Option<X86PReg> {
     if !matches!(inst.opcode, X86Opcode::XorRR | X86Opcode::Pxor)
         || !matches!(inst.operands.len(), 2 | 3)
     {
@@ -868,7 +875,7 @@ fn post_ra_zero_idiom_dst(inst: &X86ISelInst, alloc: &HashMap<VReg, X86PReg>) ->
 /// locations.
 fn classify_tied_site(
     inst: &X86ISelInst,
-    alloc: &HashMap<VReg, X86PReg>,
+    alloc: &X86Allocation,
     acc: &mut InstAccess,
 ) -> Result<(), String> {
     // Vreg-named capture: the tied destination is read AND written by the
@@ -957,10 +964,7 @@ fn conditional_inst_flag_use(inst: &X86ISelInst) -> Result<FlagMask, String> {
 /// Architecturally effective immediate shift count after the x86 operand-size
 /// mask. `None` is returned only when an already-invalid unallocated VReg keeps
 /// the operand width unknowable; that instruction fails closed independently.
-fn immediate_shift_count(
-    inst: &X86ISelInst,
-    alloc: &HashMap<VReg, X86PReg>,
-) -> Result<Option<u8>, String> {
+fn immediate_shift_count(inst: &X86ISelInst, alloc: &X86Allocation) -> Result<Option<u8>, String> {
     let Some(X86ISelOperand::Imm(raw_count)) = inst.operands.last() else {
         return Err(malformed(
             inst,
@@ -991,7 +995,7 @@ fn immediate_shift_count(
 
 fn classify_immediate_shift_flags(
     inst: &X86ISelInst,
-    alloc: &HashMap<VReg, X86PReg>,
+    alloc: &X86Allocation,
     acc: &mut InstAccess,
 ) -> Result<(), String> {
     match immediate_shift_count(inst, alloc)? {
@@ -1026,7 +1030,7 @@ fn classify_immediate_shift_flags(
 /// pass exists to catch.
 fn classify_immediate_rotate_flags(
     inst: &X86ISelInst,
-    alloc: &HashMap<VReg, X86PReg>,
+    alloc: &X86Allocation,
     acc: &mut InstAccess,
 ) -> Result<(), String> {
     match immediate_shift_count(inst, alloc)? {
@@ -1048,7 +1052,7 @@ fn classify_immediate_rotate_flags(
 /// model does not admit (fail-closed as malformed-operands).
 pub(crate) fn classify_x86_post_ra_inst(
     inst: &X86ISelInst,
-    alloc: &HashMap<VReg, X86PReg>,
+    alloc: &X86Allocation,
     call_abi: X86CallAbi,
 ) -> Result<InstAccess, String> {
     use X86Opcode::*;
@@ -2096,7 +2100,7 @@ fn unique_x86_eh_calls(
 /// ISA overwrites; copies propagate source taint and preserve untouched lanes.
 fn call_taint_block_entries(
     func: &X86ISelFunction,
-    alloc: &HashMap<VReg, X86PReg>,
+    alloc: &X86Allocation,
     call_abi: X86CallAbi,
 ) -> Result<HashMap<Block, CallTaintState>, Vec<String>> {
     let entry_block = func.block_order.first().copied();
@@ -2390,10 +2394,7 @@ fn caller_saved_locs(call_abi: X86CallAbi) -> HashSet<u8> {
 
 /// The vregs whose allocated home is a caller-saved location, with that home
 /// location — the only vregs a call can sever. Sorted for determinism.
-fn caller_saved_homed_vregs(
-    alloc: &HashMap<VReg, X86PReg>,
-    call_abi: X86CallAbi,
-) -> Vec<(VReg, u8)> {
+fn caller_saved_homed_vregs(alloc: &X86Allocation, call_abi: X86CallAbi) -> Vec<(VReg, u8)> {
     let clobbered = caller_saved_locs(call_abi);
     let mut homed: Vec<(VReg, u8)> = alloc
         .iter()
@@ -2449,7 +2450,7 @@ fn transfer_call_severed(severed: &mut SeveredSet, acc: &InstAccess, universe: &
 /// writes are physical-register events, never a def OF a named vreg.
 fn call_severed_vregs_block_entries(
     func: &X86ISelFunction,
-    alloc: &HashMap<VReg, X86PReg>,
+    alloc: &X86Allocation,
     call_abi: X86CallAbi,
     taint_entries: &HashMap<Block, CallTaintState>,
     universe: &SeveredUniverse,
@@ -2716,14 +2717,33 @@ fn first_tied_lane_mismatch(
 /// handles mode/telemetry.
 pub fn check_x86_post_ra_dataflow(
     func: &X86ISelFunction,
-    alloc: &HashMap<VReg, X86PReg>,
+    alloc: &X86Allocation,
 ) -> Vec<PostRaDataflowViolation> {
     check_x86_post_ra_dataflow_with_abi(func, alloc, X86CallAbi::SystemV)
 }
 
+/// The instruction label of a post-RA dataflow violation, formatted on demand.
+/// Its `Display` text is exactly `fn `NAME` block B inst #I (OPCODE)`.
+struct InstSite<'a> {
+    func: &'a str,
+    block: u32,
+    inst_idx: usize,
+    opcode: X86Opcode,
+}
+
+impl std::fmt::Display for InstSite<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "fn `{}` block {} inst #{} ({:?})",
+            self.func, self.block, self.inst_idx, self.opcode
+        )
+    }
+}
+
 pub fn check_x86_post_ra_dataflow_with_abi(
     func: &X86ISelFunction,
-    alloc: &HashMap<VReg, X86PReg>,
+    alloc: &X86Allocation,
     call_abi: X86CallAbi,
 ) -> Vec<PostRaDataflowViolation> {
     let mut violations = Vec::new();
@@ -2800,10 +2820,14 @@ pub fn check_x86_post_ra_dataflow_with_abi(
             .unwrap_or_else(|| universe.empty_set());
 
         for (inst_idx, inst) in block.insts.iter().enumerate() {
-            let site = format!(
-                "fn `{}` block {} inst #{inst_idx} ({:?})",
-                func.name, block_id.0, inst.opcode
-            );
+            // Rendered only when a violation is recorded: every use of `site`
+            // below is inside a violation's `format!`.
+            let site = InstSite {
+                func: &func.name,
+                block: block_id.0,
+                inst_idx,
+                opcode: inst.opcode,
+            };
 
             // (1) Classify; an inadmissible shape fails closed as
             // malformed-operands and contributes no transfer.
@@ -2956,7 +2980,7 @@ pub fn check_x86_post_ra_dataflow_with_abi(
 ///   enforce-tier correctness failures.
 pub fn evaluate(
     func: &X86ISelFunction,
-    alloc: &HashMap<VReg, X86PReg>,
+    alloc: &X86Allocation,
     arch: &str,
     mode: PostRegallocRecheckMode,
 ) -> Option<PostRaDataflowViolation> {
@@ -2965,7 +2989,7 @@ pub fn evaluate(
 
 pub fn evaluate_with_abi(
     func: &X86ISelFunction,
-    alloc: &HashMap<VReg, X86PReg>,
+    alloc: &X86Allocation,
     arch: &str,
     mode: PostRegallocRecheckMode,
     call_abi: X86CallAbi,
@@ -3032,7 +3056,7 @@ mod tests {
         X86ISelOperand::Imm(value)
     }
 
-    fn amap(pairs: &[(u32, RegClass, X86PReg)]) -> HashMap<VReg, X86PReg> {
+    fn amap(pairs: &[(u32, RegClass, X86PReg)]) -> X86Allocation {
         pairs
             .iter()
             .map(|&(id, class, preg)| (VReg::new(id, class), preg))
@@ -3105,7 +3129,7 @@ mod tests {
         kind: PostRaDataflowViolationKind,
         flag_name: &str,
     ) {
-        let violations = check_x86_post_ra_dataflow(func, &HashMap::new());
+        let violations = check_x86_post_ra_dataflow(func, &X86Allocation::default());
         assert!(
             violations
                 .iter()
@@ -3116,7 +3140,7 @@ mod tests {
     }
 
     /// Standard alloc for the deleted-bridge shape: v0->RAX, v1->RCX, v2->RDX.
-    fn add_rr_alloc() -> HashMap<VReg, X86PReg> {
+    fn add_rr_alloc() -> X86Allocation {
         amap(&[
             (0, RegClass::Gpr64, RAX),
             (1, RegClass::Gpr64, RCX),
@@ -3229,7 +3253,7 @@ mod tests {
             (1, RegClass::Fpr128, XMM1),
             (2, RegClass::Gpr64, RCX),
         ]);
-        let cases: Vec<(Vec<X86ISelInst>, HashMap<VReg, X86PReg>)> = vec![
+        let cases: Vec<(Vec<X86ISelInst>, X86Allocation)> = vec![
             // 3-op AddRI [dst, ghost, imm].
             (
                 vec![inst(X86Opcode::AddRI, vec![g64(0), g64(1), imm(7)])],
@@ -3354,7 +3378,7 @@ mod tests {
         );
         let violation = evaluate(
             &func,
-            &HashMap::new(),
+            &X86Allocation::default(),
             "x86_64",
             PostRegallocRecheckMode::Enforce,
         )
@@ -3396,7 +3420,7 @@ mod tests {
                 inst(X86Opcode::MovRR, vec![p(RBX), p(RCX)]),
             ],
         );
-        let alloc = HashMap::new();
+        let alloc: X86Allocation = X86Allocation::default();
         let violations = check_x86_post_ra_dataflow(&func, &alloc);
         assert!(
             violations
@@ -3445,7 +3469,7 @@ mod tests {
             ],
         );
         for func in [&tied_3op, &in_place_2op, &pxor_distinct] {
-            let violations = check_x86_post_ra_dataflow(func, &HashMap::new());
+            let violations = check_x86_post_ra_dataflow(func, &X86Allocation::default());
             assert!(
                 violations
                     .iter()
@@ -3771,7 +3795,7 @@ mod tests {
                 inst(X86Opcode::MovRR, vec![p(RBX), p(RSI)]),
             ],
         );
-        let alloc = HashMap::new();
+        let alloc: X86Allocation = X86Allocation::default();
         let windows = check_x86_post_ra_dataflow_with_abi(&func, &alloc, X86CallAbi::WindowsX64);
         assert!(
             !windows
@@ -3810,7 +3834,7 @@ mod tests {
         ];
         for bad in cases {
             let func = x86_func("malformed_call_results", vec![bad]);
-            let violations = check_x86_post_ra_dataflow(&func, &HashMap::new());
+            let violations = check_x86_post_ra_dataflow(&func, &X86Allocation::default());
             assert!(
                 violations
                     .iter()
@@ -3851,8 +3875,11 @@ mod tests {
             inst(X86Opcode::MovsdRR, vec![p(x86_64_regs::XMM8), p(XMM7)]),
         ];
         let func = x86_func("internal_results", reads.clone());
-        let violations =
-            check_x86_post_ra_dataflow_with_abi(&func, &HashMap::new(), X86CallAbi::SystemV);
+        let violations = check_x86_post_ra_dataflow_with_abi(
+            &func,
+            &X86Allocation::default(),
+            X86CallAbi::SystemV,
+        );
         assert!(violations.is_empty(), "{violations:?}");
 
         // A read past a result's defined width is still call-clobbered.
@@ -3860,16 +3887,24 @@ mod tests {
         wide.push(inst(X86Opcode::MovRR, vec![p(x86_64_regs::R14), p(RSI)]));
         let func = x86_func("internal_results_wide", wide);
         assert!(
-            check_x86_post_ra_dataflow_with_abi(&func, &HashMap::new(), X86CallAbi::SystemV)
-                .iter()
-                .any(|v| v.kind == PostRaDataflowViolationKind::ReadOfCallClobberedReg)
+            check_x86_post_ra_dataflow_with_abi(
+                &func,
+                &X86Allocation::default(),
+                X86CallAbi::SystemV
+            )
+            .iter()
+            .any(|v| v.kind == PostRaDataflowViolationKind::ReadOfCallClobberedReg)
         );
 
         let func = x86_func("internal_results_win64", reads);
         assert!(
-            check_x86_post_ra_dataflow_with_abi(&func, &HashMap::new(), X86CallAbi::WindowsX64)
-                .iter()
-                .any(|v| v.kind == PostRaDataflowViolationKind::MalformedOperands)
+            check_x86_post_ra_dataflow_with_abi(
+                &func,
+                &X86Allocation::default(),
+                X86CallAbi::WindowsX64
+            )
+            .iter()
+            .any(|v| v.kind == PostRaDataflowViolationKind::MalformedOperands)
         );
     }
 
@@ -3886,7 +3921,8 @@ mod tests {
                     inst(X86Opcode::MovsdRR, vec![p(XMM2), p(XMM1)]),
                 ],
             );
-            let violations = check_x86_post_ra_dataflow_with_abi(&func, &HashMap::new(), abi);
+            let violations =
+                check_x86_post_ra_dataflow_with_abi(&func, &X86Allocation::default(), abi);
             let clobbered_reads = violations
                 .iter()
                 .filter(|v| v.kind == PostRaDataflowViolationKind::ReadOfCallClobberedReg)
@@ -3927,7 +3963,7 @@ mod tests {
                 }
                 let clean = x86_func("exact_results", clean_insts);
                 let clean_violations =
-                    check_x86_post_ra_dataflow_with_abi(&clean, &HashMap::new(), abi);
+                    check_x86_post_ra_dataflow_with_abi(&clean, &X86Allocation::default(), abi);
                 assert!(clean_violations.is_empty(), "{abi:?}: {clean_violations:?}");
 
                 let bad_opcode = if still_clobbered.encoding() >= 64 {
@@ -3948,7 +3984,8 @@ mod tests {
                         inst(bad_opcode, vec![p(bad_dst), p(still_clobbered)]),
                     ],
                 );
-                let violations = check_x86_post_ra_dataflow_with_abi(&bad, &HashMap::new(), abi);
+                let violations =
+                    check_x86_post_ra_dataflow_with_abi(&bad, &X86Allocation::default(), abi);
                 assert!(
                     violations
                         .iter()
@@ -3970,7 +4007,8 @@ mod tests {
                     inst(X86Opcode::MovRR, vec![p(RBX), p(RAX)]),
                 ],
             );
-            let violations = check_x86_post_ra_dataflow_with_abi(&partial, &HashMap::new(), abi);
+            let violations =
+                check_x86_post_ra_dataflow_with_abi(&partial, &X86Allocation::default(), abi);
             assert!(
                 violations
                     .iter()
@@ -3987,7 +4025,7 @@ mod tests {
                 ],
             );
             let violations =
-                check_x86_post_ra_dataflow_with_abi(&zero_extended, &HashMap::new(), abi);
+                check_x86_post_ra_dataflow_with_abi(&zero_extended, &X86Allocation::default(), abi);
             assert!(violations.is_empty(), "{abi:?}: {violations:?}");
         }
     }
@@ -4004,7 +4042,7 @@ mod tests {
                 ],
             );
             let violations =
-                check_x86_post_ra_dataflow_with_abi(&scalar_read, &HashMap::new(), abi);
+                check_x86_post_ra_dataflow_with_abi(&scalar_read, &X86Allocation::default(), abi);
             assert!(violations.is_empty(), "{abi:?}: {violations:?}");
 
             // The full-register MovdqaRR copy itself is lane-wise garbage
@@ -4022,7 +4060,7 @@ mod tests {
                 ],
             );
             let violations =
-                check_x86_post_ra_dataflow_with_abi(&packed_read, &HashMap::new(), abi);
+                check_x86_post_ra_dataflow_with_abi(&packed_read, &X86Allocation::default(), abi);
             assert!(
                 violations
                     .iter()
@@ -4049,7 +4087,7 @@ mod tests {
                 ],
             );
             let straight_violations =
-                check_x86_post_ra_dataflow_with_abi(&straight, &HashMap::new(), abi);
+                check_x86_post_ra_dataflow_with_abi(&straight, &X86Allocation::default(), abi);
             assert!(
                 straight_violations
                     .iter()
@@ -4072,7 +4110,8 @@ mod tests {
                     (vec![inst(X86Opcode::MovRR, vec![p(RBX), p(RCX)])], vec![]),
                 ],
             );
-            let join_violations = check_x86_post_ra_dataflow_with_abi(&join, &HashMap::new(), abi);
+            let join_violations =
+                check_x86_post_ra_dataflow_with_abi(&join, &X86Allocation::default(), abi);
             assert!(
                 join_violations
                     .iter()
@@ -4094,7 +4133,7 @@ mod tests {
                 ],
             );
             let loop_violations =
-                check_x86_post_ra_dataflow_with_abi(&looped, &HashMap::new(), abi);
+                check_x86_post_ra_dataflow_with_abi(&looped, &X86Allocation::default(), abi);
             assert!(
                 loop_violations
                     .iter()
@@ -4136,7 +4175,7 @@ mod tests {
                 landing_pad_block: Block(1),
             }],
         };
-        let violations = check_x86_post_ra_dataflow(&eh_only, &HashMap::new());
+        let violations = check_x86_post_ra_dataflow(&eh_only, &X86Allocation::default());
         assert!(violations.is_empty(), "{violations:?}");
 
         // The same machine edge without semantic EH call-site metadata
@@ -4145,7 +4184,7 @@ mod tests {
             "ordinary_edge_is_not_eh",
             vec![(vec![throwing_call()], vec![1]), (pad_reads(), vec![])],
         );
-        let violations = check_x86_post_ra_dataflow(&unmarked, &HashMap::new());
+        let violations = check_x86_post_ra_dataflow(&unmarked, &X86Allocation::default());
         assert!(violations.iter().any(|violation| {
             violation.kind == PostRaDataflowViolationKind::ReadOfCallClobberedReg
         }));
@@ -4161,7 +4200,7 @@ mod tests {
             ],
         );
         mixed.eh_info = eh_only.eh_info;
-        let violations = check_x86_post_ra_dataflow(&mixed, &HashMap::new());
+        let violations = check_x86_post_ra_dataflow(&mixed, &X86Allocation::default());
         assert!(
             violations
                 .iter()
@@ -4200,7 +4239,7 @@ mod tests {
                 landing_pad_block: Block(1),
             }],
         };
-        let violations = check_x86_post_ra_dataflow(&aliased, &HashMap::new());
+        let violations = check_x86_post_ra_dataflow(&aliased, &X86Allocation::default());
         assert!(
             violations.iter().any(|violation| {
                 violation.kind == PostRaDataflowViolationKind::ReadOfCallClobberedReg
@@ -4237,7 +4276,8 @@ mod tests {
                 landing_pad_block: Block(1),
             }],
         };
-        let violations = check_x86_post_ra_dataflow(&post_call_definition, &HashMap::new());
+        let violations =
+            check_x86_post_ra_dataflow(&post_call_definition, &X86Allocation::default());
         assert!(
             violations.iter().any(|violation| {
                 violation.kind == PostRaDataflowViolationKind::ReadOfCallClobberedReg
@@ -4278,7 +4318,7 @@ mod tests {
                 }],
             };
 
-            let violations = check_x86_post_ra_dataflow(&func, &HashMap::new());
+            let violations = check_x86_post_ra_dataflow(&func, &X86Allocation::default());
             assert!(
                 violations.iter().any(|violation| {
                     violation.kind == PostRaDataflowViolationKind::MalformedOperands
@@ -4314,7 +4354,8 @@ mod tests {
             ],
         );
         for abi in [X86CallAbi::SystemV, X86CallAbi::WindowsX64] {
-            let violations = check_x86_post_ra_dataflow_with_abi(&flags, &HashMap::new(), abi);
+            let violations =
+                check_x86_post_ra_dataflow_with_abi(&flags, &X86Allocation::default(), abi);
             assert!(
                 violations
                     .iter()
@@ -4338,7 +4379,7 @@ mod tests {
         );
         let windows = check_x86_post_ra_dataflow_with_abi(
             &preserved,
-            &HashMap::new(),
+            &X86Allocation::default(),
             X86CallAbi::WindowsX64,
         );
         assert!(
@@ -4346,8 +4387,11 @@ mod tests {
                 .iter()
                 .any(|v| { v.kind == PostRaDataflowViolationKind::ReadOfCallClobberedReg })
         );
-        let system_v =
-            check_x86_post_ra_dataflow_with_abi(&preserved, &HashMap::new(), X86CallAbi::SystemV);
+        let system_v = check_x86_post_ra_dataflow_with_abi(
+            &preserved,
+            &X86Allocation::default(),
+            X86CallAbi::SystemV,
+        );
         assert!(
             system_v
                 .iter()
@@ -4373,7 +4417,7 @@ mod tests {
                 ),
             ],
         );
-        let alloc = HashMap::new();
+        let alloc: X86Allocation = X86Allocation::default();
         let violations = check_x86_post_ra_dataflow(&func, &alloc);
         assert!(
             violations
@@ -4419,7 +4463,7 @@ mod tests {
                 (vec![jcc(X86CondCode::E)], vec![]),
             ],
         );
-        let violations = check_x86_post_ra_dataflow(&func, &HashMap::new());
+        let violations = check_x86_post_ra_dataflow(&func, &X86Allocation::default());
         for kind in [
             PostRaDataflowViolationKind::ReadOfClobberedFlags,
             PostRaDataflowViolationKind::ReadOfUndefinedFlags,
@@ -4467,7 +4511,7 @@ mod tests {
                 ],
             ),
         ] {
-            let violations = check_x86_post_ra_dataflow(&func, &HashMap::new());
+            let violations = check_x86_post_ra_dataflow(&func, &X86Allocation::default());
             assert!(
                 violations.iter().any(|violation| {
                     violation.kind == PostRaDataflowViolationKind::ReadOfUndefinedFlags
@@ -4478,7 +4522,7 @@ mod tests {
             );
             let violation = evaluate(
                 &func,
-                &HashMap::new(),
+                &X86Allocation::default(),
                 "x86_64",
                 PostRegallocRecheckMode::Enforce,
             )
@@ -4578,7 +4622,7 @@ mod tests {
         for (opcode, operands, defined, undefined, may_undefined) in cases {
             let access = classify_x86_post_ra_inst(
                 &inst(opcode, operands),
-                &HashMap::new(),
+                &X86Allocation::default(),
                 X86CallAbi::SystemV,
             )
             .unwrap_or_else(|error| panic!("{opcode:?} classification failed: {error}"));
@@ -4638,7 +4682,7 @@ mod tests {
                 jcc(X86CondCode::E),
             ],
         );
-        assert_clean(&adc_with_cf, &HashMap::new());
+        assert_clean(&adc_with_cf, &X86Allocation::default());
     }
 
     #[test]
@@ -4720,7 +4764,7 @@ mod tests {
                 ],
             ),
         ] {
-            assert_clean(&x86_func(name, insts), &HashMap::new());
+            assert_clean(&x86_func(name, insts), &X86Allocation::default());
         }
     }
 
@@ -4865,7 +4909,7 @@ mod tests {
                 ],
             ),
         ] {
-            assert_clean(&x86_func(name, insts), &HashMap::new());
+            assert_clean(&x86_func(name, insts), &X86Allocation::default());
         }
     }
 
@@ -4884,7 +4928,7 @@ mod tests {
                     inst(tied_opcode, vec![p(XMM0), p(XMM1), p(XMM2)]),
                 ],
             );
-            let violations = check_x86_post_ra_dataflow(&func, &HashMap::new());
+            let violations = check_x86_post_ra_dataflow(&func, &X86Allocation::default());
             assert!(
                 violations.iter().any(|violation| {
                     violation.kind == PostRaDataflowViolationKind::TiedOperandValueMismatch
@@ -4901,7 +4945,7 @@ mod tests {
     // GREEN: the false-positive gauntlet (check() returns an empty vec)
     // ===================================================================
 
-    fn assert_clean(func: &X86ISelFunction, alloc: &HashMap<VReg, X86PReg>) {
+    fn assert_clean(func: &X86ISelFunction, alloc: &X86Allocation) {
         let violations = check_x86_post_ra_dataflow(func, alloc);
         assert!(
             violations.is_empty(),
@@ -4975,7 +5019,7 @@ mod tests {
                 inst(X86Opcode::MovRR, vec![p(RAX), p(R10)]),
             ],
         );
-        assert_clean(&func, &HashMap::new());
+        assert_clean(&func, &X86Allocation::default());
     }
 
     /// A MovRR32 bridge before a Gpr32 tied site.
@@ -5021,7 +5065,7 @@ mod tests {
                 inst(X86Opcode::Pinsrd, vec![p(XMM1), p(XMM3), p(RCX), imm(1)]),
             ],
         );
-        assert_clean(&func, &HashMap::new());
+        assert_clean(&func, &X86Allocation::default());
     }
 
     #[test]
@@ -5038,7 +5082,7 @@ mod tests {
                     inst(tied_opcode, vec![p(XMM0), p(XMM1), p(XMM2)]),
                 ],
             );
-            assert_clean(&func, &HashMap::new());
+            assert_clean(&func, &X86Allocation::default());
         }
     }
 
@@ -5086,7 +5130,7 @@ mod tests {
                 ),
             ],
         );
-        assert_clean(&join, &HashMap::new());
+        assert_clean(&join, &X86Allocation::default());
 
         let loop_func = x86_cfg_func(
             "flags_loop",
@@ -5111,7 +5155,7 @@ mod tests {
                 (vec![inst(X86Opcode::Ret, vec![])], vec![]),
             ],
         );
-        assert_clean(&loop_func, &HashMap::new());
+        assert_clean(&loop_func, &X86Allocation::default());
     }
 
     /// The all-spilled shape: dst and lhs share one reload scratch, so the
@@ -5126,7 +5170,7 @@ mod tests {
                 inst(X86Opcode::MovMR, vec![slot_mem(0), p(R10)]),
             ],
         );
-        assert_clean(&func, &HashMap::new());
+        assert_clean(&func, &X86Allocation::default());
     }
 
     /// A folded packed rhs (spilled XMM rhs folded to a stack MemAddr at
@@ -5140,7 +5184,7 @@ mod tests {
                 inst(X86Opcode::Paddd, vec![p(XMM0), p(XMM1), slot_mem(0)]),
             ],
         );
-        assert_clean(&func, &HashMap::new());
+        assert_clean(&func, &X86Allocation::default());
     }
 
     /// The CDQ/IDIV and CQO/IDIV implicit RAX/RDX clusters.
@@ -5158,7 +5202,7 @@ mod tests {
                 inst(X86Opcode::Ret, vec![]),
             ],
         );
-        assert_clean(&func, &HashMap::new());
+        assert_clean(&func, &X86Allocation::default());
     }
 
     /// The unsigned mirror of the CDQ/CQO cluster: the isel lowers unsigned
@@ -5184,7 +5228,7 @@ mod tests {
                 inst(X86Opcode::Ret, vec![]),
             ],
         );
-        assert_clean(&func, &HashMap::new());
+        assert_clean(&func, &X86Allocation::default());
     }
 
     /// The XMM sibling: `Pxor [x, x]` (the in-place 2-op vector-zero shape
@@ -5260,7 +5304,7 @@ mod tests {
                 ),
             ],
         );
-        assert_clean(&func, &HashMap::new());
+        assert_clean(&func, &X86Allocation::default());
     }
 
     /// A bridged shift-by-CL: MovRI CL setup + 2-op ShlRR with its bridge.
@@ -5274,7 +5318,7 @@ mod tests {
                 inst(X86Opcode::ShlRR, vec![p(RAX), p(RBX)]),
             ],
         );
-        assert_clean(&func, &HashMap::new());
+        assert_clean(&func, &X86Allocation::default());
     }
 
     /// Call argument/return traffic: arg setup, call, then reading the RAX
@@ -5293,7 +5337,7 @@ mod tests {
                 inst(X86Opcode::Ret, vec![]),
             ],
         );
-        assert_clean(&func, &HashMap::new());
+        assert_clean(&func, &X86Allocation::default());
     }
 
     /// THE narrow-call-arg-after-call shape (the REGALLOC-063 abort-mode
@@ -5324,7 +5368,7 @@ mod tests {
                 inst(X86Opcode::Ret, vec![]),
             ],
         );
-        assert_clean(&func, &HashMap::new());
+        assert_clean(&func, &X86Allocation::default());
     }
 
     /// The genuine-detection refutation for the per-arg-width fix: the SAME
@@ -5346,7 +5390,7 @@ mod tests {
                 inst(X86Opcode::Ret, vec![]),
             ],
         );
-        let violations = check_x86_post_ra_dataflow(&func, &HashMap::new());
+        let violations = check_x86_post_ra_dataflow(&func, &X86Allocation::default());
         assert!(
             violations.iter().any(|v| v.kind
                 == PostRaDataflowViolationKind::ReadOfCallClobberedReg
@@ -5375,7 +5419,7 @@ mod tests {
                         .with_call_result_regs(vec![]),
                 ],
             );
-            let violations = check_x86_post_ra_dataflow(&func, &HashMap::new());
+            let violations = check_x86_post_ra_dataflow(&func, &X86Allocation::default());
             assert!(
                 violations
                     .iter()
@@ -5403,7 +5447,7 @@ mod tests {
                 inst(X86Opcode::Ret, vec![]),
             ],
         );
-        assert_clean(&func, &HashMap::new());
+        assert_clean(&func, &X86Allocation::default());
     }
 
     /// The dynamic-alloc expansion shape (all in-place 2-op forms).
@@ -5419,7 +5463,7 @@ mod tests {
                 inst(X86Opcode::MovRR, vec![p(RAX), p(RSP)]),
             ],
         );
-        assert_clean(&func, &HashMap::new());
+        assert_clean(&func, &X86Allocation::default());
     }
 
     /// In-place forms carry no tied obligation.
@@ -5437,7 +5481,7 @@ mod tests {
                 inst(X86Opcode::ShlRI, vec![p(RAX), imm(3)]),
             ],
         );
-        assert_clean(&func, &HashMap::new());
+        assert_clean(&func, &X86Allocation::default());
     }
 
     /// An Xchg swap routes a value into the ghost's register: the tied
@@ -5457,7 +5501,7 @@ mod tests {
                 inst(X86Opcode::AddRR, vec![p(RBX), p(RSI), p(R8)]),
             ],
         );
-        assert_clean(&func, &HashMap::new());
+        assert_clean(&func, &X86Allocation::default());
     }
 
     /// CMP + Jcc in the same block, and a SIB load with VReg base and index.
@@ -5508,7 +5552,7 @@ mod tests {
                 inst(X86Opcode::MovRR, vec![p(RCX), p(RAX)]),
             ],
         );
-        assert_clean(&func, &HashMap::new());
+        assert_clean(&func, &X86Allocation::default());
     }
 
     /// An atomic CAS-loop pseudo with a memory operand.
@@ -5526,7 +5570,7 @@ mod tests {
                 ],
             )],
         );
-        assert_clean(&func, &HashMap::new());
+        assert_clean(&func, &X86Allocation::default());
     }
 
     // ===================================================================
@@ -5693,7 +5737,7 @@ mod tests {
                 inst(X86Opcode::Ret, vec![]),
             ],
         );
-        let violations = check_x86_post_ra_dataflow(&func, &HashMap::new());
+        let violations = check_x86_post_ra_dataflow(&func, &X86Allocation::default());
         assert!(violations.is_empty(), "{violations:?}");
     }
 
@@ -5718,7 +5762,7 @@ mod tests {
                     inst(X86Opcode::Ret, vec![]),
                 ],
             );
-            let violations = check_x86_post_ra_dataflow(&clean, &HashMap::new());
+            let violations = check_x86_post_ra_dataflow(&clean, &X86Allocation::default());
             assert!(violations.is_empty(), "{store:?}: {violations:?}");
 
             let garbage = x86_func(
@@ -5729,7 +5773,7 @@ mod tests {
                     inst(store, vec![base_mem(p(RBX)), p(XMM0)]),
                 ],
             );
-            let violations = check_x86_post_ra_dataflow(&garbage, &HashMap::new());
+            let violations = check_x86_post_ra_dataflow(&garbage, &X86Allocation::default());
             assert!(
                 violations
                     .iter()
@@ -5753,7 +5797,7 @@ mod tests {
                 inst(X86Opcode::Paddd, vec![p(XMM1), p(XMM1)]),
             ],
         );
-        let violations = check_x86_post_ra_dataflow(&func, &HashMap::new());
+        let violations = check_x86_post_ra_dataflow(&func, &X86Allocation::default());
         assert!(
             violations.iter().any(|v| v.kind
                 == PostRaDataflowViolationKind::ReadOfCallClobberedReg
@@ -5778,7 +5822,7 @@ mod tests {
                 inst(X86Opcode::MovssMR, vec![base_mem(p(RBX)), p(XMM1)]),
             ],
         );
-        let violations = check_x86_post_ra_dataflow(&func, &HashMap::new());
+        let violations = check_x86_post_ra_dataflow(&func, &X86Allocation::default());
         assert!(
             violations.iter().any(|v| v.kind
                 == PostRaDataflowViolationKind::ReadOfCallClobberedReg
@@ -5806,7 +5850,7 @@ mod tests {
                     inst(X86Opcode::Ret, vec![]),
                 ],
             );
-            let violations = check_x86_post_ra_dataflow(&garbage, &HashMap::new());
+            let violations = check_x86_post_ra_dataflow(&garbage, &X86Allocation::default());
             assert!(
                 violations.iter().any(|v| v.kind
                     == PostRaDataflowViolationKind::ReadOfCallClobberedReg
@@ -5823,7 +5867,7 @@ mod tests {
                     inst(X86Opcode::Ret, vec![]),
                 ],
             );
-            let violations = check_x86_post_ra_dataflow(&clean, &HashMap::new());
+            let violations = check_x86_post_ra_dataflow(&clean, &X86Allocation::default());
             assert!(violations.is_empty(), "{name}: {violations:?}");
         }
     }

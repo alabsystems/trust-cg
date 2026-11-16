@@ -825,6 +825,23 @@ pub enum AdapterError {
         reason: &'static str,
     },
 
+    /// A trust-ir v74 `Inst::BoxDeref` the ONE acceptance check
+    /// ([`crate::box_deref::admit_box_derefs`]) did not admit: its carried
+    /// validity fact is refused by a trust-ir rule, or backed below the
+    /// lane's evidence floor ([`crate::box_deref::BoxValidityFloor`]; the
+    /// default refuses every `BoxDeref`), or the function reached a lowering
+    /// entry without the module the fact is validated against. The same
+    /// error on every target: no lane decides this itself.
+    #[error(
+        "function `{function}` bb{block}#{inst_index}: trust-ir Inst::BoxDeref is not admitted: {reason}"
+    )]
+    BoxDerefNotAdmitted {
+        function: String,
+        block: u32,
+        inst_index: u32,
+        reason: crate::box_deref::BoxDerefRefusal,
+    },
+
     /// The borrow / binding-frame / `Undef` legalization stage
     /// ([`crate::borrow_frame_undef`]) refused a function carrying a shape
     /// whose pinned trust-ir semantics its lowering would not honour: a
@@ -3942,6 +3959,13 @@ pub(crate) fn translate_type_with_enum_tables_inner(
         Ty::FatPtr(_) => Ok(Type::Struct(vec![Type::I64, Type::I64])),
         // A function pointer is a pointer-width value, not an aggregate.
         Ty::Func(_) => Ok(Type::I64),
+        // A function item is a nominal, zero-sized identity, not a function
+        // pointer.  Lowering it as `I64` would invent an address conversion
+        // that trust-ir does not grant, so keep the new v73 carrier closed
+        // until its coercion and ABI are modeled explicitly.
+        Ty::FnItem(func) => Err(AdapterError::UnsupportedType(format!(
+            "Ty::FnItem({func:?}) has no native value ABI; an explicit function-item coercion is required"
+        ))),
         Ty::Ref(_) | Ty::RefMut(_) | Ty::PtrConst(_) | Ty::PtrMut(_) => {
             translate_inline_pointer_type(ty)
         }
@@ -4462,6 +4486,7 @@ fn translate_complex_type_with_enum_tables(
         | Ty::Ptr
         | Ty::FatPtr(_)
         | Ty::Func(_)
+        | Ty::FnItem(_)
         | Ty::Ref(_)
         | Ty::RefMut(_)
         | Ty::PtrConst(_)
@@ -4855,6 +4880,9 @@ fn visit_top_level_types(inst: &Inst, mut visit: impl FnMut(&Ty)) {
             visit(src_ty);
             visit(dst_ty);
         }
+        // The operand's and the result's type. The pointee is not a
+        // top-level type: nothing of that type is computed here.
+        Inst::BoxDeref { ptr_ty, .. } => visit(ptr_ty),
         Inst::GEP { pointee_ty, .. } => visit(pointee_ty),
         Inst::PtrData { ptr_ty, .. } => visit(ptr_ty),
         Inst::PtrMetadata {
@@ -6028,6 +6056,7 @@ impl<'a> TrustIrAdapter<'a> {
             Inst::BinOp { ty, .. }
             | Inst::UnOp { ty, .. }
             | Inst::Cast { dst_ty: ty, .. }
+            | Inst::BoxDeref { ptr_ty: ty, .. }
             | Inst::Load { ty, .. }
             | Inst::AtomicLoad { ty, .. }
             | Inst::AtomicRMW { ty, .. }
@@ -8623,6 +8652,23 @@ impl<'a> TrustIrAdapter<'a> {
         // Refuse unsupported semantics before any projection, collection
         // census, intrinsic substitution or source reconstruction.
         unmodeled_body_construct_floor(func, self.module)?;
+        // trust-ir v74 `Inst::BoxDeref`: the same acceptance check the module
+        // floor runs, for a function this entry was handed without that floor
+        // having seen it. Without a module no rule of the fact can be
+        // checked, and the function is refused.
+        if crate::box_deref::function_has_box_deref(func) {
+            match self.module {
+                // `func` in place: a detached clone is judged as itself,
+                // never by the module's stale entry of the same id.
+                Some(module) => {
+                    crate::box_deref::admit_box_derefs(
+                        &module_holding_function(func, module),
+                        crate::box_deref::BoxValidityFloor::MOST_PERMISSIVE,
+                    )?;
+                }
+                None => crate::box_deref::refuse_box_deref_without_module(func)?,
+            }
+        }
         if self.native_scalar_c_abi.is_none() {
             signature_abi_surface::refuse_recorded(self.module.ok_or(AdapterError::ModuleNotSet)?)?;
         }
@@ -11276,6 +11322,20 @@ impl<'a> TrustIrAdapter<'a> {
             Inst::MakeClosure { ty, func, captures } => {
                 self.translate_make_closure(*ty, *func, captures, &node.results)
             }
+            // trust-ir v74 `Inst::BoxDeref`, admitted by the ONE acceptance
+            // check (`crate::box_deref::admit_box_derefs`, run by `translate`
+            // and by the module floor before any body is lowered). The result
+            // IS the operand: one pointer copy. The pointee and the fact are
+            // deliberately unread here: the fact is a named assumption, and
+            // nothing is derived from it or from the instruction's undefined
+            // behaviour. No check is removed and no memory access is emitted,
+            // moved or annotated (section 28, "No licence").
+            Inst::BoxDeref {
+                ptr_ty,
+                pointee: _,
+                operand,
+                fact: _,
+            } => self.translate_box_deref(ptr_ty, *operand, &node.results),
             // trust-ir v50 `Inst::ArraySplat`: the register array `[value; n]`.
             // A fresh slot filled by one memset (byte-uniform element) or one
             // store plus a doubling copy — constant-size in `n`, never a store
@@ -13668,6 +13728,10 @@ impl<'a> TrustIrAdapter<'a> {
                 Constant::Closure { func, captures } => {
                     self.translate_closure_const(ty, *func, captures, &node.results)
                 }
+                Constant::FnItem(func) => Err(AdapterError::UnsupportedInstruction(format!(
+                    "[TCG-FN-ITEM] Constant::FnItem({func:?}) is a nominal zero-sized identity; \
+                     native lowering requires an explicit coercion to Ty::Func"
+                ))),
                 Constant::FnDef(func) => {
                     self.translate_function_symbol_const(ty, *func, &node.results)
                 }
@@ -14460,6 +14524,34 @@ impl<'a> TrustIrAdapter<'a> {
         select(&mut instrs, too_big, maximum, lower_clamped, clamped);
         select(&mut instrs, is_nan, zero, clamped, dst);
         Ok(instrs)
+    }
+
+    /// Lower an admitted trust-ir `Inst::BoxDeref` as the pointer-preserving
+    /// conversion it is: the same single `Copy` pseudo a `PtrToPtr` cast
+    /// lowers to, so every target's instruction selection and per-instruction
+    /// verifier sees an ordinary pointer copy. Shape is re-checked here as a
+    /// backstop behind trust-ir's rule 1.
+    fn translate_box_deref(
+        &mut self,
+        ptr_ty: &Ty,
+        operand: ValueId,
+        results: &[ValueId],
+    ) -> Result<Vec<Instruction>, AdapterError> {
+        if *ptr_ty != Ty::Ptr {
+            return Err(AdapterError::UnsupportedInstruction(format!(
+                "Inst::BoxDeref ptr_ty {ptr_ty:?}: only the thin pointer of a sized pointee is lowered"
+            )));
+        }
+        self.require_trust_ir_operand_type("Inst::BoxDeref", "operand", operand, ptr_ty)?;
+        let src = self.map_value(operand);
+        let dst = self.map_result(results)?;
+        let to = self.translate_ty(ptr_ty)?;
+        self.define_value_type(dst, to);
+        Ok(vec![Instruction {
+            opcode: Opcode::Copy,
+            args: vec![src],
+            results: vec![dst],
+        }])
     }
 
     fn translate_cast(
@@ -23047,6 +23139,7 @@ impl<'a> TrustIrAdapter<'a> {
                 | Constant::Set(_)
                 | Constant::Record(_)
                 | Constant::Closure { .. }
+                | Constant::FnItem(_)
                 | Constant::FnDef(_)
                 | Constant::SymbolAddr { .. }
                 | Constant::PhantomData => {
@@ -25762,6 +25855,7 @@ impl<'a> TrustIrAdapter<'a> {
                 | Constant::Set(_)
                 | Constant::Record(_)
                 | Constant::TensorBlob { .. }
+                | Constant::FnItem(_)
                 | Constant::PhantomData => {
                     return Err(AdapterError::UnsupportedInstruction(format!(
                         "trust_ir#30 aggregate/closure constant as field is not \
@@ -28509,6 +28603,16 @@ fn reject_unconsumed_v41_target_neutral_surface_with_imports_and_native(
         .flat_map(|b| &b.body)
         .filter_map(|n| n.inst.panic_site().map(|s| s.entry))
         .collect();
+    // trust-ir v74 `Inst::BoxDeref`: the ONE acceptance check, at the weakest
+    // floor any path of this backend applies. No policy is in scope here, so
+    // this is the bound: nothing below trust-ir's `NamedPremise` floor passes
+    // on any target, and a fact a trust-ir rule refuses is refused by name.
+    // The lane's own (default: refusing) floor is
+    // `CodegenLicensePolicy::enforce_module`, the same function.
+    crate::box_deref::admit_box_derefs(
+        module,
+        crate::box_deref::BoxValidityFloor::MOST_PERMISSIVE,
+    )?;
     for func in functions {
         function_surface_floor(func, func_types, policy, panic_entries.contains(&func.id))?;
         assert_panics::function_floor(func)?;
@@ -28904,6 +29008,7 @@ fn constant_uniform_array_spelling(
                 | Constant::TensorBlob { .. }
                 | Constant::Float(_)
                 | Constant::Bool(_)
+                | Constant::FnItem(_)
                 | Constant::FnDef(_)
                 | Constant::SymbolAddr { .. }
                 | Constant::PhantomData
@@ -30810,8 +30915,14 @@ pub fn validate_codegen_prerequisites(module: &TrustIrModule) -> Result<(), Adap
     // as a NAMED RATCHET. The structural pass is the same
     // `validate_module` walk this entry always ran (kernel certificates
     // re-checked in-process); the license-evidence layer is new.
-    let admission = trust_ir_build::CodegenAdmission::pinned()
-        .with_unlicensed(trust_ir_build::UnlicensedBodyPolicy::Permit);
+    // trust-ir v74 `Inst::BoxDeref`: this funnel has no policy in scope, so
+    // it holds every module to the weakest floor any path applies
+    // (`crate::box_deref`); the lane's own floor is the license policy's.
+    let admission = crate::box_deref::admission_at(
+        trust_ir_build::CodegenAdmission::pinned()
+            .with_unlicensed(trust_ir_build::UnlicensedBodyPolicy::Permit),
+        crate::box_deref::BoxValidityFloor::MOST_PERMISSIVE,
+    );
     // A panic delivery consumes the full SSA/site/edge/signature validation,
     // unlike the old diagnostic-only tolerance for partially built modules.
     let has_panic_delivery = module
@@ -30869,6 +30980,12 @@ pub(crate) fn named_validation_refusal(
     error: &trust_ir_build::ValidationError,
 ) -> Option<AdapterError> {
     use trust_ir_build::ValidationError as V;
+    // trust-ir v74: a finding about a `BoxDeref` (a rule of its validity
+    // fact, or the evidence floor) is never tolerated and has one spelling,
+    // decided by the shared classifier.
+    if let Some(refusal) = crate::box_deref::refusal_of_finding(error) {
+        return Some(refusal);
+    }
     match error {
             V::PredicateTableMalformed { .. }
             | V::PredicateTableNotInterned { .. }
@@ -32854,6 +32971,7 @@ fn const_value_debug_local(node: &InstrNode, origin: TrustIrInstId) -> Option<De
         | Constant::Set(_)
         | Constant::Record(_)
         | Constant::Closure { .. }
+        | Constant::FnItem(_)
         | Constant::FnDef(_)
         | Constant::SymbolAddr { .. }
         | Constant::PhantomData

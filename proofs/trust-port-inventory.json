@@ -200,7 +200,13 @@
       "path": "formal/lean/Trust/Model/Encoder.lean",
       "state": "port-required",
       "trust_unit": null,
-      "production_connection": "unproved"
+      "production_connection": "unproved",
+      "dependency_progress": {
+        "shared_high_register_predicate": "gprHiBit and actual REX consumers use trust_cg_x86_is_extended from required RegisterBits.lean",
+        "finite_bridge": "gprHiBit_bits preserves the original getMsbD0 statement; the current pinned Lean model and the six-declaration Trust source population pass",
+        "full_model_port": "not established",
+        "shared_rex_byte": "rexByte and actual RexPrefix.encode call trust_cg_x86_rex_byte; rexByte_bits retains the original BitVec equation; current native/CTFE controls and the exact 447-test encoder composition pass"
+      }
     },
     {
       "path": "formal/lean/Trust/Model/EncoderGolden.lean",
@@ -230,7 +236,7 @@
       "path": "formal/lean/Trust/Model/RegisterBits.lean",
       "state": "shared-computation-compiled-by-trust",
       "trust_unit": "crates/trust-cg-codegen/src/x86_64/encode.rs: register_bits",
-      "production_connection": "ModRM constructors call Trust-minted trust_cg_x86_low3; model gprLo3 consumes same source"
+      "production_connection": "Current source SHA256 896dceb444ab73d5ec2bc4d08a9d0055bcc1f8461fcb80d6476e4522328c2578 supplies the Trust-minted low3, extended-register and REX-byte computations used by ModRM/SIB construction, serialization, memory-base decisions, byte-register prefixes, opcode-register fields, RexPrefix.encode and the Lean encoder model. Trust SDK 16387 kernel-checked all six declarations, emitted callable bodies, passed native exhaustive UInt8/Boolean controls plus three CTFE calls, and refused separate low3, extended and REX body mutations against their unchanged theorems. A dependency-free composition of the unchanged production encode/opcode/register sources and complete current InstFlags definition passed all 447 actual unit tests, 0 failed/ignored/filtered. This is explicitly unverified Rust source qualification, not complete CG/source-to-machine refinement, native ABI/NoUB, x86 execution or performance proof; the full model and overall 85-file port remain incomplete."
     },
     {
       "path": "formal/lean/Trust/Model/ShrGolden.lean",
@@ -242,7 +248,13 @@
       "path": "formal/lean/Trust/Optimization/StrengthReduction.lean",
       "state": "port-required",
       "trust_unit": null,
-      "production_connection": "unproved"
+      "production_connection": "unproved",
+      "dependency_progress": {
+        "source_inclusion": "The complete original source remains tracked but is not an unconditional verifier module: Trust SDK 16387 refuses its unresolved Init.Data.BitVec.Lemmas import and BitVec HAdd/HMul instances. No reduced proof fixture or permissive import substitutes for it.",
+        "owning_crate_native_qualification": "refused by current Trust; no production consumer may claim this unit until the complete original declarations compile.",
+        "rust_implementation_refinement": "unproved; the mathematical source theorem grants no native codegen license.",
+        "checked_seed_prerequisite": "The complete unchanged source passed Clean reference replay of its original values with 175 exact dependency identities and both unchanged-proof extra-unit mutants refused. This scoped prerequisite does not qualify canonical import replay or owning-crate compilation."
+      }
     },
     {
       "path": "formal/lean/Trust/Semantics/Source.lean",
@@ -366,9 +378,9 @@
     },
     {
       "path": "proofs/sentinel_decide_spec.lean",
-      "state": "required-proof-unit; computation-port-required",
+      "state": "shared-computation-compiled-by-trust",
       "trust_unit": "crates/trust-cg-ir/src/lib.rs: sentinel_proofs",
-      "production_connection": "The required170-declaration unit includes actual UInt64 FNV low/high definitions and their complete XOR-then-prime multiplication theorem under NatOR limb decoding. It incorporates checked carry/product decomposition, mask/bit arithmetic, UInt64 mask/shifts/add/multiply/XOR/ofNat values, modular wrap composition, bounded state split and generic fullstate XOR partition. Source SHA256 942978bb5cbf20113d4ad18f60a620870746cc49ef1f16ceac5ef3d3e4cf2f88. The exact whole unit passed the actual source-built Trust f801 compiler (170 declarations, 14.034240584s); a whole-unit false final prime rejected precisely TrustCg.Fnv128Carry.full_step_source_value (9.859646416s), with source-hash bookends unchanged. Actual Rust FNV remains its existing wide-integer implementation. Native limb callability, directIR emitted-body faithfulness, Rust cast/shift/XOR/OR mapping, serialization and finite decision/recheck model ports remain unfinished. This is a required Trust proof unit, not a shared native computation, whole-unit axiom audit, Rust/whole-compiler correctness or performance superiority."
+      "production_connection": "Current source SHA256 747b71641fa22d95a0982f1e167b621c7fcc756981331f3933e06e31bcd5478f retains the complete proof-facing UInt64 FNV limb/fullstate source and supplies seven directly emitted primitives plus two checked composition theorems. Production Fnv128 calls those exact Trust-minted primitives while keeping both original limbs intact. Trust SDK 16387 kernel-checked all 179 declarations through the owning IR crate; the full 559-test IR library passed, including fixed vectors and 100,000 generated byte steps against the original wide-integer oracle. DirectIR emitted-body faithfulness, native ABI/NoUB, serialization, the broader finite decision/recheck model ports and whole-compiler correctness remain unfinished; this is explicitly unverified source qualification, not attestation or a performance claim."
     },
     {
       "path": "reports/2026-09-10-soundness-prerequisites/smoke/LeanSmoke.lean",
@@ -482,49 +494,90 @@
       "path": "reports/fixtures/ProofIndexedEGraph.lean",
       "state": "port-required",
       "trust_unit": null,
-      "production_connection": "unproved"
+      "production_connection": "unproved",
+      "dependency_progress": {
+        "source_inclusion": "Complete original source remains tracked but is not an unconditional verifier module: Trust SDK 16387 refuses its dependent Fin equality elaboration. No reduced proof fixture substitutes for it.",
+        "owning_crate_native_qualification": "refused by current Trust; no production consumer may claim this unit until the complete original declarations compile.",
+        "rust_implementation_refinement": "unproved; the mathematical source theorem grants no native codegen license."
+      }
     },
     {
       "path": "reports/fixtures/ProofIndexedExtraction.lean",
       "state": "port-required",
-      "trust_unit": null,
-      "production_connection": "unproved"
+      "trust_unit": "crates/trust-cg-verify/src/proof_indexed_models.rs: extraction",
+      "production_connection": "unproved",
+      "dependency_progress": {
+        "source_inclusion": "Complete original source is an unconditional clean mod in the verifier; no reduced proof fixture substitutes for it.",
+        "owning_crate_native_qualification": "current-tip unverified Trust compilation passed and kernel-checked all 20 declarations; source acceptance is not emitted-body or refinement evidence.",
+        "rust_implementation_refinement": "unproved; the mathematical source theorem grants no native codegen license."
+      }
     },
     {
       "path": "reports/fixtures/ProofIndexedRewriteChain.lean",
       "state": "port-required",
       "trust_unit": null,
-      "production_connection": "unproved"
+      "production_connection": "unproved",
+      "dependency_progress": {
+        "source_inclusion": "Complete original source remains tracked but is not an unconditional verifier module: Trust SDK 16387 refuses Chain.sound's dependent cast and its downstream references. No reduced proof fixture substitutes for it.",
+        "owning_crate_native_qualification": "refused by current Trust; no production consumer may claim this unit until the complete original declarations compile.",
+        "rust_implementation_refinement": "unproved; the mathematical source theorem grants no native codegen license."
+      }
     },
     {
       "path": "reports/fixtures/ProofIndexedRewriteConcrete.lean",
       "state": "port-required",
       "trust_unit": null,
-      "production_connection": "unproved"
+      "production_connection": "unproved",
+      "dependency_progress": {
+        "source_inclusion": "Complete original source remains tracked but is not an unconditional verifier module: Trust SDK 16387 has no HAdd/HMul instances for its Fin-based BV8 carrier. No reduced proof fixture substitutes for it.",
+        "owning_crate_native_qualification": "refused by current Trust; no production consumer may claim this unit until the complete original declarations compile.",
+        "rust_implementation_refinement": "unproved; the mathematical source theorem grants no native codegen license."
+      }
     },
     {
       "path": "reports/fixtures/ProofIndexedRewriteContext.lean",
       "state": "port-required",
       "trust_unit": null,
-      "production_connection": "unproved"
+      "production_connection": "unproved",
+      "dependency_progress": {
+        "source_inclusion": "Complete original source remains tracked but is not an unconditional verifier module: Trust SDK 16387 refuses its dependent Fin reflexivity elaboration. No reduced proof fixture substitutes for it.",
+        "owning_crate_native_qualification": "refused by current Trust; no production consumer may claim this unit until the complete original declarations compile.",
+        "rust_implementation_refinement": "unproved; the mathematical source theorem grants no native codegen license."
+      }
     },
     {
       "path": "reports/fixtures/ProofIndexedRewriteCore.lean",
       "state": "port-required",
       "trust_unit": null,
-      "production_connection": "unproved"
+      "production_connection": "unproved",
+      "dependency_progress": {
+        "source_inclusion": "Complete original source remains tracked but is not an unconditional verifier module: Trust SDK 16387 refuses idStep's dependent Fin equality field and its downstream references. No reduced proof fixture substitutes for it.",
+        "owning_crate_native_qualification": "refused by current Trust; no production consumer may claim this unit until the complete original declarations compile.",
+        "rust_implementation_refinement": "unproved; the mathematical source theorem grants no native codegen license."
+      }
     },
     {
       "path": "reports/fixtures/ProofIndexedRewriteSemantic.lean",
       "state": "port-required",
-      "trust_unit": null,
-      "production_connection": "unproved"
+      "trust_unit": "crates/trust-cg-verify/src/proof_indexed_models.rs: semantic",
+      "production_connection": "unproved",
+      "dependency_progress": {
+        "source_inclusion": "Complete original source is an unconditional clean mod in the verifier; no reduced proof fixture substitutes for it.",
+        "owning_crate_native_qualification": "current-tip unverified Trust compilation passed and kernel-checked all four declarations; source acceptance is not emitted-body or refinement evidence.",
+        "rust_implementation_refinement": "unproved; the mathematical source theorem grants no native codegen license."
+      }
     },
     {
       "path": "reports/fixtures/ProofIndexedRewriteTrustDebt.lean",
       "state": "port-required",
-      "trust_unit": null,
-      "production_connection": "unproved"
+      "trust_unit": "scripts/fixtures/required_proof_trust_debt.rs: rewrite_trust_debt",
+      "production_connection": "unproved",
+      "control_role": "must-refuse-explicit-trust-debt",
+      "dependency_progress": {
+        "native_gate": "scripts/check_trust_proof_debt.py compiles the unchanged original source through actual Trust and requires its named semantic sorry refusal without an executable.",
+        "paired_control": "The same complete source changes only the theorem RHS to lhs and sorry to rfl; all four original declaration names must be kernel-checked.",
+        "qualification": "Maintained gate at 856eaefb955c9a5295073fa7396897c10d5a8e13 passed under immutable Trust SDK 16387: complete four-declaration reflexive baseline accepted, unchanged original refused by the named atomic sorryAx publish audit without an executable; recorded SDK and source/tool inputs unchanged. Unverified Rust lane; no original valid proof, implementation refinement or overall port completion. Original sorry remains intact."
+      }
     }
   ]
 }

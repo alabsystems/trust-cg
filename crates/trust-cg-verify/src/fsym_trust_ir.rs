@@ -260,6 +260,7 @@ fn forged_part(value: &trust_ir::InterpretValue) -> Option<&'static str> {
         V::Ptr(_) => Some("a pointer naming an allocation"),
         V::Handle { .. } => Some("a runtime handle"),
         V::Tensor { .. } => Some("a tensor value outside the bounded model"),
+        V::FnItem(_) => Some("a nominal function item outside the bounded model"),
         // trust-ir v50: array and vector values are ropes; trust-ir f9a59d5e
         // made sequence and set values the same persistent ropes. Each STORED
         // value is visited once (a splat's element once, whatever its length):
@@ -427,6 +428,16 @@ pub struct FsymUbClass {
 /// while an admitted instruction raises it. A CLEAN function is clean with
 /// respect to the `Checked` classes.
 pub const FSYM_TRUST_IR_UB_CLASSES: &[FsymUbClass] = &[
+    FsymUbClass {
+        name: "typed ABI attributes and provenance",
+        status: FsymUbClassStatus::NotChecked,
+        detail: "modules containing any typed signature ABI are refused before scanning, so no typed-ABI transport or provenance rule is claimed by bounded fsym",
+    },
+    FsymUbClass {
+        name: "enum byte-image validity",
+        status: FsymUbClassStatus::NotChecked,
+        detail: "loads and casts that reconstruct or encode an enum-containing byte image are refused at admission; bounded fsym tracks initialized coverage but does not prove a discriminant denotes an inhabited variant",
+    },
     FsymUbClass {
         name: "tensor gather/scatter coordinates and extents",
         status: FsymUbClassStatus::NotChecked,
@@ -989,6 +1000,24 @@ struct ModuleFacts {
     /// [`module_unwritten_lane`], once a function scan asks for it.
     unwritten_lane: OnceLock<Option<String>>,
     storage_surface: OnceLock<bool>,
+    abi_contract_surface: OnceLock<Option<String>>,
+    nominal_item_surface: OnceLock<bool>,
+}
+
+/// Legacy ABI entry/return promises are outside the bounded body model,
+/// including those on an unused declaration. Typed signature descriptors
+/// retain the separate existing module-wide boundary below.
+fn module_abi_contract_surface(module: &Module) -> Option<String> {
+    module.functions.iter().find_map(|function| {
+        (function.attrs.params.iter().any(|attrs| !attrs.is_empty())
+            || !function.attrs.ret.is_empty())
+        .then(|| {
+            format!(
+                "legacy ABI parameter/result contracts on {} have no complete bounded fsym model",
+                function.name
+            )
+        })
+    })
 }
 
 /// Where `module` spells a trust-ir v49 unwritten aggregate lane
@@ -1432,6 +1461,17 @@ fn scan_one_function(
     report: &mut FsymTrustIrReport,
 ) {
     if let Some(detail) = facts
+        .abi_contract_surface
+        .get_or_init(|| module_abi_contract_surface(module))
+    {
+        report.skipped_functions.push(FsymTrustIrSkip {
+            function: function.name.clone(),
+            reason: FsymTrustIrSkipReason::UnsupportedInstruction,
+            detail: detail.clone(),
+        });
+        return;
+    }
+    if let Some(detail) = facts
         .unwritten_lane
         .get_or_init(|| module_unwritten_lane(module))
     {
@@ -1439,6 +1479,39 @@ fn scan_one_function(
             function: function.name.clone(),
             reason: FsymTrustIrSkipReason::UnsupportedInstruction,
             detail: detail.clone(),
+        });
+        return;
+    }
+    // The public scanner also accepts a supplied body outside the module's
+    // function table. Its actual spelled types cannot borrow cached absence
+    // established for a different body in that table.
+    let supplied_nominal = !module
+        .function_by_id(function.id)
+        .is_some_and(|member| std::ptr::eq(member, function))
+        && {
+            let mut found = false;
+            for block in &function.blocks {
+                for (_, ty) in &block.params {
+                    ty.visit_types(|ty| found |= matches!(ty, Ty::FnItem(_)));
+                }
+                for node in &block.body {
+                    node.inst
+                        .visit_types(|ty| found |= matches!(ty, Ty::FnItem(_)));
+                }
+            }
+            found
+        };
+    if supplied_nominal
+        || *facts.nominal_item_surface.get_or_init(|| {
+            let mut found = false;
+            module.visit_types(|ty| found |= matches!(ty, Ty::FnItem(_)));
+            found
+        })
+    {
+        report.skipped_functions.push(FsymTrustIrSkip {
+            function: function.name.clone(),
+            reason: FsymTrustIrSkipReason::UnsupportedInstruction,
+            detail: "FnItem nominal identity has no complete bounded fsym value model".into(),
         });
         return;
     }
@@ -1590,6 +1663,23 @@ fn validate_function_scope(
         return Err(FunctionSkip::new(
             FsymTrustIrSkipReason::MalformedCfg,
             "function has no blocks",
+        ));
+    }
+
+    let Some(_signature) = module.func_type(function.ty) else {
+        return Err(FunctionSkip::new(
+            FsymTrustIrSkipReason::MalformedCfg,
+            "function signature is missing",
+        ));
+    };
+    if module
+        .func_types
+        .iter()
+        .any(|signature| signature.abi.is_some())
+    {
+        return Err(FunctionSkip::new(
+            FsymTrustIrSkipReason::UnsupportedInstruction,
+            "the module contains a typed signature ABI; its transport and provenance can affect callers and are outside bounded fsym",
         ));
     }
 
@@ -1906,6 +1996,97 @@ fn carries_tensor_blob(value: &Constant) -> bool {
         .is_break()
 }
 
+/// Whether the in-memory representation of `ty` can contain an enum value.
+///
+/// The reference interpreter reconstructs an enum's active variant from its
+/// byte image on a load (and on a layout-sensitive cast). Bounded fsym has no
+/// discriminant-validity obligation, so such an instruction must be refused
+/// before it can be scanned. Pointers stop the walk: their pointee's bytes are
+/// not part of the pointer value. Missing, cyclic, or unexpectedly deep type
+/// table paths fail closed.
+fn type_may_contain_enum_by_value(module: &Module, ty: &Ty) -> bool {
+    fn walk(module: &Module, ty: &Ty, depth: usize) -> bool {
+        if depth > 64 {
+            return true;
+        }
+        match ty {
+            Ty::Enum(_) => true,
+            Ty::Vector(element, _) | Ty::Tensor(element, _) => walk(module, element, depth + 1),
+            Ty::Tuple(elements) => elements
+                .iter()
+                .any(|element| walk(module, element, depth + 1)),
+            Ty::Array(element, _)
+            | Ty::Set(element, _)
+            | Ty::Sequence(element)
+            | Ty::Refine(element, _) => module
+                .ty(*element)
+                .is_none_or(|element| walk(module, element, depth + 1)),
+            Ty::Struct(id) => module.struct_def(*id).is_none_or(|definition| {
+                definition
+                    .fields
+                    .iter()
+                    .any(|field| walk(module, &field.ty, depth + 1))
+            }),
+            Ty::Record(id) => module.record_def(*id).is_none_or(|definition| {
+                definition
+                    .fields
+                    .iter()
+                    .any(|field| walk(module, &field.ty, depth + 1))
+            }),
+            Ty::Closure(id) => module.closure_type(*id).is_none_or(|definition| {
+                definition
+                    .captures
+                    .iter()
+                    .any(|capture| walk(module, capture, depth + 1))
+            }),
+            // An enum behind any pointer-like value is not stored by value in
+            // that value. Function signatures likewise describe code-address
+            // transport, not bytes reconstructed by this instruction.
+            Ty::Ptr
+            | Ty::FatPtr(_)
+            | Ty::Ref(_)
+            | Ty::RefMut(_)
+            | Ty::PtrConst(_)
+            | Ty::PtrMut(_)
+            | Ty::Rc(_)
+            | Ty::Func(_)
+            | Ty::FnItem(_)
+            | Ty::Handle(_) => false,
+            Ty::I8
+            | Ty::I16
+            | Ty::I32
+            | Ty::I64
+            | Ty::I128
+            | Ty::U8
+            | Ty::U16
+            | Ty::U32
+            | Ty::U64
+            | Ty::U128
+            | Ty::Isize
+            | Ty::Usize
+            | Ty::Char
+            | Ty::Error
+            | Ty::F16
+            | Ty::F32
+            | Ty::F64
+            | Ty::Bool
+            | Ty::Unit
+            | Ty::Never
+            | Ty::Dialect(_) => false,
+            // A Storage value is module geometry rather than an ordinary
+            // byte value, and the scanner separately refuses any module that
+            // contains one. Keep this local instruction gate fail-closed too.
+            Ty::Storage(_) => true,
+            // Level-R's extension is uninhabited today; keeping this arm
+            // fail-closed also makes a future extension unable to bypass the
+            // enum-image gate silently.
+            Ty::Ext(_) => true,
+        }
+    }
+
+    walk(module, ty, 0)
+}
+
 fn unsupported_nonterminator_detail(module: &Module, inst: &Inst) -> Option<String> {
     match inst {
         Inst::MakeClosure { ty, func, captures } => {
@@ -1935,6 +2116,16 @@ fn unsupported_nonterminator_detail(module: &Module, inst: &Inst) -> Option<Stri
         Inst::CallCannotUnwind { .. } | Inst::CallIndirectCannotUnwind { .. } => Some(
             "a non-propagating call boundary (CallCannotUnwind / CallIndirectCannotUnwind) \
              requires host-unwind semantics; fsym models none"
+                .to_string(),
+        ),
+        // v67: the reference interpreter refuses a `BoxDeref` whose operand
+        // is null, misaligned or outside a live allocation as undefined
+        // behaviour. fsym has no obligation kind for a carried validity
+        // fact, and scanning the instruction as a plain copy would owe no
+        // verdict on those three sites while calling the function scanned.
+        Inst::BoxDeref { .. } => Some(
+            "a Box deref (BoxDeref) is undefined behaviour unless its operand is valid as a \
+             Box; fsym models no validity-fact obligation"
                 .to_string(),
         ),
         // v54 (amendment P): a sited check names the panic entry its failure
@@ -2014,6 +2205,25 @@ fn unsupported_nonterminator_detail(module: &Module, inst: &Inst) -> Option<Stri
              strong"
                 .to_string(),
         ),
+        Inst::Load { ty, .. }
+        | Inst::AtomicLoad { ty, .. }
+        | Inst::AtomicRMW { ty, .. }
+        | Inst::CmpXchg {
+            ty, weak: false, ..
+        } if type_may_contain_enum_by_value(module, ty) => Some(format!(
+            "{} reconstructs an enum-containing value from bytes; bounded fsym does not prove that the byte image names an inhabited variant",
+            crate::fsym_ub_map::fsym_inst_variant_name(inst)
+        )),
+        Inst::Cast {
+            src_ty, dst_ty, ..
+        } if type_may_contain_enum_by_value(module, src_ty)
+            || type_may_contain_enum_by_value(module, dst_ty) =>
+        {
+            Some(
+                "Cast encodes or reconstructs an enum-containing value through bytes; bounded fsym does not prove that the byte image names an inhabited variant"
+                    .to_string(),
+            )
+        }
         // Memory accesses: each owes null / bounds / use-after-free verdicts
         // in `visit_node` (and `MemCopy` a non-overlap verdict), and each is
         // enumerated by `reachable_obligation_sites`.
@@ -3480,6 +3690,7 @@ impl<'a> FunctionScan<'a> {
             | Inst::CallIndirect { .. }
             | Inst::CallCannotUnwind { .. }
             | Inst::CallIndirectCannotUnwind { .. }
+            | Inst::BoxDeref { .. }
             | Inst::OpenFrame { .. }
             | Inst::BindSlot { .. }
             | Inst::LoadSlot { .. }
@@ -6697,6 +6908,8 @@ fn obligation_kinds(
         | Inst::CallIndirect { .. }
         | Inst::CallCannotUnwind { .. }
         | Inst::CallIndirectCannotUnwind { .. }
+        // v67: refused at admission (`unsupported_nonterminator_detail`).
+        | Inst::BoxDeref { .. }
         | Inst::Undef { .. }
         | Inst::Assume { .. }
         | Inst::Assert { .. }
@@ -7294,6 +7507,7 @@ fn constant_expr(ty: &Ty, value: &Constant, pointer_bits: Option<u32>) -> Option
         | Constant::Set(_)
         | Constant::Record(_)
         | Constant::Closure { .. }
+        | Constant::FnItem(_)
         | Constant::FnDef(_)
         // A symbol address has no concrete value until link time, so there is
         // no SMT bit-vector to model it as.
@@ -12465,6 +12679,63 @@ mod tests {
             ],
         ));
         module
+    }
+
+    #[test]
+    fn enum_byte_images_are_refused_before_scanning() {
+        let mut module = enum_module("fsym_enum_image_gate", vec![], vec![]);
+        let enum_ty = Ty::Enum(trust_ir::EnumId::new(0));
+        module.types.push(enum_ty.clone());
+
+        assert!(super::type_may_contain_enum_by_value(&module, &enum_ty));
+        assert!(super::type_may_contain_enum_by_value(
+            &module,
+            &Ty::Tuple(vec![Ty::U8, enum_ty.clone()])
+        ));
+        assert!(super::type_may_contain_enum_by_value(
+            &module,
+            &Ty::Array(trust_ir::TyId::new(0), 1)
+        ));
+        assert!(!super::type_may_contain_enum_by_value(
+            &module,
+            &Ty::PtrConst(Box::new(enum_ty.clone()))
+        ));
+
+        let load = Inst::Load {
+            ty: enum_ty.clone(),
+            ptr: v(0),
+            volatile: false,
+            align: None,
+        };
+        let cast_from = Inst::Cast {
+            op: trust_ir::CastOp::Bitcast,
+            src_ty: enum_ty.clone(),
+            dst_ty: Ty::Unit,
+            operand: v(0),
+        };
+        let cast_to = Inst::Cast {
+            op: trust_ir::CastOp::Bitcast,
+            src_ty: Ty::Unit,
+            dst_ty: enum_ty,
+            operand: v(0),
+        };
+        for inst in [&load, &cast_from, &cast_to] {
+            let detail = super::unsupported_nonterminator_detail(&module, inst)
+                .expect("enum-containing byte-image operation is refused");
+            assert!(detail.contains("enum-containing"), "{detail}");
+        }
+        assert_eq!(
+            super::unsupported_nonterminator_detail(
+                &module,
+                &Inst::Load {
+                    ty: Ty::U8,
+                    ptr: v(0),
+                    volatile: false,
+                    align: None,
+                }
+            ),
+            None
+        );
     }
 
     #[test]

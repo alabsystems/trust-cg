@@ -534,6 +534,7 @@ pub fn merge_modules(modules: &[Module]) -> Result<Module, String> {
     let mut maps: Vec<ModMaps> = Vec::with_capacity(modules.len());
     for (i, m) in modules.iter().enumerate() {
         maps.push(ModMaps {
+            func_map: fid_maps[i].clone(),
             func_ty_base: func_ty_base[i],
             func_ty_len: m.func_types.len(),
             func_ty_canon: std::mem::take(&mut func_ty_canon[i]),
@@ -1491,6 +1492,9 @@ fn constant_batch_deferred_impl(c: &Constant, typed_bytes: bool) -> Option<&'sta
             }
         }
         Constant::FnDef(_) => None,
+        Constant::FnItem(_) => Some(
+            "Constant::FnItem has no native lowering; an explicit function-pointer coercion is required",
+        ),
         // U128 retains its body-only support. Bytes requires the separate
         // typed walk, never merely the absence of identity-bearing children.
         Constant::U128(_) => None,
@@ -1694,7 +1698,7 @@ pub(crate) fn decode_body_global_addr_stub(ty: &Ty, value: &Constant) -> Option<
     decode_global_addr_stub(*value)
 }
 
-/// First `FuncId` embedded in `c` (a `FnDef` or `Closure` at any constant
+/// First `FuncId` embedded in `c` (a `FnDef`, `FnItem`, or `Closure` at any constant
 /// depth) that has NO matching function in module `m` — the precheck mirror of
 /// the dangling-`GlobalAddr` gate. Resolution is by the `Function.id` FIELD
 /// (not table position), exactly how the FuncId remap map is keyed and how the
@@ -1709,7 +1713,7 @@ fn constant_dangling_funcid(c: &Constant, m: &Module) -> Option<FuncId> {
     };
     match c {
         Constant::Ext(e) => e.unreachable(),
-        Constant::FnDef(fid) => dangling(*fid),
+        Constant::FnDef(fid) | Constant::FnItem(fid) => dangling(*fid),
         Constant::Closure { func, captures } => {
             dangling(*func).or_else(|| captures.iter().find_map(|e| constant_dangling_funcid(e, m)))
         }
@@ -1763,6 +1767,7 @@ fn constant_tagged_int_anywhere(c: &Constant) -> Option<i128> {
         Constant::U128(_)
         | Constant::Bytes { .. }
         | Constant::FnDef(_)
+        | Constant::FnItem(_)
         | Constant::Float(_)
         | Constant::Bool(_)
         | Constant::SymbolAddr { .. }
@@ -1845,8 +1850,8 @@ fn unsupported_initializer_constant_reason_impl(
 ) -> Option<&'static str> {
     match c {
         Constant::Ext(e) => e.unreachable(),
-        Constant::FnDef(_) | Constant::Closure { .. } => Some(
-            "a module-scoped function constant (FnDef/Closure); initializers must use \
+        Constant::FnDef(_) | Constant::FnItem(_) | Constant::Closure { .. } => Some(
+            "a module-scoped function constant (FnDef/FnItem/Closure); initializers must use \
              name-relative SymbolAddr",
         ),
         Constant::Aggregate(v)
@@ -2086,6 +2091,7 @@ fn rename_symbol_addrs(c: &mut Constant, renames: &HashMap<String, String>) {
             }
         }
         Constant::FnDef(_)
+        | Constant::FnItem(_)
         | Constant::Int(_)
         | Constant::U128(_)
         | Constant::Bytes { .. }
@@ -2503,6 +2509,9 @@ fn assign_globals(modules: &[Module]) -> Result<GlobalsAssign, String> {
 /// Everything needed to rewrite one source module's id references into the
 /// merged id spaces.
 struct ModMaps {
+    /// Old module-local `FuncId` -> merged dense function identity. Function
+    /// item types carry this id directly, unlike `Ty::Func` signature ids.
+    func_map: HashMap<u32, u32>,
     /// `FuncTyId` shift (concatenated `func_types`).
     func_ty_base: u32,
     /// Source module's `func_types` length (bounds check before shifting).
@@ -2704,6 +2713,11 @@ fn remap_ty(
             ftid.index(),
             m,
             "Ty::Func func_type",
+        )?)),
+        Ty::FnItem(fid) => Ty::FnItem(FuncId::new(mapped(
+            &m.func_map,
+            fid.index(),
+            "Ty::FnItem function",
         )?)),
         Ty::Closure(cid) => Ty::Closure(ClosureTyId::new(shifted(
             cid.index(),
@@ -3093,6 +3107,32 @@ fn remap_inst(
             rt(src_ty)?;
             rt(dst_ty)?;
         }
+        // trust-ir v67: the pointer type and the pointee. The validity fact
+        // is carried verbatim (site, session, premises and non-claims name
+        // nothing module-relative). The one module-relative reference a fact
+        // can spell is an obligation row id, which trust-ir refuses in every
+        // fact at this pin; a merge does not rebase one, it refuses it.
+        Inst::BoxDeref {
+            ptr_ty,
+            pointee,
+            fact,
+            ..
+        } => {
+            if fact.evidence.iter().any(|entry| {
+                matches!(
+                    entry.evidence,
+                    trust_ir::box_validity::ValidityEvidence::Obligation { .. }
+                )
+            }) {
+                return Err(
+                    "Inst::BoxDeref validity fact cites an obligation row; a module merge does \
+                     not rebase a fact's obligation reference"
+                        .to_string(),
+                );
+            }
+            rt(ptr_ty)?;
+            rt(pointee.ty_mut())?;
+        }
         Inst::PtrMetadata {
             ptr_ty,
             metadata_ty,
@@ -3212,7 +3252,7 @@ fn remap_inst(
     Ok(())
 }
 
-/// Rewrite `FuncId`s embedded in a constant (`FnDef`, `Closure`, and their
+/// Rewrite `FuncId`s embedded in a constant (`FnDef`, `FnItem`, `Closure`, and their
 /// nested aggregate constants). Constants embed no type-table ids. Exhaustive.
 fn remap_constant(c: &mut Constant, fid_map: &HashMap<u32, u32>) -> Result<(), String> {
     let remap_fid = |fid: &mut FuncId| -> Result<(), String> {
@@ -3228,7 +3268,7 @@ fn remap_constant(c: &mut Constant, fid_map: &HashMap<u32, u32>) -> Result<(), S
     };
     match c {
         Constant::Ext(e) => e.unreachable(),
-        Constant::FnDef(fid) => remap_fid(fid)?,
+        Constant::FnDef(fid) | Constant::FnItem(fid) => remap_fid(fid)?,
         Constant::Closure { func, captures } => {
             remap_fid(func)?;
             for cap in captures {
@@ -3707,6 +3747,12 @@ fn check_inst_in_range(inst: &Inst, c: &TableCounts, fname: &str) -> Result<(), 
             check_ty_resolvable(src_ty, c, fname)?;
             check_ty_resolvable(dst_ty, c, fname)?;
         }
+        Inst::BoxDeref {
+            ptr_ty, pointee, ..
+        } => {
+            check_ty_resolvable(ptr_ty, c, fname)?;
+            check_ty_resolvable(pointee.ty(), c, fname)?;
+        }
         Inst::PtrMetadata {
             ptr_ty,
             metadata_ty,
@@ -3848,10 +3894,10 @@ fn check_inst_in_range(inst: &Inst, c: &TableCounts, fname: &str) -> Result<(), 
 fn check_constant_in_range(c: &Constant, func_count: u32, fname: &str) -> Result<(), String> {
     match c {
         Constant::Ext(e) => e.unreachable(),
-        Constant::FnDef(fid) => {
+        Constant::FnDef(fid) | Constant::FnItem(fid) => {
             if fid.index() >= func_count {
                 return Err(format!(
-                    "merge_modules self-check: function `{fname}` FnDef constant references \
+                    "merge_modules self-check: function `{fname}` function-identity constant references \
                      FuncId({}) out of range (only {func_count} function(s))",
                     fid.index()
                 ));
@@ -3948,6 +3994,11 @@ fn check_ty_resolvable(ty: &Ty, c: &TableCounts, loc: &str) -> Result<(), String
         Ty::Func(id) => {
             if id.index() as usize >= c.func_types {
                 return Err(oob("func_type", id.index(), c.func_types));
+            }
+        }
+        Ty::FnItem(id) => {
+            if id.index() >= c.functions {
+                return Err(oob("function", id.index(), c.functions as usize));
             }
         }
         Ty::Struct(id) => {
@@ -4356,6 +4407,28 @@ fn verify_function_identity_preservation(
                     {
                         return Err(ierr("indirect call value operand changed", &mf.name));
                     }
+                }
+                // trust-ir v67: a merge carries a Box deref's operand and its
+                // whole validity fact unchanged. A fact that changed is a
+                // different assumption about a different cast.
+                if let (
+                    Inst::BoxDeref {
+                        operand: source_operand,
+                        fact: source_fact,
+                        ..
+                    },
+                    Inst::BoxDeref {
+                        operand: actual_operand,
+                        fact: actual_fact,
+                        ..
+                    },
+                ) = (&sn.inst, &mn.inst)
+                    && (source_operand != actual_operand || source_fact != actual_fact)
+                {
+                    return Err(ierr(
+                        "BoxDeref operand or validity fact changed across the merge",
+                        &mf.name,
+                    ));
                 }
                 if let (
                     Inst::MakeClosure {
@@ -5177,6 +5250,101 @@ mod tests {
             visibility: Default::default(),
             retained: false,
         }
+    }
+
+    #[test]
+    fn box_deref_merge_remaps_pointee_type_and_preserves_site_operand_and_result() {
+        use trust_ir::box_validity::{
+            BoxDerefSite, BoxFactSession, BoxPointee, BoxValidityFact, PremiseRoot,
+        };
+
+        // Force the Box module's local TyId(0) to become TyId(1). The fact
+        // and SSA ids are function-local and must remain byte-for-byte
+        // identical; only the pointee's module-scoped type id is remapped.
+        let mut first = build_callee_module();
+        first.types = vec![Ty::U8];
+
+        let fact = BoxValidityFact::premise(
+            BoxDerefSite {
+                item: [0x5a; 16],
+                ordinal: 7,
+            },
+            BoxFactSession::PROOF_SNAPSHOT,
+            PremiseRoot::ParamByValue,
+        );
+        let source_pointee = BoxPointee::Sized {
+            ty: Ty::Array(TyId::new(0), 2),
+        };
+        let mut boxed = Module::new("boxed");
+        boxed.types = vec![Ty::I64];
+        boxed.func_types = vec![FuncTy {
+            params: vec![Ty::Ptr],
+            returns: vec![Ty::Ptr],
+            abi: None,
+            is_vararg: false,
+        }];
+        boxed.functions = vec![tfunc(
+            0,
+            "box_identity",
+            0,
+            vec![tblock(
+                0,
+                vec![(0, Ty::Ptr)],
+                vec![
+                    tnode(
+                        Inst::BoxDeref {
+                            ptr_ty: Ty::Ptr,
+                            pointee: source_pointee.clone(),
+                            operand: v(0),
+                            fact: Box::new(fact.clone()),
+                        },
+                        vec![1],
+                    ),
+                    tnode(Inst::Return { values: vec![v(1)] }, vec![]),
+                ],
+            )],
+        )];
+
+        assert!(trust_ir_build::validate_module(&boxed).is_empty());
+        let merged = merge_modules(&[first, boxed]).expect("BoxDeref module merges");
+        let function = merged
+            .functions
+            .iter()
+            .find(|function| function.name == "box_identity")
+            .expect("merged Box function");
+        let node = &function.blocks[0].body[0];
+        let Inst::BoxDeref {
+            ptr_ty,
+            pointee,
+            operand,
+            fact: merged_fact,
+        } = &node.inst
+        else {
+            panic!("Box instruction changed shape across merge")
+        };
+        assert_eq!(*ptr_ty, Ty::Ptr);
+        assert_eq!(*operand, v(0), "function-local operand is preserved");
+        assert_eq!(
+            node.results,
+            vec![v(1)],
+            "function-local result is preserved"
+        );
+        assert_eq!(
+            merged_fact.as_ref(),
+            &fact,
+            "site and full fact are preserved"
+        );
+        assert_eq!(
+            pointee,
+            &BoxPointee::Sized {
+                ty: Ty::Array(TyId::new(1), 2),
+            },
+            "the pointee type follows the merged types table"
+        );
+        assert_ne!(
+            pointee, &source_pointee,
+            "the control forced an actual remap"
+        );
     }
 
     fn tsdef(id: u32, name: &str, field_tys: Vec<Ty>) -> StructDef {
@@ -8230,7 +8398,8 @@ bb0:
     #[test]
     fn merge_refuses_nonempty_tensor_blob_tables_before_rebuild() {
         let plain = build_callee_module();
-        merge_modules(&[plain.clone()]).expect("the original empty-table scalar remains eligible");
+        merge_modules(std::slice::from_ref(&plain))
+            .expect("the original empty-table scalar remains eligible");
         let duplicate = merge_modules(&[plain.clone(), plain.clone()])
             .expect_err("duplicate definitions remain refused");
         assert!(
@@ -9255,6 +9424,7 @@ bb0:
 
     fn test_maps(func_ty_base: u32, func_ty_len: usize) -> ModMaps {
         ModMaps {
+            func_map: HashMap::new(),
             func_ty_base,
             func_ty_len,
             func_ty_canon: HashMap::new(),

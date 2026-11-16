@@ -38,6 +38,7 @@
 //! Reference: ~/llvm-project-ref/llvm/lib/Target/X86/MCTargetDesc/X86MCCodeEmitter.cpp
 
 pub mod backend_timing;
+mod call_split;
 pub mod decode_check;
 pub mod encode;
 pub mod pipeline;

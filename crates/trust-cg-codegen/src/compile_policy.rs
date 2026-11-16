@@ -121,6 +121,11 @@ const TAG_COMPILER_LINK_UNIT_DEFINITIONS: u16 = 0x1014;
 /// Forced AArch64 object frame records, present only when enabled so existing
 /// default-policy artifact identities remain unchanged.
 const TAG_COMPILER_AARCH64_FORCE_FRAME_POINTERS: u16 = 0x1015;
+/// The x86-64 certificate-free allocation request
+/// (`CompilerConfig::x86_certificate_free_allocation`), present only when on
+/// so every default-policy digest is unchanged. It changes emitted bytes:
+/// Artifact.
+const TAG_COMPILER_X86_CERTIFICATE_FREE_ALLOCATION: u16 = 0x1016;
 
 // JitConfig fields.  Profile hooks and emit_entry_counters intentionally share
 // one effective field: the latter is an ergonomic alias, not a second policy.
@@ -621,6 +626,7 @@ fn push_compiler_fields(
         eh_frames_cannot_unwind,
         eh_nounwind_callees,
         link_unit_definitions,
+        x86_certificate_free_allocation,
     } = compiler;
     if target_spec.architecture != *target {
         return Err(CompilePolicyError::TargetArchitectureMismatch {
@@ -799,6 +805,16 @@ fn push_compiler_fields(
             CompilePolicyPartition::Evidence,
             TAG_COMPILER_LINK_UNIT_DEFINITIONS,
             &link_unit_definitions_sha256(link_unit_definitions),
+        );
+    }
+    // The certificate-free allocation request changes which registers and
+    // copies an x86-64 object compile emits. Absent when off.
+    if *x86_certificate_free_allocation {
+        push_field(
+            fields,
+            CompilePolicyPartition::Artifact,
+            TAG_COMPILER_X86_CERTIFICATE_FREE_ALLOCATION,
+            &[bool_tag(true)],
         );
     }
     Ok(())
@@ -1164,6 +1180,7 @@ mod tests {
             eh_frames_cannot_unwind: false,
             eh_nounwind_callees: std::collections::BTreeSet::new(),
             link_unit_definitions: std::collections::BTreeSet::new(),
+            x86_certificate_free_allocation: false,
         };
         let jit = JitConfig {
             opt_level: OptLevel::O2,
@@ -1555,6 +1572,35 @@ mod tests {
             with(&["b", "a"]).digest(CompilePolicyPartition::Artifact),
             with(&["a", "b"]).digest(CompilePolicyPartition::Artifact)
         );
+    }
+
+    /// The x86-64 certificate-free allocation request is encoded only when on,
+    /// only in the Artifact partition (it changes emitted bytes).
+    #[test]
+    fn x86_certificate_free_allocation_is_an_artifact_field_only_when_on() {
+        let (target, compiler, jit) = baseline();
+        let tag = TAG_COMPILER_X86_CERTIFICATE_FREE_ALLOCATION.to_be_bytes();
+        let has_tag = |policy: &CompilePolicy, partition| {
+            let bytes = policy.canonical_bytes(partition);
+            let mut cursor = ENCODING_HEADER_BYTES;
+            let mut found = false;
+            while cursor < bytes.len() {
+                let len = usize::from(u16::from_be_bytes([bytes[cursor + 2], bytes[cursor + 3]]));
+                found |= bytes[cursor..cursor + 2] == tag;
+                cursor += TLV_HEADER_BYTES + len;
+            }
+            found
+        };
+        let base = policy(target, &compiler, &jit);
+        assert!(!has_tag(&base, CompilePolicyPartition::Full));
+        let mut changed = compiler.clone();
+        changed.x86_certificate_free_allocation = true;
+        let on = policy(target, &changed, &jit);
+        assert!(has_tag(&on, CompilePolicyPartition::Artifact));
+        assert!(has_tag(&on, CompilePolicyPartition::Full));
+        assert!(!has_tag(&on, CompilePolicyPartition::Evidence));
+        assert!(!has_tag(&on, CompilePolicyPartition::Invocation));
+        assert_only_partition_changed(&base, &on, CompilePolicyPartition::Artifact);
     }
 
     /// OD-216: the link-unit definition set is encoded only when non-empty,

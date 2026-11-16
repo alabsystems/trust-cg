@@ -412,14 +412,17 @@ impl Wasm32FnLinkage {
                 // A splat holds its one element once; renaming it renames every
                 // lane.
                 Constant::Splat { elem, .. } => pending.push(elem.as_mut()),
-                // No symbol reference: a `FnDef` names its function by id, and
-                // the function itself is renamed in `apply`.
+                // No symbol reference: `FnDef`/`FnItem` name their function by
+                // id, and the function itself is renamed in `apply`. A
+                // function item remains nominal/ZST until an explicit pointer
+                // coercion.
                 Constant::Int(_)
                 | Constant::U128(_)
                 | Constant::Bytes { .. }
                 | Constant::Float(_)
                 | Constant::Bool(_)
                 | Constant::FnDef(_)
+                | Constant::FnItem(_)
                 | Constant::PhantomData
                 | Constant::Uninit
                 // A tensor weight blob names its bytes by digest: no symbol.

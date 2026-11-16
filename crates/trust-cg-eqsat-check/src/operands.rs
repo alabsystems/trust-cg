@@ -65,9 +65,10 @@ pub(crate) fn set_operands(inst: &mut Inst, new: &[ValueId]) -> Option<()> {
         Inst::SeqMapAddK { seq, .. } | Inst::SeqMapNot { seq, .. } | Inst::SeqMap { seq, .. } => {
             f.put(seq)?
         }
-        Inst::UnOp { operand, .. } | Inst::Cast { operand, .. } | Inst::Copy { operand, .. } => {
-            f.put(operand)?
-        }
+        Inst::UnOp { operand, .. }
+        | Inst::Cast { operand, .. }
+        | Inst::Copy { operand, .. }
+        | Inst::BoxDeref { operand, .. } => f.put(operand)?,
         Inst::Load { ptr, .. }
         | Inst::PtrData { ptr, .. }
         | Inst::PtrMetadata { ptr, .. }

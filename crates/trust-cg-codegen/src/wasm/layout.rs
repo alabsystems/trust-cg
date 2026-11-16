@@ -842,6 +842,12 @@ fn descriptor_image(
             }
             EnumView::Direct { offset }
         }
+        EnumTagEncoding::DirectWithUninhabited { .. } => {
+            return Err(unsupported(
+                ty,
+                "direct-with-uninhabited storage profiles are not represented by the Wasm enum image",
+            ));
+        }
         EnumTagEncoding::Niche {
             untagged_variant,
             niche_variants_start,

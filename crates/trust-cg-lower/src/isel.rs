@@ -157,6 +157,10 @@ const FP_ARRANGEMENT_2D: i64 = 2;
 /// grows one load/store pair per residual lane) stops paying for itself.
 const INLINE_MEMCPY_MAX_BYTES: i64 = 32;
 
+/// A small memmove buffers every source lane before storing any destination
+/// lane. At most six temporary registers cover this exact-width bound.
+const INLINE_MEMMOVE_MAX_BYTES: i64 = 32;
+
 /// Largest by-reference composite argument selection copies itself
 /// (`stage_by_reference_argument_copies`). Its largest LDP/STP lane offset is
 /// 240 and its largest residual lane offset 255, both inside one base's
@@ -12682,9 +12686,8 @@ impl InstructionSelector {
 
         // Inline a small constant-length copy. The length is read from the
         // `Iconst` pre-scan so a fold does NOT rematerialize the length into a
-        // dead register. `memmove` is deliberately excluded (its overlap
-        // semantics need a direction choice this straight-line expansion does
-        // not make) — this path is `memcpy`-only.
+        // dead register. This forward expansion is memcpy-only; memmove uses
+        // the buffered form below so overlapping regions remain well-defined.
         let len_val = inst.args[2];
         if let Some(len) = self.iconst_origins.get(&len_val).map(|(_, imm)| *imm)
             && (0..=INLINE_MEMCPY_MAX_BYTES).contains(&len)
@@ -12764,8 +12767,25 @@ impl InstructionSelector {
     /// a Gpr64 lane is an X-register access (8 bytes), a Gpr32 lane a
     /// W-register access (4 bytes); halfword/byte use LDRH/STRH and LDRB/STRB.
     fn emit_inline_memcpy(&mut self, block: Block, dest: ISelOperand, src: ISelOperand, len: u64) {
+        self.emit_inline_copy(block, dest, src, len, false);
+    }
+
+    /// With `buffered`, retain every loaded lane until all source reads have
+    /// finished. Stores then consume that snapshot, including for either
+    /// overlap direction or identical pointers. No byte outside the exact
+    /// source/destination extents is accessed. The unbuffered memcpy form
+    /// preserves its existing load/store sequence and allocates no buffer.
+    fn emit_inline_copy(
+        &mut self,
+        block: Block,
+        dest: ISelOperand,
+        src: ISelOperand,
+        len: u64,
+        buffered: bool,
+    ) {
         let mut off: i64 = 0;
         let mut remaining = len;
+        let mut stores = Vec::new();
 
         // 16-byte LDP/STP chunks (two X registers per chunk).
         while remaining >= 16 {
@@ -12783,18 +12803,20 @@ impl InstructionSelector {
                     ],
                 ),
             );
-            self.emit(
-                block,
-                ISelInst::new(
-                    AArch64Opcode::StpRI,
-                    vec![
-                        ISelOperand::VReg(t0),
-                        ISelOperand::VReg(t1),
-                        dest.clone(),
-                        ISelOperand::Imm(off),
-                    ],
-                ),
+            let store = ISelInst::new(
+                AArch64Opcode::StpRI,
+                vec![
+                    ISelOperand::VReg(t0),
+                    ISelOperand::VReg(t1),
+                    dest.clone(),
+                    ISelOperand::Imm(off),
+                ],
             );
+            if buffered {
+                stores.push(store);
+            } else {
+                self.emit(block, store);
+            }
             off += 16;
             remaining -= 16;
         }
@@ -12828,13 +12850,15 @@ impl InstructionSelector {
                     vec![ISelOperand::VReg(t), src.clone(), ISelOperand::Imm(off)],
                 ),
             );
-            self.emit(
-                block,
-                ISelInst::new(
-                    st,
-                    vec![ISelOperand::VReg(t), dest.clone(), ISelOperand::Imm(off)],
-                ),
+            let store = ISelInst::new(
+                st,
+                vec![ISelOperand::VReg(t), dest.clone(), ISelOperand::Imm(off)],
             );
+            if buffered {
+                stores.push(store);
+            } else {
+                self.emit(block, store);
+            }
             off += lane as i64;
             remaining -= lane;
         }
@@ -12843,16 +12867,31 @@ impl InstructionSelector {
             remaining, 0,
             "inline memcpy left {remaining} bytes uncopied"
         );
+        for store in stores {
+            self.emit(block, store);
+        }
     }
 
     /// Select a memmove intrinsic.
     ///
-    /// Lowered to a regular libc call: `memmove(dest, src, len)`.
+    /// Small constant lengths load the entire source before writing any
+    /// destination byte, preserving overlap without a runtime call. Other
+    /// lengths keep the regular libc call `memmove(dest, src, len)`.
     /// args[0] = dest ptr (I64), args[1] = src ptr (I64), args[2] = length (I64).
     /// No results (void).
     fn select_memmove(&mut self, inst: &Instruction, block: Block) -> Result<(), ISelError> {
         Self::require_exact_args(inst, 3, "Memmove")?;
         Self::require_no_results(inst, "Memmove")?;
+        if let Some(len) = self.iconst_origins.get(&inst.args[2]).map(|(_, imm)| *imm)
+            && (0..=INLINE_MEMMOVE_MAX_BYTES).contains(&len)
+        {
+            if len > 0 {
+                let dest = self.use_value(&inst.args[0])?;
+                let src = self.use_value(&inst.args[1])?;
+                self.emit_inline_copy(block, dest, src, len as u64, true);
+            }
+            return Ok(());
+        }
         self.select_library_routine_call(
             RuntimeSymbol::Memmove,
             &inst.args,
@@ -39591,14 +39630,14 @@ mod tests {
     }
 
     #[test]
-    fn memmove_const_len_keeps_libcall() {
-        // memmove has overlap semantics: never inlined, even for a small const.
+    fn memmove_large_const_len_keeps_libcall() {
         let (mut isel, entry) = make_empty_isel();
         let d = isel.new_vreg(RegClass::Gpr64);
         isel.define_value(Value(0), ISelOperand::VReg(d), Type::I64);
         let s = isel.new_vreg(RegClass::Gpr64);
         isel.define_value(Value(1), ISelOperand::VReg(s), Type::I64);
-        isel.iconst_origins.insert(Value(2), (Type::I64, 16));
+        isel.iconst_origins
+            .insert(Value(2), (Type::I64, INLINE_MEMMOVE_MAX_BYTES + 1));
         isel.current_block = Some(entry);
         isel.select_instruction(
             &Instruction {
@@ -39618,6 +39657,65 @@ mod tests {
             bl.expect("memmove keeps its BL").operands[0],
             ISelOperand::Symbol("memmove".to_string()),
         );
+    }
+
+    #[test]
+    fn small_memmove_loads_every_source_lane_before_any_destination_store() {
+        for len in 0..=INLINE_MEMMOVE_MAX_BYTES {
+            let (mut isel, entry) = make_empty_isel();
+            for value in [Value(0), Value(1)] {
+                let reg = isel.new_vreg(RegClass::Gpr64);
+                isel.define_value(value, ISelOperand::VReg(reg), Type::I64);
+            }
+            isel.iconst_origins.insert(Value(2), (Type::I64, len));
+            isel.select_instruction(
+                &Instruction {
+                    opcode: Opcode::Memmove,
+                    args: vec![Value(0), Value(1), Value(2)],
+                    results: vec![],
+                },
+                entry,
+            )
+            .unwrap();
+            let function = isel.finalize();
+            let insts = &function.blocks[&entry].insts;
+            assert!(
+                !insts.iter().any(|inst| inst.opcode == AArch64Opcode::Bl),
+                "{len}"
+            );
+            if len == 0 {
+                assert!(insts.is_empty(), "zero bytes must access no address");
+                continue;
+            }
+            let last_load = insts
+                .iter()
+                .rposition(|inst| {
+                    matches!(
+                        inst.opcode,
+                        AArch64Opcode::LdpRI
+                            | AArch64Opcode::LdrRI
+                            | AArch64Opcode::LdrhRI
+                            | AArch64Opcode::LdrbRI
+                    )
+                })
+                .unwrap();
+            let first_store = insts
+                .iter()
+                .position(|inst| {
+                    matches!(
+                        inst.opcode,
+                        AArch64Opcode::StpRI
+                            | AArch64Opcode::StrRI
+                            | AArch64Opcode::StrhRI
+                            | AArch64Opcode::StrbRI
+                    )
+                })
+                .unwrap();
+            assert!(
+                last_load < first_store,
+                "{len}: overlapping bytes must use a full snapshot"
+            );
+        }
     }
 
     // =======================================================================

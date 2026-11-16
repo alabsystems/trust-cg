@@ -390,8 +390,14 @@ pub fn admission_findings(
     // The claim-less verdict is the license policy's, stated in trust-ir's
     // type by `codegen_license` (the one file the Permit census lets name a
     // Permit); this entry decides nothing about it.
-    let admission = trust_ir_build::CodegenAdmission::from_config(config)
-        .with_unlicensed(license.trust_ir_unlicensed_policy());
+    // trust-ir v74 `Inst::BoxDeref` is held to the license policy's floor
+    // (default: refuse); the finding is named by the shared classifier in
+    // `named_validation_refusal`.
+    let admission = crate::box_deref::admission_at(
+        trust_ir_build::CodegenAdmission::from_config(config)
+            .with_unlicensed(license.trust_ir_unlicensed_policy()),
+        license.box_validity_floor(),
+    );
     let linked = license
         .authenticated_imports()
         .and_then(|imports| imports.bind_for_ingestion(module));

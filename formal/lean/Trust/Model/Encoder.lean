@@ -75,11 +75,16 @@ def gprLo3 (r : GPR) : BitVec 3 :=
 /-- The shared Trust computation extracts exactly the model's three register bits. -/
 @[simp] theorem gprLo3_bits (r : GPR) : gprLo3 r = (gprNum r).truncate 3 := by
   cases r <;> decide
-def gprHiBit (r : GPR) : Bool := (gprNum r).getMsbD 0
+def gprHiBit (r : GPR) : Bool :=
+  trust_cg_x86_is_extended (UInt8.ofNat (gprNum r).toNat) == 1
+
+/-- The actual shared high-register decision is the model's most significant bit. -/
+@[simp] theorem gprHiBit_bits (r : GPR) : gprHiBit r = (gprNum r).getMsbD 0 := by
+  cases r <;> decide
 
 theorem gprNum_split (r : GPR) :
     gprNum r = ((BitVec.ofBool (gprHiBit r)) ++ (gprLo3 r)).cast (by omega) := by
-  cases r <;> (simp only [gprNum, gprLo3_bits, gprHiBit]; bv_decide)
+  cases r <;> (simp only [gprNum, gprLo3_bits, gprHiBit_bits]; bv_decide)
 
 /-! ## 1.  Condition codes (Jcc / SETcc / CMOVcc). -/
 
@@ -148,9 +153,16 @@ inductive Instr
 @[inline] def b8 (x : BitVec 8) : UInt8 := UInt8.ofNat x.toNat
 
 def rexByte (w r x b : Bool) : BitVec 8 :=
+  BitVec.ofNat 8
+    (trust_cg_x86_rex_byte (if w then 1 else 0) (if r then 1 else 0)
+      (if x then 1 else 0) (if b then 1 else 0)).toNat
+
+/-- The shared emitted computation preserves the original architectural byte. -/
+@[simp] theorem rexByte_bits (w r x b : Bool) : rexByte w r x b =
   (0x40 : BitVec 8)
     ||| (if w then 0x08 else 0) ||| (if r then 0x04 else 0)
-    ||| (if x then 0x02 else 0) ||| (if b then 0x01 else 0)
+    ||| (if x then 0x02 else 0) ||| (if b then 0x01 else 0) := by
+  cases w <;> cases r <;> cases x <;> cases b <;> decide
 
 def rexRR (sz : OSize) (reg rm : GPR) : BitVec 8 :=
   rexByte (sz = OSize.b64) (gprHiBit reg) false (gprHiBit rm)
@@ -401,7 +413,7 @@ theorem decode_encode_movabsRI (dst : GPR) (imm : BitVec 64) (tail : List UInt8)
   simp only [BitVec.truncate, BitVec.setWidth_setWidth_of_le _ (by decide : 8 ≤ 32)] at hread
   cases dst <;>
     simp [encode, encInstr, le64, le32, decode, u8ToBv_b8,
-      rexRR, rexByte, gprHiBit, gprLo3_bits, gprNum, gprOfNum] <;> exact hread
+      rexRR, rexByte_bits, gprHiBit_bits, gprLo3_bits, gprNum, gprOfNum] <;> exact hread
 
 /-- The entire imm8 domain shares the anchored three-byte prefix. -/
 theorem encode_shrRI_immediate (dst : GPR) (amt : BitVec 8) :
@@ -413,13 +425,13 @@ theorem decode_encode_shrRI (dst : GPR) (amt : BitVec 8) (tail : List UInt8) :
     decode (encode (.shrRI .b64 dst amt) ++ tail) = some (.shrRI .b64 dst amt, tail) := by
   cases dst <;>
     simp [encode, encInstr, osPrefix, le8, decode, u8ToBv_b8, rexRR,
-      rexByte, modrmExtR, modrmByte, gprHiBit, gprLo3_bits, gprNum, decodeRR, gprOfNum]
+      rexByte_bits, modrmExtR, modrmByte, gprHiBit_bits, gprLo3_bits, gprNum, decodeRR, gprOfNum]
 
 /-! ## 7.  `decode_encode` — the byte round-trip (left inverse). -/
 
 theorem decodeRR_roundtrip (reg rm : GPR) :
     decodeRR (rexRR OSize.b64 reg rm) (modrmRR reg rm) = (reg, rm) := by
-  simp only [decodeRR, rexRR, rexByte, modrmRR, modrmByte, gprLo3_bits, gprHiBit]
+  simp only [decodeRR, rexRR, rexByte_bits, modrmRR, modrmByte, gprLo3_bits, gprHiBit_bits]
   have hreg : gprOfNum (gprNum reg) = reg := gprOfNum_gprNum reg
   have hrm  : gprOfNum (gprNum rm)  = rm  := gprOfNum_gprNum rm
   cases reg <;> cases rm <;>
@@ -428,7 +440,7 @@ theorem decodeRR_roundtrip (reg rm : GPR) :
 theorem rexRR_b64_guard (reg rm : GPR) :
     ((rexRR OSize.b64 reg rm) >>> (4 : BitVec 8) == (0x4 : BitVec 8)) = true ∧
     (rexRR OSize.b64 reg rm).getLsbD 3 = true := by
-  cases reg <;> cases rm <;> (simp only [rexRR, rexByte, gprHiBit, gprNum]; bv_decide)
+  cases reg <;> cases rm <;> (simp only [rexRR, rexByte_bits, gprHiBit_bits, gprNum]; bv_decide)
 
 /-- The emitted register mode is checked independently of the opcode. -/
 theorem modrmRR_register_mode (reg rm : GPR) :

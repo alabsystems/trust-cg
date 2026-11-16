@@ -102,6 +102,8 @@
 
 use std::collections::{HashMap, HashSet};
 
+use crate::fast_hash::{FxHashMap, FxHashSet};
+
 use trust_cg_ir::function::StackSlotAllocationKind;
 use trust_cg_ir::x86_64_regs::{RAX, X86PReg};
 use trust_cg_ir::{InstFlags, VReg, X86CondCode, X86Opcode};
@@ -368,7 +370,7 @@ fn run_impl(
 fn hoist_loop_invariants(
     func: &mut X86ISelFunction,
     lp: &NaturalLoop,
-    def_counts: &HashMap<u32, usize>,
+    def_counts: &FxHashMap<u32, usize>,
     idom: &crate::fast_hash::FxHashMap<Block, Block>,
     hoist_invariant_loads: bool,
     hoist_flag_arith: bool,
@@ -413,13 +415,13 @@ fn hoist_loop_invariants(
     };
 
     // VRegs proven loop-invariant so far (transitive closure seed).
-    let mut invariant_vregs: HashSet<VReg> = HashSet::new();
+    let mut invariant_vregs: FxHashSet<VReg> = FxHashSet::default();
 
     // Instructions to hoist, identified by (source_block, index_within_block).
     // We resolve to concrete instructions at the end to avoid index churn while
     // iterating.
     let mut to_hoist: Vec<(Block, usize)> = Vec::new();
-    let mut hoisted_set: HashSet<(Block, usize)> = HashSet::new();
+    let mut hoisted_set: FxHashSet<(Block, usize)> = FxHashSet::default();
 
     let mut found_new = true;
     while found_new {
@@ -701,9 +703,9 @@ fn call_splice_flag_safe(func: &X86ISelFunction, preheader: Block, insert_pos: u
 fn recognize_pure_call_cluster(
     block: &trust_cg_lower::X86ISelBlock,
     call_idx: usize,
-    loop_defs: &HashMap<u32, Block>,
-    invariant_vregs: &HashSet<VReg>,
-    def_counts: &HashMap<u32, usize>,
+    loop_defs: &FxHashMap<u32, Block>,
+    invariant_vregs: &FxHashSet<VReg>,
+    def_counts: &FxHashMap<u32, usize>,
 ) -> Option<(usize, usize)> {
     let call = &block.insts[call_idx];
 
@@ -791,9 +793,9 @@ fn eval_cc(cc: X86CondCode, a: i64, b: i64) -> Option<bool> {
 /// range, or with unknown inputs, are left unknown so downstream evaluation
 /// fails safe). Handles only the small opcode set the frontend's counted-loop
 /// guard lowering uses; every other opcode leaves its def unknown.
-fn interp_const_defs(block: &trust_cg_lower::X86ISelBlock, vals: &mut HashMap<VReg, i64>) {
+fn interp_const_defs(block: &trust_cg_lower::X86ISelBlock, vals: &mut FxHashMap<VReg, i64>) {
     const MAXV: i64 = i32::MAX as i64;
-    let record = |vals: &mut HashMap<VReg, i64>, d: VReg, v: i64| {
+    let record = |vals: &mut FxHashMap<VReg, i64>, d: VReg, v: i64| {
         if (0..=MAXV).contains(&v) {
             vals.insert(d, v);
         } else {
@@ -893,7 +895,7 @@ fn loop_first_entry(
         b = up;
     }
     chain.reverse();
-    let mut vals: HashMap<VReg, i64> = HashMap::new();
+    let mut vals: FxHashMap<VReg, i64> = FxHashMap::default();
     for blk in &chain {
         if let Some(bb) = func.blocks.get(blk) {
             interp_const_defs(bb, &mut vals);
@@ -1080,7 +1082,7 @@ fn call_may_move_ahead_of(inst: &X86ISelInst) -> bool {
 fn hoist_pure_call_clusters(
     func: &mut X86ISelFunction,
     lp: &NaturalLoop,
-    def_counts: &HashMap<u32, usize>,
+    def_counts: &FxHashMap<u32, usize>,
     idom: &crate::fast_hash::FxHashMap<Block, Block>,
     eh_call_blocks: &HashSet<Block>,
 ) -> bool {
@@ -1122,7 +1124,7 @@ fn hoist_pure_call_clusters(
     // v1 does not chain a hoisted cluster's result into a later cluster's
     // invariance, so the loop-defined-invariant seed stays empty: arg sources
     // must be defined OUTSIDE the loop.
-    let invariant_vregs: HashSet<VReg> = HashSet::new();
+    let invariant_vregs: FxHashSet<VReg> = FxHashSet::default();
 
     // Discover clusters in the first iteration's execution order: the path's
     // blocks in order, each in ascending index. The walk stops at the first
@@ -1239,7 +1241,7 @@ fn hoist_pure_call_clusters(
 /// Returns the single SSA def VReg of `inst` iff `inst` satisfies every
 /// machine-movement precondition (purity, no flag/memory/call/fixed-register
 /// coupling, single whole-function def). Mirrors the AArch64 LICM gate set.
-fn hoistable_def(inst: &X86ISelInst, def_counts: &HashMap<u32, usize>) -> Option<VReg> {
+fn hoistable_def(inst: &X86ISelInst, def_counts: &FxHashMap<u32, usize>) -> Option<VReg> {
     let flags = inst.flags;
 
     // Pure memory effect only (no load/store/call/barrier).
@@ -1446,7 +1448,7 @@ fn x86_fully_defines_flags(opcode: X86Opcode) -> bool {
 /// abstract operands, and no flag *read*. Flag WRITES are permitted here (unlike
 /// [`hoistable_def`]); the caller additionally proves the written flags dead via
 /// [`rflags_dead_after_site`] and [`preheader_flag_hoist_safe`].
-fn hoistable_flag_arith(inst: &X86ISelInst, def_counts: &HashMap<u32, usize>) -> Option<VReg> {
+fn hoistable_flag_arith(inst: &X86ISelInst, def_counts: &FxHashMap<u32, usize>) -> Option<VReg> {
     let flags = inst.flags;
 
     if !is_hoistable_flag_arith_opcode(inst.opcode) {
@@ -1561,9 +1563,9 @@ fn preheader_flag_hoist_safe(func: &X86ISelFunction, preheader: Block, header: B
 /// stack slot, block, ...) is not.
 fn is_operand_loop_invariant(
     operand: &X86ISelOperand,
-    loop_defs: &HashMap<u32, Block>,
-    invariant_vregs: &HashSet<VReg>,
-    def_counts: &HashMap<u32, usize>,
+    loop_defs: &FxHashMap<u32, Block>,
+    invariant_vregs: &FxHashSet<VReg>,
+    def_counts: &FxHashMap<u32, usize>,
 ) -> bool {
     match operand {
         X86ISelOperand::VReg(v) => {
@@ -1651,9 +1653,9 @@ fn outer_iv_invariance_enabled() -> bool {
 
 fn is_vreg_loop_invariant(
     v: VReg,
-    loop_defs: &HashMap<u32, Block>,
-    invariant_vregs: &HashSet<VReg>,
-    def_counts: &HashMap<u32, usize>,
+    loop_defs: &FxHashMap<u32, Block>,
+    invariant_vregs: &FxHashSet<VReg>,
+    def_counts: &FxHashMap<u32, usize>,
 ) -> bool {
     is_vreg_loop_invariant_with(
         v,
@@ -1671,9 +1673,9 @@ fn is_vreg_loop_invariant(
 /// binary, and an untestable enabled path is not worth having.
 fn is_vreg_loop_invariant_with(
     v: VReg,
-    loop_defs: &HashMap<u32, Block>,
-    invariant_vregs: &HashSet<VReg>,
-    def_counts: &HashMap<u32, usize>,
+    loop_defs: &FxHashMap<u32, Block>,
+    invariant_vregs: &FxHashSet<VReg>,
+    def_counts: &FxHashMap<u32, usize>,
     allow_outer_iv: bool,
 ) -> bool {
     let single_def = def_counts.get(&v.id).copied().unwrap_or(0) == 1;
@@ -1800,13 +1802,13 @@ fn plain_store_width(opcode: X86Opcode) -> Option<i64> {
 /// loop's hoist is materialized.
 struct LoadTierAnalysis {
     /// Slots written by at least one in-loop store (slot-granular).
-    stored_slots: HashSet<u32>,
+    stored_slots: FxHashSet<u32>,
     /// Slots whose address is ever materialized (function-wide).
-    escaped_slots: HashSet<u32>,
+    escaped_slots: FxHashSet<u32>,
     /// Whole-function def sites (only meaningful for single-def vregs).
-    def_sites: HashMap<VReg, (Block, usize)>,
+    def_sites: FxHashMap<VReg, (Block, usize)>,
     /// Whole-function directly `[StackSlot]`-addressed stores, per slot.
-    direct_slot_stores: HashMap<u32, Vec<(Block, usize)>>,
+    direct_slot_stores: FxHashMap<u32, Vec<(Block, usize)>>,
 }
 
 impl LoadTierAnalysis {
@@ -1817,7 +1819,7 @@ impl LoadTierAnalysis {
     fn compute(
         func: &X86ISelFunction,
         lp: &NaturalLoop,
-        def_counts: &HashMap<u32, usize>,
+        def_counts: &FxHashMap<u32, usize>,
         idom: &crate::fast_hash::FxHashMap<Block, Block>,
     ) -> Option<Self> {
         let def_sites = build_def_sites(func);
@@ -1825,7 +1827,7 @@ impl LoadTierAnalysis {
         let direct_slot_stores = build_direct_slot_stores(func);
 
         let mut analysis = LoadTierAnalysis {
-            stored_slots: HashSet::new(),
+            stored_slots: FxHashSet::default(),
             escaped_slots,
             def_sites,
             direct_slot_stores,
@@ -1833,7 +1835,7 @@ impl LoadTierAnalysis {
 
         // Scan every instruction of the loop body. Any single instruction we
         // cannot account for disables the tier for the whole loop.
-        let mut stored_slots: HashSet<u32> = HashSet::new();
+        let mut stored_slots: FxHashSet<u32> = FxHashSet::default();
         for block_id in &func.block_order {
             if !lp.body.contains(block_id) {
                 continue;
@@ -1866,7 +1868,7 @@ impl LoadTierAnalysis {
 fn resolve_plain_store_slot(
     func: &X86ISelFunction,
     inst: &X86ISelInst,
-    def_counts: &HashMap<u32, usize>,
+    def_counts: &FxHashMap<u32, usize>,
     idom: &crate::fast_hash::FxHashMap<Block, Block>,
     analysis: &LoadTierAnalysis,
 ) -> Option<u32> {
@@ -1913,7 +1915,7 @@ fn resolve_plain_store_slot(
 fn resolve_frame_address(
     func: &X86ISelFunction,
     v: VReg,
-    def_counts: &HashMap<u32, usize>,
+    def_counts: &FxHashMap<u32, usize>,
     idom: &crate::fast_hash::FxHashMap<Block, Block>,
     analysis: &LoadTierAnalysis,
     fuel: u32,
@@ -1994,7 +1996,7 @@ fn forward_pointer_through_slot(
     q: u32,
     qoff: i64,
     load_site: (Block, usize),
-    def_counts: &HashMap<u32, usize>,
+    def_counts: &FxHashMap<u32, usize>,
     idom: &crate::fast_hash::FxHashMap<Block, Block>,
     analysis: &LoadTierAnalysis,
     fuel: u32,
@@ -2153,13 +2155,13 @@ struct LoadSite<'a> {
     idx: usize,
     lp: &'a NaturalLoop,
     /// `(block, index)` pairs already committed to this loop's hoist list.
-    hoisted: &'a HashSet<(Block, usize)>,
+    hoisted: &'a FxHashSet<(Block, usize)>,
     /// Whether the POINTER-BASE arm is enabled. DEFAULT ON — see
     /// [`pointer_base_load_is_hoistable`] for both measurements.
     pointer_base_loads: bool,
     /// Vregs defined INSIDE the loop body. A per-loop fact, carried here so the
     /// hoist predicate stays inside clippy's argument budget.
-    loop_defs: &'a HashMap<u32, Block>,
+    loop_defs: &'a FxHashMap<u32, Block>,
 }
 
 /// Whether `inst` can neither FAULT nor transfer control.
@@ -2321,7 +2323,7 @@ fn pointer_base_load_is_hoistable(
     site: &LoadSite<'_>,
     tier: &LoadTierAnalysis,
     base: VReg,
-    loop_defs: &HashMap<u32, Block>,
+    loop_defs: &FxHashMap<u32, Block>,
 ) -> bool {
     if !site.pointer_base_loads {
         return false;
@@ -2382,8 +2384,8 @@ fn hoistable_invariant_load(
     func: &X86ISelFunction,
     inst: &X86ISelInst,
     tier: &LoadTierAnalysis,
-    invariant_vregs: &HashSet<VReg>,
-    def_counts: &HashMap<u32, usize>,
+    invariant_vregs: &FxHashSet<VReg>,
+    def_counts: &FxHashMap<u32, usize>,
     idom: &crate::fast_hash::FxHashMap<Block, Block>,
     site: &LoadSite<'_>,
 ) -> Option<VReg> {
@@ -2472,8 +2474,8 @@ fn hoistable_invariant_load(
 /// Whole-function def sites. Only consulted for single-def vregs; for
 /// multi-def vregs the recorded (last) site is never used because callers
 /// check `def_counts` first.
-fn build_def_sites(func: &X86ISelFunction) -> HashMap<VReg, (Block, usize)> {
-    let mut sites: HashMap<VReg, (Block, usize)> = HashMap::new();
+fn build_def_sites(func: &X86ISelFunction) -> FxHashMap<VReg, (Block, usize)> {
+    let mut sites: FxHashMap<VReg, (Block, usize)> = FxHashMap::default();
     for block_id in &func.block_order {
         let Some(block) = func.blocks.get(block_id) else {
             continue;
@@ -2491,8 +2493,8 @@ fn build_def_sites(func: &X86ISelFunction) -> HashMap<VReg, (Block, usize)> {
 /// referenced only as the direct base of load/store memory operands never has
 /// its address taken; `Lea` of the slot (or any non-memory-access appearance)
 /// escapes it. Conservative: unknown shapes escape.
-fn compute_escaped_slots(func: &X86ISelFunction) -> HashSet<u32> {
-    let mut escaped: HashSet<u32> = HashSet::new();
+fn compute_escaped_slots(func: &X86ISelFunction) -> FxHashSet<u32> {
+    let mut escaped: FxHashSet<u32> = FxHashSet::default();
     for block_id in &func.block_order {
         let Some(block) = func.blocks.get(block_id) else {
             continue;
@@ -2516,7 +2518,7 @@ fn compute_escaped_slots(func: &X86ISelFunction) -> HashSet<u32> {
 fn mark_escaping_slots(
     operand: &X86ISelOperand,
     is_memory_access: bool,
-    escaped: &mut HashSet<u32>,
+    escaped: &mut FxHashSet<u32>,
 ) {
     match operand {
         // A bare slot operand is an address use (frame-address
@@ -2554,8 +2556,8 @@ fn mark_escaping_slots(
 
 /// Whole-function directly `[StackSlot]`-addressed stores, per slot. These are
 /// the only possible writers of a non-escaped slot.
-fn build_direct_slot_stores(func: &X86ISelFunction) -> HashMap<u32, Vec<(Block, usize)>> {
-    let mut stores: HashMap<u32, Vec<(Block, usize)>> = HashMap::new();
+fn build_direct_slot_stores(func: &X86ISelFunction) -> FxHashMap<u32, Vec<(Block, usize)>> {
+    let mut stores: FxHashMap<u32, Vec<(Block, usize)>> = FxHashMap::default();
     for block_id in &func.block_order {
         let Some(block) = func.blocks.get(block_id) else {
             continue;
@@ -2591,8 +2593,8 @@ fn build_direct_slot_stores(func: &X86ISelFunction) -> HashMap<u32, Vec<(Block, 
 
 /// May-write identity is the register ID, independent of its width/class view.
 /// Count each ID once per instruction, including implicit exchange/CAS writes.
-fn build_def_counts(func: &X86ISelFunction) -> HashMap<u32, usize> {
-    let mut counts = HashMap::new();
+fn build_def_counts(func: &X86ISelFunction) -> FxHashMap<u32, usize> {
+    let mut counts = FxHashMap::default();
     for block_id in &func.block_order {
         let Some(block) = func.blocks.get(block_id) else {
             continue;
@@ -2609,8 +2611,8 @@ fn build_def_counts(func: &X86ISelFunction) -> HashMap<u32, usize> {
 fn build_loop_defs(
     func: &X86ISelFunction,
     body: &crate::fast_hash::FxHashSet<Block>,
-) -> HashMap<u32, Block> {
-    let mut defs = HashMap::new();
+) -> FxHashMap<u32, Block> {
+    let mut defs = FxHashMap::default();
     for block_id in &func.block_order {
         if !body.contains(block_id) {
             continue;
@@ -2912,7 +2914,7 @@ fn region_def_of(inst: &X86ISelInst) -> Option<VReg> {
 fn verify_preheader_defs_precede_uses(
     func: &X86ISelFunction,
     preheader: Block,
-    def_counts: &HashMap<u32, usize>,
+    def_counts: &FxHashMap<u32, usize>,
 ) {
     // Both production callers (`hoist_loop_invariants`, `hoist_pure_call_clusters`)
     // reach this only after splicing through a `blocks.get_mut(&preheader)`
@@ -3584,8 +3586,8 @@ fn gh_const_of(
     block: &trust_cg_lower::X86ISelBlock,
     upto: usize,
     v: VReg,
-    def_counts: &HashMap<u32, usize>,
-    def_sites: &HashMap<VReg, (Block, usize)>,
+    def_counts: &FxHashMap<u32, usize>,
+    def_sites: &FxHashMap<VReg, (Block, usize)>,
 ) -> Option<i64> {
     let (cur, pos) = gh_resolve_copies(block, upto, v);
     match gh_nearest_local_def(block, pos, cur) {
@@ -3617,8 +3619,8 @@ fn gh_term_of(
     block: &trust_cg_lower::X86ISelBlock,
     upto: usize,
     v: VReg,
-    def_counts: &HashMap<u32, usize>,
-    def_sites: &HashMap<VReg, (Block, usize)>,
+    def_counts: &FxHashMap<u32, usize>,
+    def_sites: &FxHashMap<VReg, (Block, usize)>,
 ) -> (VReg, i64, usize) {
     let (cur, pos) = gh_resolve_copies(block, upto, v);
     // Local def, else the single-def site for a live-in (value fixed there).
@@ -3707,8 +3709,8 @@ fn gh_resolve_sym_addr(
     block_id: Block,
     upto: usize,
     v: VReg,
-    def_counts: &HashMap<u32, usize>,
-    def_sites: &HashMap<VReg, (Block, usize)>,
+    def_counts: &FxHashMap<u32, usize>,
+    def_sites: &FxHashMap<VReg, (Block, usize)>,
     fuel: u32,
 ) -> Option<GhSymAddr> {
     if fuel == 0 {
@@ -6670,10 +6672,14 @@ mod tests {
 
     // ---- outer-IV invariance relaxation ----
 
-    fn inv_inputs() -> (HashMap<u32, Block>, HashSet<VReg>, HashMap<u32, usize>) {
-        let loop_defs: HashMap<u32, Block> = HashMap::new();
-        let invariant: HashSet<VReg> = HashSet::new();
-        let mut defs: HashMap<u32, usize> = HashMap::new();
+    fn inv_inputs() -> (
+        FxHashMap<u32, Block>,
+        FxHashSet<VReg>,
+        FxHashMap<u32, usize>,
+    ) {
+        let loop_defs: FxHashMap<u32, Block> = FxHashMap::default();
+        let invariant: FxHashSet<VReg> = FxHashSet::default();
+        let mut defs: FxHashMap<u32, usize> = FxHashMap::default();
         // v7 is an ENCLOSING loop's induction variable: two defs (init and
         // increment), NEITHER inside this loop's body.
         defs.insert(7, 2);
@@ -6718,10 +6724,10 @@ mod tests {
     fn a_vreg_defined_inside_the_loop_stays_non_invariant_under_the_relaxation() {
         // THE case the relaxation must not touch: a def INSIDE the body that has
         // not been proven invariant. This is the loop's own counter.
-        let mut ld: HashMap<u32, Block> = HashMap::new();
+        let mut ld: FxHashMap<u32, Block> = FxHashMap::default();
         ld.insert(9, Block(1));
-        let iv: HashSet<VReg> = HashSet::new();
-        let mut dc: HashMap<u32, usize> = HashMap::new();
+        let iv: FxHashSet<VReg> = FxHashSet::default();
+        let mut dc: FxHashMap<u32, usize> = FxHashMap::default();
         dc.insert(9, 2);
         for relax in [false, true] {
             assert!(

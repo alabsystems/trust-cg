@@ -4686,7 +4686,7 @@ fn validate_core_constant_binding(
 
     match constant {
         Constant::Ext(e) => e.unreachable(),
-        Constant::FnDef(target) => validate_function_target(*target),
+        Constant::FnDef(target) | Constant::FnItem(target) => validate_function_target(*target),
         Constant::Closure { func, captures } => {
             validate_function_target(*func)?;
             for capture in captures {

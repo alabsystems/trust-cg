@@ -421,6 +421,152 @@ const EXPECTED_REASON: &[(&str, &str, &str)] = &[
     // the convention is refused before the definition's `Invoke` reaches the
     // unwired-EH scan.
     ("calling_conv_c_unwind_definition", "wasm-object", "CUnwind"),
+    // trust-ir v74 `Inst::BoxDeref` (the pinned Box validity
+    // lane, not a landed pin). Every row is refused on every lane by the
+    // instruction's own verdict: a fact rule trust-ir names, the tier floor
+    // (the default license admits no premise tier; the policy-free funnels
+    // hold the assumed roots to `named_premise` before it), or the reader.
+    (
+        "box_deref_premise_tier",
+        "*",
+        "backed at tier named_premise",
+    ),
+    (
+        "box_deref_assumed_root_tier",
+        "*",
+        "backed at tier assumed_root_premise",
+    ),
+    ("box_deref_operand_not_ptr", "*", "BoxDerefTypeMismatch"),
+    (
+        "box_deref_pointee_zero_sized",
+        "*",
+        "BoxDerefPointeeOutOfScope",
+    ),
+    (
+        "box_deref_pointee_uninhabited",
+        "*",
+        "BoxDerefPointeeOutOfScope",
+    ),
+    ("box_deref_conjunct_missing", "*", "BoxDerefConjunctCover"),
+    (
+        "box_deref_conjunct_duplicated",
+        "*",
+        "BoxDerefConjunctCover",
+    ),
+    (
+        "box_deref_conjunct_misordered",
+        "*",
+        "BoxDerefConjunctCover",
+    ),
+    (
+        "box_deref_metadata_valid_on_sized",
+        "*",
+        "BoxDerefConjunctCover",
+    ),
+    (
+        "box_deref_premise_standing_dropped",
+        "*",
+        "BoxDerefPremiseNotPinned",
+    ),
+    ("box_deref_session_fallback", "*", "BoxDerefSessionRefused"),
+    ("box_deref_session_not_proof", "*", "BoxDerefSessionRefused"),
+    (
+        "box_deref_check_pinned_shape",
+        "*",
+        "BoxDerefDominatingCheckInvalid",
+    ),
+    (
+        "box_deref_check_address_round_trip",
+        "*",
+        "BoxDerefDominatingCheckInvalid",
+    ),
+    (
+        "box_deref_check_for_dereferenceable",
+        "*",
+        "BoxDerefDominatingCheckInvalid",
+    ),
+    (
+        "box_deref_check_wrong_alignment",
+        "*",
+        "BoxDerefDominatingCheckInvalid",
+    ),
+    (
+        "box_deref_check_absent",
+        "*",
+        "BoxDerefDominatingCheckInvalid",
+    ),
+    (
+        "box_deref_check_not_dominating",
+        "*",
+        "BoxDerefDominatingCheckInvalid",
+    ),
+    (
+        "box_deref_check_on_operand",
+        "*",
+        "BoxDerefDominatingCheckInvalid",
+    ),
+    (
+        "box_deref_obligation_missing",
+        "*",
+        "BoxDerefObligationUnbound",
+    ),
+    (
+        "box_deref_obligation_wrong_kind",
+        "*",
+        "BoxDerefObligationUnbound",
+    ),
+    (
+        "box_deref_obligation_wrong_function",
+        "*",
+        "BoxDerefObligationUnbound",
+    ),
+    (
+        "box_deref_obligation_wrong_site",
+        "*",
+        "BoxDerefObligationUnbound",
+    ),
+    (
+        "box_deref_obligation_not_replayed",
+        "*",
+        "BoxDerefObligationUnbound",
+    ),
+    (
+        "box_deref_non_claim_dropped",
+        "*",
+        "BoxDerefNonClaimsNotPinned",
+    ),
+    (
+        "box_deref_premise_null_operand",
+        "*",
+        "BoxDerefPremiseContradicted",
+    ),
+    (
+        "box_deref_premise_inttoptr_operand",
+        "*",
+        "BoxDerefPremiseContradicted",
+    ),
+    (
+        "box_deref_premise_param_root_without_parameter",
+        "*",
+        "BoxDerefPremiseContradicted",
+    ),
+    (
+        "box_deref_premise_alloc_root_without_allocation",
+        "*",
+        "BoxDerefPremiseContradicted",
+    ),
+    (
+        "box_deref_premise_freed_operand",
+        "*",
+        "BoxDerefPremiseContradicted",
+    ),
+    (
+        "box_deref_premise_mixed_roots",
+        "*",
+        "BoxDerefPremiseContradicted",
+    ),
+    ("blob_box_deref_below_its_version", "*", "invalid tag: 77"),
+    ("blob_box_deref_premise_root_unknown", "*", "invalid tag: 9"),
 ];
 
 /// Whether an [`EXPECTED_REASON`] lane spec covers `lane`.

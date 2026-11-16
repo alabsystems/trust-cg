@@ -89,7 +89,7 @@ class SentinelCleanUnitTest(unittest.TestCase):
     def test_complete_actual_unit_is_kernel_checked(self):
         result = self.check_package("actual_sentinel")
         self.assertEqual(result.returncode, 0, result.stdout)
-        self.assertRegex(result.stdout, r"Clean island kernel-checked: 170 declaration\(s\) registered")
+        self.assertRegex(result.stdout, r"Clean island kernel-checked: 179 declaration\(s\) registered")
         self.assertIn("TrustCg.Fnv128Carry.full_step_source_value", result.stdout)
         self.assertEqual(hashlib.sha256(self.source.read_bytes()).hexdigest(), self.source_hash)
 

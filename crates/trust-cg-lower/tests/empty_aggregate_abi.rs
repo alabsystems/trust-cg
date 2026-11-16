@@ -35,8 +35,8 @@ fn empty_parameters_preserve_scalar_registers_and_overflow_offsets() {
             let mut expected = vec![ArgLocation::Ignore, ArgLocation::Ignore];
             for index in 0..scalars {
                 params.extend([Type::I64, empty()]);
-                expected.push(if index < 8 {
-                    ArgLocation::Reg(registers[index])
+                expected.push(if let Some(register) = registers.get(index).copied() {
+                    ArgLocation::Reg(register)
                 } else {
                     ArgLocation::Stack {
                         offset: (index as i64 - 8) * 8,

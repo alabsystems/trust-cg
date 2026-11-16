@@ -44,6 +44,8 @@ GUARD_TEST_NAMES = {
         "every_raiser_is_an_inst_variant_or_a_pseudo_raiser",
         "every_restricted_owed_shape_accepts_an_admitted_instance",
         "interpreter_ub_sites_are_exactly_the_map",
+        "typed_abi_entry_ub_cannot_receive_a_body_only_verdict",
+        "abi_contract_boundary_includes_unused_types_and_legacy_parameters",
         "leaf_interpreter_modules_reach_no_ub_site",
         "named_ub_message_is_resolved_before_an_unrelated_later_literal",
         "non_test_census_preserves_production_after_test_modules",

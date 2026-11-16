@@ -323,6 +323,7 @@ pub fn x86_64_alloc_config() -> crate::AllocConfig {
         hints: BTreeMap::new(),
         callee_saved_regs: x86_64_callee_saved_regs(),
         coalesce_tuning: x86_64_coalesce_tuning(),
+        avoid_claimed_hint_regs: false,
     }
 }
 
@@ -340,6 +341,7 @@ pub fn x86_64_greedy_alloc_config() -> crate::AllocConfig {
         hints: BTreeMap::new(),
         callee_saved_regs: x86_64_callee_saved_regs(),
         coalesce_tuning: x86_64_coalesce_tuning(),
+        avoid_claimed_hint_regs: false,
     }
 }
 

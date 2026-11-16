@@ -428,7 +428,7 @@ impl<'m> Interpreter<'m> {
                             ));
                         }
                         let result_vid = node.results[0];
-                        let val = self.eval_constant(value);
+                        let val = self.eval_constant(value)?;
                         regs.insert(result_vid, val);
                     }
 
@@ -755,8 +755,21 @@ impl<'m> Interpreter<'m> {
             .ok_or(InterpreterError::ValueNotFound(vid))
     }
 
-    fn eval_constant(&self, c: &Constant) -> InterpreterValue {
-        match c {
+    fn eval_constant(&self, c: &Constant) -> Result<InterpreterValue, InterpreterError> {
+        if c.try_visit_constants(|nested| {
+            if matches!(nested, Constant::FnItem(_)) {
+                std::ops::ControlFlow::Break(())
+            } else {
+                std::ops::ControlFlow::Continue(())
+            }
+        })
+        .is_break()
+        {
+            return Err(InterpreterError::Unsupported(
+                "Constant::FnItem has no diagnostic nominal-identity model".into(),
+            ));
+        }
+        Ok(match c {
             Constant::Ext(e) => e.unreachable(),
             Constant::Int(v) => InterpreterValue::Int(*v),
             Constant::Float(v) => InterpreterValue::Float(*v),
@@ -787,10 +800,11 @@ impl<'m> Interpreter<'m> {
             // is exercised by link+run differential testing instead).
             | Constant::SymbolAddr { .. }
             | Constant::PhantomData => InterpreterValue::Undef,
-            // v49: an unwritten lane is no value; every use of `Undef` here
-            // is a type mismatch, so nothing reads it as one.
+            // Legacy diagnostic fallback for values this simplified oracle
+            // does not represent; this is no source or native validity claim.
             Constant::TensorBlob { .. } | Constant::Uninit => InterpreterValue::Undef,
-        }
+            Constant::FnItem(_) => return Err(InterpreterError::Unsupported("Constant::FnItem has no diagnostic nominal-identity model".into())),
+        })
     }
 
     fn eval_binop(
@@ -1194,6 +1208,14 @@ pub fn interpret_with_config(
         ));
     }
 
+    let mut nominal = false;
+    module.visit_types(|ty| nominal |= matches!(ty, Ty::FnItem(_)));
+    if nominal {
+        return Err(InterpreterError::Unsupported(
+            "FnItem types have no diagnostic nominal-identity model".into(),
+        ));
+    }
+
     let func = module
         .functions
         .iter()
@@ -1232,7 +1254,23 @@ mod tests {
             Constant::Int(0),
         ]));
 
-        assert!(matches!(value, InterpreterValue::Undef));
+        assert!(matches!(value, Ok(InterpreterValue::Undef)));
+    }
+
+    #[test]
+    fn test_interpreter_nominal_constants_refuse_even_inside_aggregate_fallbacks() {
+        let module = TrustIrModule::new("nominal_constant_refusal");
+        let interp = Interpreter::new(&module, InterpreterConfig::default());
+        for id in [0, 1] {
+            for value in [
+                Constant::FnItem(FuncId::new(id)),
+                Constant::Aggregate(vec![Constant::FnItem(FuncId::new(id))]),
+            ] {
+                assert!(
+                    matches!(interp.eval_constant(&value), Err(InterpreterError::Unsupported(reason)) if reason.contains("FnItem"))
+                );
+            }
+        }
     }
 
     #[test]

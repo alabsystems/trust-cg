@@ -11,7 +11,12 @@ import os
 from pathlib import Path
 import re
 import signal
+import shlex
+import shutil
 import subprocess
+import sys
+
+from bump_trust_ir_pin import resource_fds
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -31,7 +36,24 @@ def main():
     parser.add_argument('--out-dir', type=Path, required=True)
     parser.add_argument('--only', action='append', default=[])
     parser.add_argument('--timeout', type=int, default=30)
+    parser.add_argument('--_admitted', action='store_true', help=argparse.SUPPRESS)
     args = parser.parse_args()
+    if not args._admitted:
+        gate = shutil.which('build-slot')
+        make = shutil.which('make')
+        if gate is None or make is None:
+            raise SystemExit('build-slot and GNU Make are required for native compiler resource custody')
+        version = subprocess.check_output([make, '--version'], text=True,
+            pass_fds=resource_fds(os.environ))
+        if not version.startswith('GNU Make '):
+            raise SystemExit('the source probe requires a genuine GNU Make jobserver')
+        recipe = '.PHONY: probe\nprobe:\n\t+' + shlex.join([
+            sys.executable, str(Path(__file__).resolve()), '--_admitted', *sys.argv[1:],
+        ]) + '\n'
+        raise SystemExit(subprocess.run(
+            [gate, '--cpus', '2', '--mem-gb', '4', '--', make, '-j2', '-f', '-', 'probe'],
+            input=recipe, text=True, cwd=ROOT, pass_fds=resource_fds(os.environ),
+        ).returncode)
     args.out_dir.mkdir(parents=True, exist_ok=True)
     if any(args.out_dir.iterdir()):
         raise SystemExit('output directory must be empty')
@@ -48,7 +70,8 @@ def main():
             imports=re.findall(r'^import\s+([^\n]+)', text, re.M),
             status='unmeasured', consumer_binding='unproved'))
     (out / 'inventory.json').write_text(json.dumps(rows, indent=2) + '\n')
-    version = subprocess.check_output(['trustc', '-Vv'], text=True)
+    version = subprocess.check_output(['trustc', '-Vv'], text=True,
+        pass_fds=resource_fds(os.environ))
     (out / 'compiler.txt').write_text(version)
     if 'trust:' not in version:
         raise SystemExit('compiler is not Trust')
@@ -68,7 +91,8 @@ def main():
                    str(wrapper), '-o', str(out / stem)]
         with (out / (stem + '.log')).open('wb') as log:
             child = subprocess.Popen(command, cwd=ROOT, stdout=log,
-                stderr=subprocess.STDOUT, start_new_session=True)
+                stderr=subprocess.STDOUT, start_new_session=True,
+                pass_fds=resource_fds(os.environ))
             try:
                 code = child.wait(timeout=args.timeout)
             except subprocess.TimeoutExpired:

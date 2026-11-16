@@ -202,6 +202,11 @@ pub fn check_function(function: &Function) -> InitCheckResult {
                 | Inst::HeapAlloc { .. }
                 | Inst::Copy { .. }
                 | Inst::Cast { .. }
+                // trust-ir v67: a pointer-to-pointer identity. It reads and
+                // writes no memory, and it initializes nothing: its validity
+                // fact is a named assumption, never evidence that the
+                // pointee was written.
+                | Inst::BoxDeref { .. }
                 | Inst::BinOp { .. }
                 | Inst::UnOp { .. }
                 | Inst::Overflow { .. }

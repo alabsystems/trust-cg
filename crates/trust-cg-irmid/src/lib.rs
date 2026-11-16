@@ -350,6 +350,31 @@ pub fn optimize_module(module: &Module, config: &MidConfig) -> (Module, IrmidRep
                 );
                 return (module.clone(), report);
             }
+            // trust-ir v74 `Inst::BoxDeref` is undefined behaviour unless its
+            // operand is valid as a Box, and that undefined behaviour is not
+            // a licence: no pass may use it, or the carried named
+            // assumption, to remove a check or a branch or to move or
+            // introduce a memory access (`SPEC_RATIFICATIONS` section 28). No
+            // pass here models the instruction, and several classify
+            // instructions through a wildcard, so a module holding one is
+            // left exactly as it was received.
+            if let Some(func) = module.functions.iter().find(|f| {
+                f.blocks
+                    .iter()
+                    .flat_map(|b| &b.body)
+                    .any(|n| matches!(n.inst, trust_ir::Inst::BoxDeref { .. }))
+            }) {
+                let report = IrmidReport::not_run(
+                    config.profile,
+                    format!(
+                        "function `{}` holds a Box deref (trust-ir v74 `Inst::BoxDeref`); no \
+                         pass models its carried validity fact, and the fact licenses no \
+                         transformation",
+                        func.name
+                    ),
+                );
+                return (module.clone(), report);
+            }
             if let Some(func) = module
                 .functions
                 .iter()

@@ -838,6 +838,7 @@ pub(crate) fn inst_name(inst: &Inst) -> &'static str {
         Inst::InvokeIndirect { .. } => "InvokeIndirect",
         Inst::MakeAggregate { .. } => "MakeAggregate",
         Inst::MakeClosure { .. } => "MakeClosure",
+        Inst::BoxDeref { .. } => "BoxDeref",
         Inst::ArraySplat { .. } => "ArraySplat",
         Inst::ExtractField { .. } => "ExtractField",
         Inst::InsertField { .. } => "InsertField",

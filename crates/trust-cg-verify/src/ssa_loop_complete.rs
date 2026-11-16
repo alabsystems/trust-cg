@@ -881,9 +881,13 @@ fn check_loop_completeness(
         // computed from that param inside the loop). A back-edge arg "belongs to"
         // slot j iff it equals param j or lies in param j's derivations — i.e. it
         // is the reaching definition of slot j's loop variable.
+        // One index of the loop's derivation edges serves every slot and both
+        // closures below; it is a function of the loop alone (see
+        // [`DerivationIndex`]).
+        let derivation_index = DerivationIndex::new(function, &loop_blocks, header);
         let param_derivations: Vec<(ValueId, BTreeSet<ValueId>)> = header_params
             .iter()
-            .map(|&p| (p, in_loop_derivations(function, &loop_blocks, p, None)))
+            .map(|&p| (p, derivation_index.derivations(p, false)))
             .collect();
         let belongs_to = |arg: ValueId, idx: usize| -> bool {
             let (p, derivs) = &param_derivations[idx];
@@ -902,7 +906,7 @@ fn check_loop_completeness(
         // other-slot evidence below is unchanged.
         let own_slot_derivations: Vec<BTreeSet<ValueId>> = header_params
             .iter()
-            .map(|&p| in_loop_derivations(function, &loop_blocks, p, Some(header)))
+            .map(|&p| derivation_index.derivations(p, true))
             .collect();
         let belongs_to_own = |arg: ValueId, idx: usize| -> bool {
             belongs_to(arg, idx) || own_slot_derivations[idx].contains(&arg)
@@ -1140,6 +1144,10 @@ fn in_loop_copy_chain(
 /// constant, an out-of-loop value) is not entered, and a param with no incoming
 /// edge is not entered. Header params are the slots themselves and are never
 /// entered.
+///
+/// The reference definition: production asks [`DerivationIndex`], which
+/// `derivation_index_matches_fixpoint` holds to this function.
+#[cfg(test)]
 fn in_loop_derivations(
     function: &Function,
     loop_blocks: &HashSet<BlockId>,
@@ -1149,27 +1157,10 @@ fn in_loop_derivations(
     // Every in-loop join param with the full list of edge arguments that flow
     // into it (collected over all blocks, so an out-of-loop predecessor keeps
     // the param out of the closure).
-    let mut join_incoming: Vec<(ValueId, Vec<ValueId>)> = Vec::new();
-    if let Some(header) = through_joins {
-        for join in &function.blocks {
-            if join.id == header || !loop_blocks.contains(&join.id) {
-                continue;
-            }
-            for (index, (param, _)) in join.params.iter().enumerate() {
-                let mut incoming = Vec::new();
-                for pred in &function.blocks {
-                    for (target, args) in terminator_edges(pred) {
-                        if target == join.id
-                            && let Some(arg) = args.get(index)
-                        {
-                            incoming.push(*arg);
-                        }
-                    }
-                }
-                join_incoming.push((*param, incoming));
-            }
-        }
-    }
+    let join_incoming: Vec<(ValueId, Vec<ValueId>)> = match through_joins {
+        Some(header) => join_incoming_args(function, loop_blocks, header),
+        None => Vec::new(),
+    };
     let mut reachable: HashSet<ValueId> = HashSet::from([seed]);
     let mut derived: BTreeSet<ValueId> = BTreeSet::new();
     let mut changed = true;
@@ -1209,6 +1200,150 @@ fn in_loop_derivations(
         }
     }
     derived
+}
+
+/// The derivation edges of one loop, built once and shared by every
+/// [`in_loop_derivations`] question the loop's slots ask.
+///
+/// `in_loop_derivations` answers each question by re-scanning the whole loop
+/// to a fixpoint, and with `through_joins` it first rebuilds the incoming edge
+/// arguments of every in-loop join param by scanning every terminator of the
+/// function once per param. Neither depends on the seed, so the loop paid them
+/// once per header param, twice over. This index holds the same edges, built
+/// by the same scans: each in-loop non-terminator node with results, keyed by
+/// the values it consumes (`non_terminator_value_uses`), and each join param
+/// with its incoming arguments, collected exactly as `in_loop_derivations`
+/// collects them. [`DerivationIndex::derivations`] then computes the closure
+/// by a worklist. The closure is the least set containing the seed and closed
+/// under the two rules both implementations apply (a node consuming a reached
+/// value reaches all its results; a join param whose non-empty incoming list
+/// is all reached is reached), so the two return the same set;
+/// `derivation_index_matches_fixpoint` pins that on the fixtures.
+struct DerivationIndex {
+    /// Results of each indexed node.
+    node_results: Vec<Vec<ValueId>>,
+    /// Value -> the indexed nodes that consume it.
+    consumers: HashMap<ValueId, Vec<usize>>,
+    /// Every in-loop join param (any in-loop block other than the header)
+    /// with the edge arguments flowing into it, as `in_loop_derivations`
+    /// collects them.
+    joins: Vec<(ValueId, Vec<ValueId>)>,
+    /// Value -> the joins whose incoming list contains it.
+    joins_by_arg: HashMap<ValueId, Vec<usize>>,
+}
+
+impl DerivationIndex {
+    fn new(function: &Function, loop_blocks: &HashSet<BlockId>, header: BlockId) -> Self {
+        let mut node_results = Vec::new();
+        let mut consumers: HashMap<ValueId, Vec<usize>> = HashMap::new();
+        for block_id in loop_blocks {
+            let Some(block) = function_block(function, *block_id) else {
+                continue;
+            };
+            for node in &block.body {
+                if node.is_terminator() || node.results.is_empty() {
+                    continue;
+                }
+                let index = node_results.len();
+                node_results.push(node.results.clone());
+                for used in non_terminator_value_uses(&node.inst) {
+                    let list = consumers.entry(used).or_default();
+                    if list.last() != Some(&index) {
+                        list.push(index);
+                    }
+                }
+            }
+        }
+        let joins = join_incoming_args(function, loop_blocks, header);
+        let mut joins_by_arg: HashMap<ValueId, Vec<usize>> = HashMap::new();
+        for (index, (_, incoming)) in joins.iter().enumerate() {
+            for arg in incoming {
+                let list = joins_by_arg.entry(*arg).or_default();
+                if list.last() != Some(&index) {
+                    list.push(index);
+                }
+            }
+        }
+        DerivationIndex {
+            node_results,
+            consumers,
+            joins,
+            joins_by_arg,
+        }
+    }
+
+    /// `in_loop_derivations(function, loop_blocks, seed, through_joins)` for
+    /// the loop this index was built from, with `through_joins` naming its
+    /// header when `joins` is set.
+    fn derivations(&self, seed: ValueId, joins: bool) -> BTreeSet<ValueId> {
+        let mut reachable: HashSet<ValueId> = HashSet::from([seed]);
+        let mut derived: BTreeSet<ValueId> = BTreeSet::new();
+        let mut fired = vec![false; self.node_results.len()];
+        let mut work = vec![seed];
+        while let Some(value) = work.pop() {
+            if let Some(nodes) = self.consumers.get(&value) {
+                for &node in nodes {
+                    if std::mem::replace(&mut fired[node], true) {
+                        continue;
+                    }
+                    for result in &self.node_results[node] {
+                        if reachable.insert(*result) {
+                            derived.insert(*result);
+                            work.push(*result);
+                        }
+                    }
+                }
+            }
+            if !joins {
+                continue;
+            }
+            if let Some(entries) = self.joins_by_arg.get(&value) {
+                for &entry in entries {
+                    let (param, incoming) = &self.joins[entry];
+                    if !incoming.is_empty()
+                        && !reachable.contains(param)
+                        && incoming.iter().all(|arg| reachable.contains(arg))
+                    {
+                        reachable.insert(*param);
+                        derived.insert(*param);
+                        work.push(*param);
+                    }
+                }
+            }
+        }
+        derived
+    }
+}
+
+/// Every in-loop join param (the params of each block of `function.blocks`
+/// that is in the loop and is not `header`) with the full list of edge
+/// arguments flowing into it from every block of the function, in block and
+/// edge order.
+fn join_incoming_args(
+    function: &Function,
+    loop_blocks: &HashSet<BlockId>,
+    header: BlockId,
+) -> Vec<(ValueId, Vec<ValueId>)> {
+    let mut join_incoming: Vec<(ValueId, Vec<ValueId>)> = Vec::new();
+    for join in &function.blocks {
+        if join.id == header || !loop_blocks.contains(&join.id) {
+            continue;
+        }
+        for (index, (param, _)) in join.params.iter().enumerate() {
+            let mut incoming = Vec::new();
+            for pred in &function.blocks {
+                for (target, args) in terminator_edges(pred) {
+                    if target == join.id
+                        && let Some(arg) = args.get(index)
+                    {
+                        incoming.push(*arg);
+                    }
+                }
+            }
+            join_incoming.push((*param, incoming));
+        }
+    }
+    join_incoming
 }
 
 /// Best-effort static type of each value, for the same-type dropped-update check.
@@ -1479,6 +1614,9 @@ pub fn non_terminator_value_uses(inst: &Inst) -> Vec<ValueId> {
         Inst::UnOp { operand, .. } | Inst::Cast { operand, .. } | Inst::Copy { operand, .. } => {
             vec![*operand]
         }
+        // trust-ir v67: ONE value use, the box's pointer. The fact names no
+        // SSA value (obligation evidence cites a proof row, not a value).
+        Inst::BoxDeref { operand, .. } => vec![*operand],
 
         Inst::Load { ptr, .. } => vec![*ptr],
         Inst::Store { ptr, value, .. } => vec![*ptr, *value],
@@ -2108,6 +2246,122 @@ mod tests {
     /// through a header param + back-edge arg, the checker ACCEPTS the function.
     /// Guards against the checker being over-eager (false-positive fail-closed,
     /// which would reject all real loops).
+    /// A loop with an in-loop JOIN: `bb6(%20, %21)` merges `%4 = %10 + 1`
+    /// with `%10` itself (so `%20` is slot `%10`'s variable on both paths) and
+    /// `%4` with the out-of-loop `%0` (so `%21` is not).
+    ///
+    ///   bb0:  %0 = const 0 ; br bb1(%0)
+    ///   bb1(%10): %1 = const 5 ; %2 = icmp slt %10, %1 ; condbr %2, bb2, bb5
+    ///   bb2:  %3 = const 1 ; %4 = add %10, %3
+    ///         condbr %2, bb6(%4, %4), bb6(%10, %0)
+    ///   bb6(%20, %21): %5 = add %20, %21 ; br bb1(%5)
+    ///   bb5:  return %10
+    fn join_loop() -> Function {
+        let mut f = empty_fn();
+        let int = |n| Inst::Const {
+            ty: Ty::I32,
+            value: Constant::Int(n),
+        };
+        let add = |lhs, rhs| Inst::BinOp {
+            op: BinOp::Add,
+            ty: Ty::I32,
+            lhs,
+            rhs,
+        };
+        let mut bb0 = Block::new(b(0));
+        bb0.body.push(InstrNode::new(int(0)).with_result(v(0)));
+        bb0.body.push(InstrNode::new(Inst::Br {
+            target: b(1),
+            args: vec![v(0)],
+        }));
+        let mut bb1 = Block::new(b(1)).with_param(v(10), Ty::I32);
+        bb1.body.push(InstrNode::new(int(5)).with_result(v(1)));
+        bb1.body.push(
+            InstrNode::new(Inst::ICmp {
+                op: ICmpOp::Slt,
+                ty: Ty::I32,
+                lhs: v(10),
+                rhs: v(1),
+            })
+            .with_result(v(2)),
+        );
+        bb1.body.push(InstrNode::new(Inst::CondBr {
+            cond: v(2),
+            then_target: b(2),
+            then_args: vec![],
+            else_target: b(5),
+            else_args: vec![],
+        }));
+        let mut bb2 = Block::new(b(2));
+        bb2.body.push(InstrNode::new(int(1)).with_result(v(3)));
+        bb2.body
+            .push(InstrNode::new(add(v(10), v(3))).with_result(v(4)));
+        bb2.body.push(InstrNode::new(Inst::CondBr {
+            cond: v(2),
+            then_target: b(6),
+            then_args: vec![v(4), v(4)],
+            else_target: b(6),
+            else_args: vec![v(10), v(0)],
+        }));
+        let mut bb6 = Block::new(b(6))
+            .with_param(v(20), Ty::I32)
+            .with_param(v(21), Ty::I32);
+        bb6.body
+            .push(InstrNode::new(add(v(20), v(21))).with_result(v(5)));
+        bb6.body.push(InstrNode::new(Inst::Br {
+            target: b(1),
+            args: vec![v(5)],
+        }));
+        let mut bb5 = Block::new(b(5));
+        bb5.body.push(InstrNode::new(Inst::Return {
+            values: vec![v(10)],
+        }));
+        f.blocks = vec![bb0, bb1, bb2, bb6, bb5];
+        f
+    }
+
+    /// [`DerivationIndex::derivations`] returns exactly what the reference
+    /// fixpoint [`in_loop_derivations`] returns, with and without joins, for
+    /// every value of every loop of every fixture as the seed. The join
+    /// fixture makes the two modes differ (`%20` enters only through the
+    /// join), so the comparison covers the join rule.
+    #[test]
+    fn derivation_index_matches_fixpoint() {
+        let mut join_entered = false;
+        for function in [
+            threaded_scalar_loop(),
+            dropped_aggregate_loop(),
+            stale_rethread_loop(),
+            swapped_slot_loop(),
+            dead_invariant_temp_loop(),
+            dead_invariant_copy_loop(),
+            join_loop(),
+        ] {
+            let cfg = Cfg::new(&function);
+            let dominators = Dominators::compute(&cfg);
+            let mut seeds: BTreeSet<ValueId> = BTreeSet::new();
+            for block in &function.blocks {
+                seeds.extend(block.params.iter().map(|(value, _)| *value));
+                for node in &block.body {
+                    seeds.extend(node.results.iter().copied());
+                }
+            }
+            for back in back_edges(&cfg, &dominators) {
+                let loop_blocks = natural_loop_blocks(&cfg, back.target, back.source);
+                let index = DerivationIndex::new(&function, &loop_blocks, back.target);
+                for &seed in &seeds {
+                    let plain = in_loop_derivations(&function, &loop_blocks, seed, None);
+                    let joined =
+                        in_loop_derivations(&function, &loop_blocks, seed, Some(back.target));
+                    assert_eq!(index.derivations(seed, false), plain, "seed {seed:?}");
+                    assert_eq!(index.derivations(seed, true), joined, "seed {seed:?}");
+                    join_entered |= joined.contains(&v(20)) && !plain.contains(&v(20));
+                }
+            }
+        }
+        assert!(join_entered, "the join fixture must exercise the join rule");
+    }
+
     #[test]
     fn accepts_threaded_scalar_loop() {
         let f = threaded_scalar_loop();

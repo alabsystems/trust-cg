@@ -525,7 +525,7 @@ exit 2
     );
     assert_eq!(
         proof.digest,
-        "sha256:dc5d8253a8bd0a33fd258ec6a16110c41bae9e35a881e179ee872a7fe304ce2a"
+        "sha256:c47ba63eb1a8e164c75fba1b4f38eb3744f7b34e0e7b2b100759f7c9cacff67c"
     );
 }
 
@@ -645,7 +645,7 @@ exit 2
     assert_eq!(proof.uri, "reports/fixtures/ProofIndexedExtraction.lean");
     assert_eq!(
         proof.digest,
-        "sha256:c0e60991c21c8fe96c70c2166ca07c4646f1658874f5277a8a8ec89ae840eb33"
+        "sha256:7c7bba15a64aa37cd72d8d97376a7e44815b006c91f0684693ed1083559dc0de"
     );
 }
 

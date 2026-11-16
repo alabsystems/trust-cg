@@ -69,6 +69,7 @@ use trust_cg_lower::function::StackSlotInfo;
 use trust_cg_lower::instructions::Block as LirBlock;
 use trust_cg_lower::types::Type;
 use trust_cg_lower::x86_64_isel::{X86CallAbi, X86ISelFunction, X86ISelInst, X86ISelOperand};
+use trust_cg_verify::post_ra_dataflow::X86Allocation;
 
 use crate::dwarf_cfi::{DwarfCfiSection, x86_64_fde_from_prologue};
 use crate::elf::{ElfMachine, ElfWriter};
@@ -2113,7 +2114,7 @@ fn align_code_vec_with_nops(bytes: &mut Vec<u8>, alignment: usize) {
 /// liveness analysis or spill code generation.
 pub struct X86RegAssignment {
     /// VReg -> physical register mapping.
-    pub allocation: HashMap<VReg, X86PReg>,
+    pub allocation: X86Allocation,
     /// Callee-saved GPRs that were used and need push/pop preservation.
     pub used_callee_saved: Vec<X86PReg>,
     /// Windows x64 callee-saved XMM registers that need 128-bit save/restore.
@@ -2255,7 +2256,7 @@ fn x86_merge_fixed_callee_saved_gpr_defs(
 
 fn x86_used_callee_saved_from_allocation(
     abi: X86CallAbi,
-    allocation: &HashMap<VReg, X86PReg>,
+    allocation: &X86Allocation,
 ) -> (Vec<X86PReg>, Vec<X86PReg>) {
     let callee_saved_xmms = x86_abi_callee_saved_xmms(abi);
     let mut used_callee_saved_set: HashSet<X86PReg> = HashSet::new();
@@ -2408,7 +2409,7 @@ fn is_x86_volatile_load(opcode: X86Opcode) -> bool {
 /// assigns every appearing VReg, so it does not need this repair.
 fn bind_x86_dead_volatile_load_defs(
     func: &X86ISelFunction,
-    allocation: &mut HashMap<VReg, X86PReg>,
+    allocation: &mut X86Allocation,
     abi: X86CallAbi,
 ) -> Result<(), X86PipelineError> {
     for block_id in &func.block_order {
@@ -2504,7 +2505,7 @@ impl X86RegAssignment {
                     .to_string(),
             ));
         }
-        let mut allocation: HashMap<VReg, X86PReg> = HashMap::new();
+        let mut allocation: X86Allocation = X86Allocation::default();
         let mut used_gprs: HashSet<X86PReg> = HashSet::new();
         let mut used_xmms: HashSet<X86PReg> = HashSet::new();
         let mut used_callee_saved: Vec<X86PReg> = Vec::new();
@@ -2518,7 +2519,7 @@ impl X86RegAssignment {
 
         // Pass 1: Collect register hints from `MOV vreg, PReg(X)` instructions.
         // These are typically argument loads from physical registers.
-        let mut hints: HashMap<VReg, X86PReg> = HashMap::new();
+        let mut hints: X86Allocation = X86Allocation::default();
         for block in func.block_order.iter() {
             if let Some(mblock) = func.blocks.get(block) {
                 for inst in &mblock.insts {
@@ -2673,7 +2674,7 @@ impl X86RegAssignment {
 // ---------------------------------------------------------------------------
 
 /// Resolve an ISel operand to a physical register after allocation.
-fn resolve_operand(op: &X86ISelOperand, alloc: &HashMap<VReg, X86PReg>) -> Option<X86PReg> {
+fn resolve_operand(op: &X86ISelOperand, alloc: &X86Allocation) -> Option<X86PReg> {
     match op {
         X86ISelOperand::VReg(v) => alloc.get(v).copied(),
         X86ISelOperand::PReg(p) => Some(*p),
@@ -2683,7 +2684,7 @@ fn resolve_operand(op: &X86ISelOperand, alloc: &HashMap<VReg, X86PReg>) -> Optio
 
 fn resolve_register_or_mem_source_operand(
     op: &X86ISelOperand,
-    alloc: &HashMap<VReg, X86PReg>,
+    alloc: &X86Allocation,
     ops: &mut X86InstOperands,
 ) {
     match op {
@@ -2830,7 +2831,7 @@ fn reject_unsupported_x86_mem_rmw_isel_inst(inst: &X86ISelInst) -> Result<(), X8
 
 fn resolve_sib_memaddr_operand(
     op: &X86ISelOperand,
-    alloc: &HashMap<VReg, X86PReg>,
+    alloc: &X86Allocation,
     ops: &mut X86InstOperands,
 ) -> bool {
     if let X86ISelOperand::SibMemAddr {
@@ -2851,7 +2852,7 @@ fn resolve_sib_memaddr_operand(
 }
 
 /// Convert an ISel instruction to encoder operands using the register assignment.
-fn resolve_inst_operands(inst: &X86ISelInst, alloc: &HashMap<VReg, X86PReg>) -> X86InstOperands {
+fn resolve_inst_operands(inst: &X86ISelInst, alloc: &X86Allocation) -> X86InstOperands {
     let mut ops = X86InstOperands::none();
 
     match inst.opcode {
@@ -3774,7 +3775,7 @@ fn x86_jcc_erratum_pad(
     ops: &X86InstOperands,
     insts: &[X86ISelInst],
     inst_idx: usize,
-    alloc: &HashMap<VReg, X86PReg>,
+    alloc: &X86Allocation,
 ) -> Option<usize> {
     let mut unit_len = x86_encoded_len(opcode, ops)?;
     let trace = crate::env_lock::var_os("TCG_X86_JCC_ALIGN_TRACE").is_some();
@@ -3905,6 +3906,13 @@ const X86_LOOP_ALIGN_DEFAULT_MAX_SKIP: usize = 63;
 /// gate: there the alignment was "worth 0", which means the loop was not a
 /// containment repair at all.
 ///
+/// This argument covers straddling loops only. With the relocation of
+/// contained loops installed (certificate-free bridge compiles,
+/// `set_x86_loop_align_relocate_contained`) G6 no longer excludes a contained
+/// loop, so its pad has a bound of its own,
+/// `x86_loop_align_contained_pad_admitted`: at a live seam the pad must emit
+/// fewer NOP instructions than one iteration of the body retires.
+///
 /// The knob `-Ztrust-ir-cg-args=x86-loop-align-seam-pad=0` restores the refusal,
 /// which is how this policy stays falsifiable.
 const X86_LOOP_ALIGN_DEFAULT_SEAM_PAD: usize = X86_LOOP_ALIGN_DEFAULT_MAX_SKIP;
@@ -3963,6 +3971,200 @@ static LOOP_ALIGN_MAX_BODY: std::sync::OnceLock<usize> = std::sync::OnceLock::ne
 static LOOP_ALIGN_MAX_SKIP: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
 static LOOP_ALIGN_LOG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
 static LOOP_HEAD_ALIGN_DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+static LOOP_ALIGN_RELOCATE_CONTAINED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+/// Install the relocation of CONTAINED loops, once: with it, a loop whose
+/// body already lies inside one 64-byte line is aligned to the line too, under
+/// the same pad budgets, instead of G6 declining it. Uninstalled means off
+/// (G6 as before). The rustc bridge installs it on only for a compile without
+/// proof certificates (`no-x86-loop-align-relocate-contained` opts out).
+///
+/// Measured on x86-64 Linux (AMD, 2026-11-15,
+/// `reports/2026-11-15-x86-runtime-2/`): the array-fill helper's 4-instruction
+/// store loop runs about 1.5 % of `p7_sieve` slower when it lies inside a line
+/// at offset 0x60, 0x64 or 0x69 than at a line start (byte-identical
+/// instructions placed by hand), and the ABI copy hints moved it from the line
+/// start to 0x69. With the relocation, the hints no longer slow `p7_sieve`
+/// (median of 21, O2: 0.823 of LLVM against 0.840 with the relocation off and
+/// 0.828 for the base), and `h1_vec_push_sum`'s gain also comes from it; no
+/// other program moved beyond the base/base-copy spread. A relocated loop's
+/// pad is bounded by `x86_loop_align_contained_pad_admitted`.
+pub fn set_x86_loop_align_relocate_contained(enabled: bool) -> bool {
+    match LOOP_ALIGN_RELOCATE_CONTAINED.set(enabled) {
+        Ok(()) => true,
+        Err(requested) => LOOP_ALIGN_RELOCATE_CONTAINED.get() == Some(&requested),
+    }
+}
+
+fn x86_loop_align_relocate_contained() -> bool {
+    LOOP_ALIGN_RELOCATE_CONTAINED
+        .get()
+        .copied()
+        .unwrap_or(false)
+}
+
+/// Whether a compile withholds the relocation of contained loops: when it was
+/// opted out of (`no-x86-loop-align-relocate-contained`), or when the compile
+/// keeps proof certificates. The relocation only inserts NOPs, but it moves
+/// every byte after them and has been measured only with proof certificates
+/// off, so a certificate-keeping compile keeps G6's layout.
+pub fn x86_loop_align_relocate_contained_withheld(
+    opted_out: bool,
+    proof_certificates: bool,
+) -> bool {
+    opted_out || proof_certificates
+}
+
+/// G6 of the loop-head aligner: whether a loop head whose body ALREADY lies
+/// inside one 64-byte line where it stands is left where it is. Without the
+/// installed relocation it always is (repair only, never relocate); with it,
+/// such a loop is padded to the line start like a straddling one, under the
+/// same pad budgets.
+fn x86_loop_align_g6_declines(contained_now: bool, relocate_contained: bool) -> bool {
+    contained_now && !relocate_contained
+}
+
+/// G7 for a RELOCATED contained loop: whether its pad is admitted.
+///
+/// The straddling-loop argument at `X86_LOOP_ALIGN_DEFAULT_SEAM_PAD` does not
+/// carry over: a contained loop's pad is not shorter than its body as it
+/// stands, and aligning it saves no line crossing per iteration. Its measured
+/// benefit (`p7_sieve`'s array-fill loop, `h1_vec_push_sum`,
+/// `reports/2026-11-15-x86-runtime-2/`) is empirical, so the pad's cost must
+/// be bounded on its own terms:
+///
+/// - at a DEAD site (`dead_site`: the last emitted instruction is an
+///   unconditional transfer) the pad never executes, and `max_skip` bounds it
+///   as for any other loop;
+/// - at a LIVE fall-through seam the pad retires on every entry to the loop,
+///   so it is admitted only within the seam budget AND when the NOP
+///   instructions it emits (`x86_emit_nop_run`: 15-byte chunks) are FEWER
+///   than the instructions the body retires per iteration
+///   (`body_insts`, counted low by [`x86_span_retired_inst_floor`]). The
+///   extra work is then less than one iteration per entry, which bounds the
+///   huffbench failure mode (pad NOPs retired inside a hot enclosing loop for
+///   an alignment worth nothing) to under one inner iteration per entry
+///   rather than leaving it unbounded.
+fn x86_loop_align_contained_pad_admitted(
+    pad: usize,
+    dead_site: bool,
+    max_skip: usize,
+    seam_pad: usize,
+    body_insts: usize,
+) -> bool {
+    if dead_site {
+        pad <= max_skip
+    } else {
+        pad <= seam_pad && pad.div_ceil(X86_NOP_RUN_CHUNK) < body_insts
+    }
+}
+
+/// The largest single NOP `x86_emit_nop_run` emits.
+const X86_NOP_RUN_CHUNK: usize = 15;
+
+/// A LOWER bound on the instructions the span `head_idx..=span_end_idx`
+/// retires per pass through its blocks: every instruction except the
+/// pseudo-instructions that encode nothing (`Nop`, `Phi`, `StackAlloc`) and
+/// every `Jmp` (an elided fall-through `jmp` encodes nothing; counting none of
+/// them keeps the bound low without modelling the elision). JCC-erratum NOPs
+/// are not counted either. `None` when the span names a block the function
+/// does not have, which the caller treats as "not admitted".
+fn x86_span_retired_inst_floor(
+    func: &X86ISelFunction,
+    head_idx: usize,
+    span_end_idx: usize,
+) -> Option<usize> {
+    let mut count = 0usize;
+    for block_id in func.block_order.get(head_idx..=span_end_idx)? {
+        let block = func.blocks.get(block_id)?;
+        count += block
+            .insts
+            .iter()
+            .filter(|inst| {
+                !matches!(
+                    inst.opcode,
+                    X86Opcode::Nop | X86Opcode::Phi | X86Opcode::StackAlloc | X86Opcode::Jmp
+                )
+            })
+            .count();
+    }
+    Some(count)
+}
+
+#[cfg(test)]
+mod x86_loop_align_relocate_contained_tests {
+    use super::*;
+
+    #[test]
+    fn g6_declines_a_contained_loop_unless_relocation_is_installed() {
+        assert!(x86_loop_align_g6_declines(true, false));
+        assert!(!x86_loop_align_g6_declines(true, true));
+        assert!(!x86_loop_align_g6_declines(false, false));
+        assert!(!x86_loop_align_g6_declines(false, true));
+        // Nothing in this test binary installs it: G6 as before.
+        assert!(!x86_loop_align_relocate_contained());
+    }
+
+    #[test]
+    fn a_contained_loops_pad_at_a_live_seam_costs_less_than_one_iteration() {
+        // Dead site: only max_skip bounds the pad, whatever the body.
+        assert!(x86_loop_align_contained_pad_admitted(63, true, 63, 0, 0));
+        assert!(!x86_loop_align_contained_pad_admitted(
+            64, true, 63, 63, 100
+        ));
+        // Live seam: within the seam budget AND fewer NOPs than body insts.
+        // p7_sieve's fill loop: pad 23 = 2 NOPs, 4-instruction body.
+        assert!(x86_loop_align_contained_pad_admitted(23, false, 63, 63, 4));
+        assert!(!x86_loop_align_contained_pad_admitted(23, false, 63, 63, 2));
+        assert!(x86_loop_align_contained_pad_admitted(15, false, 63, 63, 2));
+        assert!(!x86_loop_align_contained_pad_admitted(16, false, 63, 63, 2));
+        assert!(!x86_loop_align_contained_pad_admitted(1, false, 63, 63, 1));
+        // The seam knob still refuses at a live seam (`seam-pad=0`).
+        assert!(!x86_loop_align_contained_pad_admitted(
+            23, false, 63, 0, 100
+        ));
+        assert!(!x86_loop_align_contained_pad_admitted(
+            24, false, 63, 23, 100
+        ));
+    }
+
+    #[test]
+    fn the_span_instruction_floor_skips_pseudos_and_jumps() {
+        let mut func = X86ISelFunction::new("floor".to_owned(), Default::default());
+        let b0 = LirBlock(0);
+        let b1 = LirBlock(1);
+        func.block_order = vec![b0, b1];
+        let inst = |opcode| X86ISelInst::new(opcode, vec![]);
+        let block = |insts| trust_cg_lower::x86_64_isel::X86ISelBlock {
+            insts,
+            successors: vec![],
+        };
+        let block0 = block(vec![
+            inst(X86Opcode::Phi),
+            inst(X86Opcode::AddRI),
+            inst(X86Opcode::Nop),
+            inst(X86Opcode::Jmp),
+        ]);
+        let block1 = block(vec![
+            inst(X86Opcode::StackAlloc),
+            inst(X86Opcode::CmpRR),
+            inst(X86Opcode::Jcc),
+        ]);
+        func.blocks.insert(b0, block0);
+        func.blocks.insert(b1, block1);
+        assert_eq!(x86_span_retired_inst_floor(&func, 0, 1), Some(3));
+        assert_eq!(x86_span_retired_inst_floor(&func, 1, 1), Some(2));
+        assert_eq!(x86_span_retired_inst_floor(&func, 0, 2), None);
+    }
+
+    #[test]
+    fn a_certificate_keeping_compile_withholds_the_relocation() {
+        assert!(x86_loop_align_relocate_contained_withheld(false, true));
+        assert!(x86_loop_align_relocate_contained_withheld(true, false));
+        assert!(x86_loop_align_relocate_contained_withheld(true, true));
+        assert!(!x86_loop_align_relocate_contained_withheld(false, false));
+    }
+}
 
 /// Install the fall-through-seam pad budget from a TRACKED compiler option, once
 /// (`-Ztrust-ir-cg-args=x86-loop-align-seam-pad=<bytes>`).
@@ -4105,7 +4307,7 @@ fn x86_innermost_loop_head_spans(
 /// length decisions. Held by reference; constructed once per function.
 struct X86SpanProbe<'a> {
     func: &'a X86ISelFunction,
-    alloc: &'a HashMap<VReg, X86PReg>,
+    alloc: &'a X86Allocation,
     branch_targets: &'a HashMap<(LirBlock, usize), LirBlock>,
     layout_successor: &'a HashMap<LirBlock, LirBlock>,
     elide_fallthrough_jmp: bool,
@@ -4266,6 +4468,11 @@ struct X86LoopAlignStats {
     decline_body_too_big: usize,
     decline_already_contained: usize,
     decline_live_seam: usize,
+    /// Contained loops padded by the installed relocation (also in `padded`).
+    relocated_contained: usize,
+    /// Contained loops the relocation would pad whose pad
+    /// `x86_loop_align_contained_pad_admitted` refused.
+    decline_contained_pad: usize,
     miss: usize,
 }
 
@@ -4600,7 +4807,7 @@ fn x86_preg_overlaps_any(preg: X86PReg, regs: &[X86PReg]) -> bool {
 
 fn select_x86_two_address_scratch(
     inst: &X86ISelInst,
-    alloc: &HashMap<VReg, X86PReg>,
+    alloc: &X86Allocation,
     abi: X86CallAbi,
     forbidden: &[X86PReg],
 ) -> Option<X86PReg> {
@@ -4645,7 +4852,7 @@ fn x86_requires_noncommutative_rhs_alias_scratch(
 /// Reference: x86_adapter.rs `is_two_address_opcode()` and `TiedOperand`.
 fn fixup_two_address(
     func: &mut X86ISelFunction,
-    alloc: &HashMap<VReg, X86PReg>,
+    alloc: &X86Allocation,
     abi: X86CallAbi,
 ) -> Result<usize, X86PipelineError> {
     let mut copy_count = 0;
@@ -4810,11 +5017,7 @@ fn x86_operand_is_machine_use(inst: &X86ISelInst, idx: usize) -> bool {
 
 /// Collect the physical registers named by a resolved register/memory operand
 /// (recursing into memory-address base/index), in width-specific `X86PReg` form.
-fn x86_operand_resolved_pregs(
-    op: &X86ISelOperand,
-    alloc: &HashMap<VReg, X86PReg>,
-    out: &mut Vec<X86PReg>,
-) {
+fn x86_operand_resolved_pregs(op: &X86ISelOperand, alloc: &X86Allocation, out: &mut Vec<X86PReg>) {
     match op {
         X86ISelOperand::VReg(_) | X86ISelOperand::PReg(_) => {
             if let Some(p) = resolve_operand(op, alloc) {
@@ -4914,7 +5117,7 @@ fn x86_inst_implicit_gpr64_roots(
 }
 
 /// GPR64-root read set of an instruction (explicit operands + implicit uses).
-fn x86_inst_gpr64_use_roots(inst: &X86ISelInst, alloc: &HashMap<VReg, X86PReg>) -> Vec<X86PReg> {
+fn x86_inst_gpr64_use_roots(inst: &X86ISelInst, alloc: &X86Allocation) -> Vec<X86PReg> {
     let mut roots = Vec::new();
     for i in 0..inst.operands.len() {
         if x86_operand_is_machine_use(inst, i) {
@@ -4936,7 +5139,7 @@ fn x86_inst_gpr64_use_roots(inst: &X86ISelInst, alloc: &HashMap<VReg, X86PReg>) 
 /// overwritten (64-bit or 32-bit — the latter zero-extends and thus clears the
 /// full 64-bit register). Partial (8/16-bit) writes are NOT kills. Used only by
 /// liveness; omitting a kill only over-approximates liveness, which is safe.
-fn x86_inst_gpr64_kill_roots(inst: &X86ISelInst, alloc: &HashMap<VReg, X86PReg>) -> Vec<X86PReg> {
+fn x86_inst_gpr64_kill_roots(inst: &X86ISelInst, alloc: &X86Allocation) -> Vec<X86PReg> {
     let mut kills = Vec::new();
     for i in 0..inst.operands.len() {
         if x86_operand_access(inst, i).is_def
@@ -4954,11 +5157,7 @@ fn x86_inst_gpr64_kill_roots(inst: &X86ISelInst, alloc: &HashMap<VReg, X86PReg>)
 
 /// Return `true` if the instruction writes (fully OR partially) a register whose
 /// containing GPR64 is `root` — used for interference/clobber detection.
-fn x86_inst_clobbers_gpr64_root(
-    inst: &X86ISelInst,
-    alloc: &HashMap<VReg, X86PReg>,
-    root: X86PReg,
-) -> bool {
+fn x86_inst_clobbers_gpr64_root(inst: &X86ISelInst, alloc: &X86Allocation, root: X86PReg) -> bool {
     for i in 0..inst.operands.len() {
         if x86_operand_access(inst, i).is_def {
             let mut pregs = Vec::new();
@@ -4980,7 +5179,7 @@ fn x86_inst_clobbers_gpr64_root(
 /// Return `true` if the instruction FULLY overwrites `root`.
 fn x86_inst_full_def_of_gpr64_root(
     inst: &X86ISelInst,
-    alloc: &HashMap<VReg, X86PReg>,
+    alloc: &X86Allocation,
     root: X86PReg,
 ) -> bool {
     for i in 0..inst.operands.len() {
@@ -5013,7 +5212,7 @@ fn x86_inst_implicit_uses_gpr64_root(inst: &X86ISelInst, root: X86PReg) -> bool 
 /// tied read-modify operand.
 fn x86_inst_explicit_reads_of_root(
     inst: &X86ISelInst,
-    alloc: &HashMap<VReg, X86PReg>,
+    alloc: &X86Allocation,
     root: X86PReg,
     exact: X86PReg,
 ) -> (bool, bool) {
@@ -5049,14 +5248,9 @@ fn x86_rename_reads_pdst_to_psrc(
     inst: &mut X86ISelInst,
     pdst: X86PReg,
     psrc: X86PReg,
-    alloc: &HashMap<VReg, X86PReg>,
+    alloc: &X86Allocation,
 ) {
-    fn rewrite(
-        op: &mut X86ISelOperand,
-        pdst: X86PReg,
-        psrc: X86PReg,
-        alloc: &HashMap<VReg, X86PReg>,
-    ) {
+    fn rewrite(op: &mut X86ISelOperand, pdst: X86PReg, psrc: X86PReg, alloc: &X86Allocation) {
         match op {
             X86ISelOperand::VReg(_) | X86ISelOperand::PReg(_) => {
                 if resolve_operand(op, alloc) == Some(pdst) {
@@ -5082,7 +5276,7 @@ fn x86_rename_reads_pdst_to_psrc(
 /// Conservative per-block GPR64-root live-out via iterative backward liveness.
 fn compute_x86_gpr64_live_out(
     func: &X86ISelFunction,
-    alloc: &HashMap<VReg, X86PReg>,
+    alloc: &X86Allocation,
 ) -> HashMap<LirBlock, HashSet<X86PReg>> {
     let mut live_in: HashMap<LirBlock, HashSet<X86PReg>> = HashMap::new();
     for b in &func.block_order {
@@ -5248,7 +5442,7 @@ fn x86_try_collapse_bridge_into_lea(
     a: X86PReg,
     d_root: X86PReg,
     a_root: X86PReg,
-    alloc: &HashMap<VReg, X86PReg>,
+    alloc: &X86Allocation,
 ) -> Option<[X86ISelOperand; 3]> {
     if d != d_root || a != a_root || d_root == a_root {
         return None;
@@ -5325,7 +5519,7 @@ fn x86_try_collapse_bridge_into_lea_imm(
     a: X86PReg,
     d_root: X86PReg,
     a_root: X86PReg,
-    alloc: &HashMap<VReg, X86PReg>,
+    alloc: &X86Allocation,
 ) -> Option<(i32, [X86ISelOperand; 2])> {
     if d != d_root || a != a_root || d_root == a_root {
         return None;
@@ -5388,7 +5582,7 @@ fn x86_try_collapse_producer_writeback(
     a_root: X86PReg,
     d_root: X86PReg,
     block_live_out: &HashSet<X86PReg>,
-    alloc: &HashMap<VReg, X86PReg>,
+    alloc: &X86Allocation,
 ) -> bool {
     if wb_pos == 0 {
         return false;
@@ -5703,7 +5897,7 @@ fn x86_try_collapse_lea_self_writeback(
     a_root: X86PReg,
     d_root: X86PReg,
     block_live_out: &HashSet<X86PReg>,
-    alloc: &HashMap<VReg, X86PReg>,
+    alloc: &X86Allocation,
 ) -> bool {
     if !x86_lea_writeback_collapse_enabled() || wb_pos == 0 {
         return false;
@@ -5864,7 +6058,7 @@ fn x86_try_rename_coalesce_copy(
     pdst_root: X86PReg,
     psrc_root: X86PReg,
     block_live_out: &HashSet<X86PReg>,
-    alloc: &HashMap<VReg, X86PReg>,
+    alloc: &X86Allocation,
 ) -> bool {
     let start = copy_pos + 1;
     let n = insts.len();
@@ -6091,7 +6285,7 @@ fn x86_try_collapse_gpr_bridge_into_op(
     pdst_root: X86PReg,
     psrc_root: X86PReg,
     block_live_out: &HashSet<X86PReg>,
-    alloc: &HashMap<VReg, X86PReg>,
+    alloc: &X86Allocation,
 ) -> bool {
     // ⚑ The frame registers are OUTSIDE the allocator's model: `x86_inst_
     // implicit_gpr64_roots` does not record `ret`/`push`/`pop`'s implicit RSP
@@ -6431,7 +6625,7 @@ fn x86_inst_implicit_xmm_uses(inst: &X86ISelInst, uses: &mut Vec<X86PReg>) {
 }
 
 /// XMM read set of an instruction (explicit machine-use operands + implicit).
-fn x86_inst_xmm_use_regs(inst: &X86ISelInst, alloc: &HashMap<VReg, X86PReg>) -> Vec<X86PReg> {
+fn x86_inst_xmm_use_regs(inst: &X86ISelInst, alloc: &X86Allocation) -> Vec<X86PReg> {
     let mut regs = Vec::new();
     for i in 0..inst.operands.len() {
         if x86_operand_is_machine_use(inst, i) {
@@ -6450,7 +6644,7 @@ fn x86_inst_xmm_use_regs(inst: &X86ISelInst, alloc: &HashMap<VReg, X86PReg>) -> 
 
 /// XMM FULL-kill set of an instruction. Partial writers (lane merges) are NOT
 /// kills; omitting a kill only over-approximates liveness, which is safe.
-fn x86_inst_xmm_kill_regs(inst: &X86ISelInst, alloc: &HashMap<VReg, X86PReg>) -> Vec<X86PReg> {
+fn x86_inst_xmm_kill_regs(inst: &X86ISelInst, alloc: &X86Allocation) -> Vec<X86PReg> {
     let mut kills = Vec::new();
     if x86_opcode_full_xmm_def(inst.opcode) {
         for i in 0..inst.operands.len() {
@@ -6470,7 +6664,7 @@ fn x86_inst_xmm_kill_regs(inst: &X86ISelInst, alloc: &HashMap<VReg, X86PReg>) ->
 /// identity (no sub-register lattice), so no root mapping is needed.
 fn compute_x86_xmm_live_out(
     func: &X86ISelFunction,
-    alloc: &HashMap<VReg, X86PReg>,
+    alloc: &X86Allocation,
 ) -> HashMap<LirBlock, HashSet<X86PReg>> {
     let mut live_in: HashMap<LirBlock, HashSet<X86PReg>> = HashMap::new();
     for b in &func.block_order {
@@ -6551,7 +6745,7 @@ fn x86_try_collapse_xmm_bridge_into_op(
     d: X86PReg,
     s: X86PReg,
     block_xmm_live_out: &HashSet<X86PReg>,
-    alloc: &HashMap<VReg, X86PReg>,
+    alloc: &X86Allocation,
 ) -> bool {
     let Some(op) = insts.get(copy_pos + 1) else {
         return false;
@@ -6716,10 +6910,7 @@ fn x86_movrr_coalesce_disabled() -> bool {
 
 /// Block-local redundant-`MovRR` coalescing over the post-fixup function.
 /// Returns the number of copies removed.
-fn coalesce_x86_redundant_movrr_copies(
-    func: &mut X86ISelFunction,
-    alloc: &HashMap<VReg, X86PReg>,
-) -> usize {
+fn coalesce_x86_redundant_movrr_copies(func: &mut X86ISelFunction, alloc: &X86Allocation) -> usize {
     let live_out = compute_x86_gpr64_live_out(func, alloc);
     // Kill switch checked ONCE per invocation. With the XMM arm disabled the
     // function runs exactly one sweep per block, bit-identical to its
@@ -7434,7 +7625,7 @@ fn formal_arg_prologue_len(
 /// scalar XMM moves for scalar FP, and `MovdqaRR` for full 128-bit values).
 fn classify_formal_arg_mov(
     inst: &X86ISelInst,
-    alloc: &HashMap<VReg, X86PReg>,
+    alloc: &X86Allocation,
 ) -> Option<(X86PReg, X86PReg, X86Opcode)> {
     match inst.opcode {
         X86Opcode::MovRR
@@ -8417,7 +8608,7 @@ enum FormalLoadDestination {
 /// instruction and the physical assignment would be a lie).
 fn formal_stack_arg_load_destination(
     inst: &X86ISelInst,
-    alloc: &HashMap<VReg, X86PReg>,
+    alloc: &X86Allocation,
     installed_spills: &HashMap<VReg, u32>,
 ) -> Result<(FormalLoadDestination, i32, X86Opcode), X86PipelineError> {
     let shape_error = || {
@@ -8482,7 +8673,7 @@ fn formal_spill_replay_scratch_candidates(
 /// that vreg unassigned, or when the operand shape is not a two-register move.
 fn formal_barrier_operand_pregs(
     inst: &X86ISelInst,
-    alloc: &HashMap<VReg, X86PReg>,
+    alloc: &X86Allocation,
 ) -> (Option<X86PReg>, Option<X86PReg>) {
     match inst.operands.as_slice() {
         [X86ISelOperand::PReg(d), X86ISelOperand::PReg(s)] => (Some(*d), Some(*s)),
@@ -8515,7 +8706,7 @@ enum FormalConnectorEnd {
 fn formal_connector_end(
     operand: Option<&X86ISelOperand>,
     which: &str,
-    alloc: &HashMap<VReg, X86PReg>,
+    alloc: &X86Allocation,
     installed_spills: &HashMap<VReg, u32>,
 ) -> Result<FormalConnectorEnd, X86PipelineError> {
     match operand {
@@ -8660,7 +8851,7 @@ enum FormalBarrierEnd {
 /// writes, so that reordering the prologue around it can be proved or refused.
 fn formal_barrier_ends_for_value_proof(
     inst: &X86ISelInst,
-    alloc: &HashMap<VReg, X86PReg>,
+    alloc: &X86Allocation,
     installed_spills: &HashMap<VReg, u32>,
     abi: X86CallAbi,
 ) -> Result<(FormalBarrierEnd, FormalBarrierEnd), X86PipelineError> {
@@ -8733,7 +8924,7 @@ fn formal_barrier_ends_for_value_proof(
 /// the one shape where the two could coincide.
 fn formal_connector_replay_slots(
     residue: &[FormalPrefixResidue],
-    alloc: &HashMap<VReg, X86PReg>,
+    alloc: &X86Allocation,
     installed_spills: &HashMap<VReg, u32>,
     abi: X86CallAbi,
 ) -> Result<Vec<u32>, X86PipelineError> {
@@ -8756,7 +8947,7 @@ fn formal_connector_replay_slots(
 }
 
 /// The destination preg of a split-replay connector, or `None` when unresolved.
-fn formal_barrier_dst_preg(inst: &X86ISelInst, alloc: &HashMap<VReg, X86PReg>) -> Option<X86PReg> {
+fn formal_barrier_dst_preg(inst: &X86ISelInst, alloc: &X86Allocation) -> Option<X86PReg> {
     formal_barrier_operand_pregs(inst, alloc).0
 }
 
@@ -8809,7 +9000,7 @@ struct FormalSpilledSave {
 fn formal_prefix_register_writes(
     segments: &[FormalCopySegment],
     residue: &[FormalPrefixResidue],
-    alloc: &HashMap<VReg, X86PReg>,
+    alloc: &X86Allocation,
     installed_spills: &HashMap<VReg, u32>,
     abi: X86CallAbi,
 ) -> Result<Vec<(usize, X86PReg)>, X86PipelineError> {
@@ -8900,7 +9091,7 @@ fn formal_arg_prefix_needs_no_reordering(
     segments: &[FormalCopySegment],
     residue: &[FormalPrefixResidue],
     spilled: &[FormalSpilledSave],
-    alloc: &HashMap<VReg, X86PReg>,
+    alloc: &X86Allocation,
     installed_spills: &HashMap<VReg, u32>,
     abi: X86CallAbi,
 ) -> Result<(), X86PipelineError> {
@@ -9046,7 +9237,7 @@ fn prove_formal_arg_prefix_admits_loads(
     segments: &[FormalCopySegment],
     residue: &[FormalPrefixResidue],
     spilled: &[FormalSpilledSave],
-    alloc: &HashMap<VReg, X86PReg>,
+    alloc: &X86Allocation,
     installed_spills: &HashMap<VReg, u32>,
     abi: X86CallAbi,
     xmm_scratch: X86PReg,
@@ -9436,7 +9627,7 @@ fn prove_formal_arg_prefix_admits_loads(
 /// * `alloc` — the VReg-to-PReg allocation produced by regalloc.
 fn fixup_formal_arg_parallel_copy(
     func: &mut X86ISelFunction,
-    alloc: &HashMap<VReg, X86PReg>,
+    alloc: &X86Allocation,
     installed_spills: &HashMap<VReg, u32>,
     abi: X86CallAbi,
 ) -> Result<(), X86PipelineError> {
@@ -10937,7 +11128,7 @@ fn build_x86_64_coff_unwind_sections(
 
 fn x86_stack_alloc_preg(
     operand: &X86ISelOperand,
-    alloc: &HashMap<VReg, X86PReg>,
+    alloc: &X86Allocation,
     context: &'static str,
 ) -> Result<X86PReg, X86PipelineError> {
     let reg = resolve_operand(operand, alloc).ok_or_else(|| {
@@ -11720,7 +11911,7 @@ fn expand_x86_vector_mask_extracts(func: &mut X86ISelFunction) -> Result<(), X86
 
 fn expand_x86_dynamic_stack_alloc_inst(
     inst: &X86ISelInst,
-    alloc: &HashMap<VReg, X86PReg>,
+    alloc: &X86Allocation,
     outgoing_call_bytes: u32,
 ) -> Result<Option<Vec<X86ISelInst>>, X86PipelineError> {
     if inst.opcode != X86Opcode::StackAlloc {
@@ -11879,7 +12070,7 @@ fn expand_x86_dynamic_stack_alloc_inst(
 
 fn expand_x86_dynamic_stack_allocs(
     func: &mut X86ISelFunction,
-    alloc: &HashMap<VReg, X86PReg>,
+    alloc: &X86Allocation,
 ) -> Result<(), X86PipelineError> {
     let outgoing_call_bytes = func.max_outgoing_call_bytes;
     for block_id in func.block_order.clone() {
@@ -12345,6 +12536,387 @@ pub fn set_x86_branch_layout_disabled(disabled: bool) -> bool {
     match BRANCH_LAYOUT_DISABLED.set(disabled) {
         Ok(()) => true,
         Err(requested) => BRANCH_LAYOUT_DISABLED.get() == Some(&requested),
+    }
+}
+
+static RA_ABI_COPY_HINTS_DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+static RA_CALLER_SAVED_FIRST_DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+static RA_CALL_SPLIT_DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+static RA_TRACE_ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+static RA_COLD_CALL_WEIGHT_DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+/// Install the cold-call-region weighting's kill switch from a TRACKED
+/// option, once (`-Ztrust-ir-cg-args=no-x86-ra-cold-call-weight`); see
+/// [`x86_cold_call_regions`].
+pub fn set_x86_ra_cold_call_weight_disabled(disabled: bool) -> bool {
+    match RA_COLD_CALL_WEIGHT_DISABLED.set(disabled) {
+        Ok(()) => true,
+        Err(requested) => RA_COLD_CALL_WEIGHT_DISABLED.get() == Some(&requested),
+    }
+}
+
+fn x86_ra_cold_call_weight_enabled_in(mode: X86AllocationQuality) -> bool {
+    x86_ra_quality_enabled_in(mode, RA_COLD_CALL_WEIGHT_DISABLED.get().copied(), true)
+}
+
+#[cfg(test)]
+fn x86_ra_cold_call_weight_enabled() -> bool {
+    x86_ra_cold_call_weight_enabled_in(X86AllocationQuality::Installed)
+}
+
+/// Install the allocation trace from a TRACKED option, once
+/// (`-Ztrust-ir-cg-args=trace-x86-ra`). DEFAULT OFF; diagnostics only: for
+/// every function the full allocator allocates, it prints the allocator's
+/// instructions after coalescing, each live interval with its spill weight,
+/// extent, use and definition counts and its register or `SPILL`, each
+/// block's position span and loop depth, and the call split's counts. No
+/// codegen effect.
+pub fn set_x86_ra_trace_enabled(enabled: bool) -> bool {
+    match RA_TRACE_ENABLED.set(enabled) {
+        Ok(()) => true,
+        Err(requested) => RA_TRACE_ENABLED.get() == Some(&requested),
+    }
+}
+
+fn x86_ra_trace_enabled() -> bool {
+    RA_TRACE_ENABLED.get().copied().unwrap_or(false)
+}
+
+/// The `trace-x86-ra` report for one allocated function (see
+/// [`set_x86_ra_trace_enabled`]).
+fn x86_ra_trace_report(
+    ra_func: &RegAllocFunction,
+    result: &trust_cg_regalloc::AllocationResult,
+    split_calls: usize,
+    split_temps: usize,
+) {
+    let liveness = trust_cg_regalloc::compute_live_intervals(ra_func);
+    let spilled: HashSet<VReg> = result.spills.iter().map(|spill| spill.vreg).collect();
+    eprintln!(
+        "[trace-x86-ra] func={} intervals={} spilled={} split_calls={} split_temps={}",
+        ra_func.name,
+        liveness.intervals.len(),
+        spilled.len(),
+        split_calls,
+        split_temps
+    );
+    for block_id in &ra_func.block_order {
+        let Some(block) = ra_func.blocks.get(block_id.0 as usize) else {
+            continue;
+        };
+        let positions: Vec<u32> = block
+            .insts
+            .iter()
+            .filter_map(|id| liveness.inst_numbering.get(id).copied())
+            .collect();
+        let calls = block
+            .insts
+            .iter()
+            .filter(|id| {
+                ra_func
+                    .insts
+                    .get(id.0 as usize)
+                    .is_some_and(|inst| inst.flags.is_call())
+            })
+            .count();
+        eprintln!(
+            "[trace-x86-ra]   block={} pos={:?}..{:?} depth={} calls={} succs={:?}",
+            block_id.0,
+            positions.first(),
+            positions.last(),
+            block.loop_depth,
+            calls,
+            block.succs.iter().map(|b| b.0).collect::<Vec<_>>()
+        );
+    }
+    for block_id in &ra_func.block_order {
+        let Some(block) = ra_func.blocks.get(block_id.0 as usize) else {
+            continue;
+        };
+        for id in &block.insts {
+            let Some(inst) = ra_func.insts.get(id.0 as usize) else {
+                continue;
+            };
+            eprintln!(
+                "[trace-x86-ra]     b{} @{:?} op={} defs={:?} uses={:?} idefs={} iuses={} call={}",
+                block_id.0,
+                liveness.inst_numbering.get(id),
+                inst.opcode,
+                inst.defs,
+                inst.uses,
+                inst.implicit_defs.len(),
+                inst.implicit_uses.len(),
+                inst.flags.is_call()
+            );
+        }
+    }
+    let mut intervals: Vec<_> = liveness.intervals.values().collect();
+    intervals.sort_by(|a, b| b.spill_weight.total_cmp(&a.spill_weight));
+    for interval in intervals {
+        let location = if spilled.contains(&interval.vreg) {
+            "SPILL".to_string()
+        } else {
+            result
+                .allocation
+                .get(&interval.vreg)
+                .and_then(|preg| trust_cg_regalloc::preg_to_x86(*preg))
+                .map(|reg| x86_preg_name(reg).to_string())
+                .unwrap_or_else(|| "-".to_string())
+        };
+        eprintln!(
+            "[trace-x86-ra]   v{}:{:?} w={:.3} span={}..{} ranges={} uses={} defs={} -> {}",
+            interval.vreg.id,
+            interval.vreg.class,
+            interval.spill_weight,
+            interval.ranges.first().map_or(0, |r| r.start),
+            interval.ranges.last().map_or(0, |r| r.end),
+            interval.ranges.len(),
+            interval.use_positions.len(),
+            interval.def_positions.len(),
+            location
+        );
+    }
+}
+
+/// Install the ABI-copy-hint kill switch from a TRACKED option, once
+/// (`-Ztrust-ir-cg-args=no-x86-ra-abi-copy-hints`); see
+/// [`X86RegallocConversion::abi_copies`]. Returns whether the installed value
+/// agrees with `disabled`. This and the other three allocation-quality switches
+/// (caller-saved-first, cold-call weight, call split) are ON only when the
+/// installed value is `false` (the bridge installs `false` only for a compile
+/// without proof certificates) and OFF when nothing is installed
+/// ([`x86_ra_quality_enabled`]).
+pub fn set_x86_ra_abi_copy_hints_disabled(disabled: bool) -> bool {
+    match RA_ABI_COPY_HINTS_DISABLED.set(disabled) {
+        Ok(()) => true,
+        Err(requested) => RA_ABI_COPY_HINTS_DISABLED.get() == Some(&requested),
+    }
+}
+
+/// Install the caller-saved-first allocation order's kill switch from a
+/// TRACKED option, once (`-Ztrust-ir-cg-args=no-x86-ra-caller-saved-first`);
+/// see [`x86_caller_saved_first_order`].
+pub fn set_x86_ra_caller_saved_first_disabled(disabled: bool) -> bool {
+    match RA_CALLER_SAVED_FIRST_DISABLED.set(disabled) {
+        Ok(()) => true,
+        Err(requested) => RA_CALLER_SAVED_FIRST_DISABLED.get() == Some(&requested),
+    }
+}
+
+/// Install the conditional-call live-range split's kill switch from a TRACKED
+/// option, once (`-Ztrust-ir-cg-args=no-x86-ra-call-split`); see
+/// `super::call_split`.
+pub fn set_x86_ra_call_split_disabled(disabled: bool) -> bool {
+    match RA_CALL_SPLIT_DISABLED.set(disabled) {
+        Ok(()) => true,
+        Err(requested) => RA_CALL_SPLIT_DISABLED.get() == Some(&requested),
+    }
+}
+
+/// Whether a compile that keeps proof certificates withholds the four
+/// allocation-quality changes (ABI copy hints, caller-saved-first order,
+/// cold-call weight, call split). They change which registers and which
+/// copies the allocator emits, and no compile with proof certificates has
+/// exercised them, so a caller that keeps certificates disables them; the
+/// proofs-off lane keeps them on unless opted out.
+pub fn x86_ra_quality_withheld(opted_out: bool, proof_certificates: bool) -> bool {
+    opted_out || proof_certificates
+}
+
+/// Whether one allocation-quality change is enabled in an `Installed`
+/// pipeline, given the value its switch's setter installed (`Some(disabled)`)
+/// or `None` when no driver installed a policy. Only an installed `false`
+/// enables it there: such a pipeline (the JIT, a direct `X86Pipeline` user,
+/// the unit tests) may keep proof certificates, and the x86 JIT envelope's
+/// certified bytes are pinned and change with them on. `Compiler::compile`'s
+/// object pipeline also decides per compile from its configuration
+/// ([`X86AllocationQuality`]). There is deliberately no environment opt-in. This is the `rowreg_memory_rmw_enabled` contract.
+#[cfg(test)]
+fn x86_ra_quality_enabled(installed_disabled: Option<bool>) -> bool {
+    x86_ra_quality_enabled_in(X86AllocationQuality::Installed, installed_disabled, false)
+}
+
+/// Which allocation-quality policy one pipeline's register allocation follows
+/// (`X86PipelineConfig::allocation_quality`). The four changes are the ABI
+/// copy hints, caller-saved-first order, cold-call weighting and the
+/// conditional-call split.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum X86AllocationQuality {
+    /// Follow the process policy a driver installed through the setters
+    /// (`set_x86_ra_*_disabled`); with nothing installed every change is
+    /// withheld, because the driver may keep proof certificates. The default,
+    /// and the JIT's.
+    #[default]
+    Installed,
+    /// This compile keeps no proof certificates and its driver requested the
+    /// certificate-free allocation (`Compiler::compile` with `emit_proofs`
+    /// off and `CompilerConfig::x86_certificate_free_allocation` on): each
+    /// change is on unless an installed policy opted out of it, so a driver
+    /// that installs nothing (the TY ahead-of-time path) gets the allocation
+    /// the rustc bridge installs for `no-proof-certs`.
+    CertificateFree,
+    /// This compile keeps proof certificates: every change is withheld, whatever
+    /// a driver installed, and the historical allocation is kept.
+    Withheld,
+}
+
+/// What a certificate-free compile does with the ABI copy hints when no
+/// driver installed a policy for them: on, as the rustc bridge installs them
+/// for `no-proof-certs` (default since 2026-11-15, after the `p7_sieve`
+/// regression they caused was traced to the array-fill helper's loop
+/// position and the loop-head aligner's relocation of contained loops
+/// removed it).
+const X86_RA_ABI_COPY_HINTS_CERTIFICATE_FREE_DEFAULT: bool = true;
+
+/// Whether one allocation-quality change is enabled in `mode`, given the value
+/// its switch's setter installed (`Some(disabled)`, or `None`) and what a
+/// certificate-free compile does when nothing is installed.
+fn x86_ra_quality_enabled_in(
+    mode: X86AllocationQuality,
+    installed_disabled: Option<bool>,
+    certificate_free_default: bool,
+) -> bool {
+    match mode {
+        X86AllocationQuality::Withheld => false,
+        X86AllocationQuality::Installed => installed_disabled.is_some_and(|disabled| !disabled),
+        X86AllocationQuality::CertificateFree => {
+            installed_disabled.map_or(certificate_free_default, |disabled| !disabled)
+        }
+    }
+}
+
+fn x86_ra_abi_copy_hints_enabled_in(mode: X86AllocationQuality) -> bool {
+    x86_ra_quality_enabled_in(
+        mode,
+        RA_ABI_COPY_HINTS_DISABLED.get().copied(),
+        X86_RA_ABI_COPY_HINTS_CERTIFICATE_FREE_DEFAULT,
+    )
+}
+
+fn x86_ra_caller_saved_first_enabled_in(mode: X86AllocationQuality) -> bool {
+    x86_ra_quality_enabled_in(mode, RA_CALLER_SAVED_FIRST_DISABLED.get().copied(), true)
+}
+
+fn x86_ra_call_split_enabled_in(mode: X86AllocationQuality) -> bool {
+    x86_ra_quality_enabled_in(mode, RA_CALL_SPLIT_DISABLED.get().copied(), true)
+}
+
+#[cfg(test)]
+fn x86_ra_abi_copy_hints_enabled() -> bool {
+    x86_ra_abi_copy_hints_enabled_in(X86AllocationQuality::Installed)
+}
+
+#[cfg(test)]
+fn x86_ra_caller_saved_first_enabled() -> bool {
+    x86_ra_caller_saved_first_enabled_in(X86AllocationQuality::Installed)
+}
+
+#[cfg(test)]
+fn x86_ra_call_split_enabled() -> bool {
+    x86_ra_call_split_enabled_in(X86AllocationQuality::Installed)
+}
+
+#[cfg(test)]
+mod x86_ra_quality_policy_tests {
+    use super::*;
+
+    #[test]
+    fn certificate_keeping_compiles_withhold_the_changes() {
+        // (opted_out, proof_certificates) -> withheld
+        assert!(!x86_ra_quality_withheld(false, false));
+        assert!(x86_ra_quality_withheld(true, false));
+        assert!(x86_ra_quality_withheld(false, true));
+        assert!(x86_ra_quality_withheld(true, true));
+    }
+
+    #[test]
+    fn only_an_installed_false_enables_a_change() {
+        assert!(!x86_ra_quality_enabled(None));
+        assert!(!x86_ra_quality_enabled(Some(true)));
+        assert!(x86_ra_quality_enabled(Some(false)));
+    }
+
+    #[test]
+    fn the_pipeline_mode_decides_per_compile() {
+        use X86AllocationQuality::*;
+        for installed in [None, Some(false), Some(true)] {
+            for default in [false, true] {
+                // A certificate-keeping compile withholds whatever is installed.
+                assert!(!x86_ra_quality_enabled_in(Withheld, installed, default));
+                // The process policy alone, as before.
+                assert_eq!(
+                    x86_ra_quality_enabled_in(Installed, installed, default),
+                    installed == Some(false)
+                );
+            }
+        }
+        // A certificate-free compile: an installed value wins, else the default.
+        assert!(x86_ra_quality_enabled_in(CertificateFree, None, true));
+        assert!(!x86_ra_quality_enabled_in(CertificateFree, None, false));
+        assert!(x86_ra_quality_enabled_in(
+            CertificateFree,
+            Some(false),
+            false
+        ));
+        assert!(!x86_ra_quality_enabled_in(
+            CertificateFree,
+            Some(true),
+            true
+        ));
+        // Nothing installed in this binary: a certificate-free pipeline gets
+        // all four changes.
+        assert!(x86_ra_caller_saved_first_enabled_in(CertificateFree));
+        assert!(x86_ra_cold_call_weight_enabled_in(CertificateFree));
+        assert!(x86_ra_call_split_enabled_in(CertificateFree));
+        assert_eq!(
+            x86_ra_abi_copy_hints_enabled_in(CertificateFree),
+            X86_RA_ABI_COPY_HINTS_CERTIFICATE_FREE_DEFAULT
+        );
+        assert_eq!(X86PipelineConfig::default().allocation_quality, Installed);
+    }
+
+    #[test]
+    fn an_uninstalled_policy_withholds_every_change() {
+        // No test in this crate's unit-test binary installs these switches,
+        // so each predicate reads an uninstalled policy here. Whatever the
+        // process environment holds, all four must be off.
+        assert!(RA_ABI_COPY_HINTS_DISABLED.get().is_none());
+        assert!(RA_CALLER_SAVED_FIRST_DISABLED.get().is_none());
+        assert!(RA_COLD_CALL_WEIGHT_DISABLED.get().is_none());
+        assert!(RA_CALL_SPLIT_DISABLED.get().is_none());
+        assert!(!x86_ra_abi_copy_hints_enabled());
+        assert!(!x86_ra_caller_saved_first_enabled());
+        assert!(!x86_ra_cold_call_weight_enabled());
+        assert!(!x86_ra_call_split_enabled());
+    }
+}
+
+/// Reorder every GPR class of `config`'s allocatable pool so that the ABI's
+/// caller-saved registers come first and its callee-saved registers last,
+/// each group in its existing relative order. The pool's MEMBERSHIP is
+/// unchanged; only the order the allocator tries free registers in moves.
+///
+/// Why: the allocator takes the first free register in pool order for an
+/// interval with no hint, and the historical order put callee-saved RBX
+/// fourth. A value that crosses no call then took RBX whenever RAX, RCX and
+/// RDX were busy, which costs a `push`/`pop` pair (and a frame realignment) in
+/// a function that needed none, and in a loop that holds a call on one path it
+/// took the callee-saved registers the values living ACROSS that call needed,
+/// so those were spilled. An interval that crosses a call is unaffected:
+/// every caller-saved register is reserved at the call, and its call-crossing
+/// hint already lists the callee-saved registers first. This is the order
+/// LLVM's x86-64 allocation order uses for the same reason.
+fn x86_caller_saved_first_order(config: &mut trust_cg_regalloc::AllocConfig, abi: X86CallAbi) {
+    for class in [RegClass::Gpr64, RegClass::Gpr32] {
+        let Some(regs) = config.allocatable_regs.get_mut(&class) else {
+            continue;
+        };
+        let callee_saved = |preg: &trust_cg_regalloc::PReg| {
+            trust_cg_regalloc::preg_to_x86(*preg)
+                .is_some_and(|reg| x86_callee_saved_gpr_save_root(abi, reg).is_some())
+        };
+        let (caller, callee): (Vec<_>, Vec<_>) = regs.iter().partition(|preg| !callee_saved(preg));
+        *regs = caller.into_iter().chain(callee).collect();
     }
 }
 
@@ -15853,6 +16425,13 @@ pub struct X86PipelineConfig {
     /// emission); raw bytes do not read it. Empty keeps every object
     /// byte-identical.
     pub weak_function_definitions: std::collections::BTreeSet<String>,
+    /// Which allocation-quality policy the register allocation follows
+    /// ([`X86AllocationQuality`]). The default, `Installed`, reads only the
+    /// process policy a driver installed; `Compiler::compile` sets `Withheld`
+    /// on its object pipeline when the compile emits proof certificates and
+    /// `CertificateFree` when it emits none and requests it
+    /// (`CompilerConfig::x86_certificate_free_allocation`).
+    pub allocation_quality: X86AllocationQuality,
 }
 
 impl Default for X86PipelineConfig {
@@ -15868,6 +16447,7 @@ impl Default for X86PipelineConfig {
             panic_unwind: false,
             macho_build_version: crate::apple_deployment::MachOBuildVersion::DEFAULT,
             weak_function_definitions: std::collections::BTreeSet::new(),
+            allocation_quality: X86AllocationQuality::Installed,
         }
     }
 }
@@ -16498,6 +17078,15 @@ fn x86_replay_existing_operand_rewrite(
                     && defs.peek() == Some(&RegAllocOperand::PReg(expected))
                 {
                     defs.consume_exact(RegAllocOperand::PReg(expected))?;
+                }
+                // An ABI register copy's source (`x86_abi_register_copy`) is
+                // the one physical operand stated as an EXPLICIT use.
+                if access.is_use
+                    && !access.is_def
+                    && let Some(expected) = x86_fixed_operand_to_preg(*preg)
+                    && uses.peek() == Some(&RegAllocOperand::PReg(expected))
+                {
+                    uses.consume_exact(RegAllocOperand::PReg(expected))?;
                 }
             }
             X86ISelOperand::Imm(imm) => {
@@ -17230,12 +17819,12 @@ fn x86_cmpxchg_has_memory_operand(inst: &X86ISelInst) -> bool {
 }
 
 #[derive(Clone, Copy)]
-struct X86OperandAccess {
-    is_use: bool,
-    is_def: bool,
+pub(super) struct X86OperandAccess {
+    pub(super) is_use: bool,
+    pub(super) is_def: bool,
 }
 
-fn x86_operand_access(inst: &X86ISelInst, idx: usize) -> X86OperandAccess {
+pub(super) fn x86_operand_access(inst: &X86ISelInst, idx: usize) -> X86OperandAccess {
     match inst.opcode {
         X86Opcode::Xchg if idx < 2 => {
             return X86OperandAccess {
@@ -17570,7 +18159,7 @@ fn install_x86_spill_slots(func: &mut X86ISelFunction, plan: &X86SpillPlan) -> H
 
 struct X86SpillScratchState {
     abi: X86CallAbi,
-    assigned: HashMap<VReg, X86PReg>,
+    assigned: X86Allocation,
     loaded: HashSet<VReg>,
     stores: Vec<VReg>,
     gpr_used: usize,
@@ -17581,7 +18170,7 @@ impl X86SpillScratchState {
     fn new(abi: X86CallAbi) -> Self {
         Self {
             abi,
-            assigned: HashMap::new(),
+            assigned: X86Allocation::default(),
             loaded: HashSet::new(),
             stores: Vec::new(),
             gpr_used: 0,
@@ -18450,7 +19039,7 @@ struct X86ReloadedSlot {
 fn elide_redundant_x86_spill_reloads(
     func: &mut X86ISelFunction,
     installed_spills: &HashMap<VReg, u32>,
-    alloc: &HashMap<VReg, X86PReg>,
+    alloc: &X86Allocation,
 ) -> X86ReloadElideEvidence {
     let mut evidence = X86ReloadElideEvidence::default();
     if installed_spills.is_empty() || !x86_spill_reload_elide_enabled() {
@@ -18603,7 +19192,7 @@ impl X86ReloadElideEvidence {
 /// Whether any DEF operand of `inst` names a register this pass cannot resolve to
 /// a physical one (rule 1b). A `PReg` always resolves; a `VReg` resolves only when
 /// `alloc` maps it.
-fn x86_inst_has_unresolvable_def(inst: &X86ISelInst, alloc: &HashMap<VReg, X86PReg>) -> bool {
+fn x86_inst_has_unresolvable_def(inst: &X86ISelInst, alloc: &X86Allocation) -> bool {
     (0..inst.operands.len()).any(|i| {
         x86_operand_access(inst, i).is_def
             && matches!(&inst.operands[i], X86ISelOperand::VReg(v) if !alloc.contains_key(v))
@@ -18691,7 +19280,7 @@ fn x86_spill_reload_shape(
 fn x86_spill_store_shape(
     inst: &X86ISelInst,
     spill_slots: &HashSet<u32>,
-    alloc: &HashMap<VReg, X86PReg>,
+    alloc: &X86Allocation,
 ) -> Option<(X86PReg, u32, u8)> {
     if inst.proof_origin.is_some() || inst.flags != inst.opcode.default_flags() {
         return None;
@@ -18930,7 +19519,6 @@ fn materialize_x86_spills(
 /// spills — allocation correctness is independently enforced by the regalloc
 /// validator + TV-5 on every compile.
 fn x86_block_loop_depths(func: &X86ISelFunction) -> Vec<u32> {
-    use std::collections::{HashMap as DepthMap, HashSet as DepthSet};
     let max_block_id = func
         .block_order
         .iter()
@@ -18966,6 +19554,36 @@ fn x86_block_loop_depths(func: &X86ISelFunction) -> Vec<u32> {
         || func.block_order.len() < 2
     {
         return depths;
+    }
+
+    for natural_loop in x86_natural_loops(func).values() {
+        for block in &natural_loop.body {
+            if let Some(d) = depths.get_mut(block.0 as usize) {
+                *d = d.saturating_add(1);
+            }
+        }
+    }
+    depths
+}
+
+/// One natural loop of an x86 ISel CFG: every back edge into `header`
+/// (an edge whose target dominates its source) merged into one body.
+#[derive(Debug, Clone, Default)]
+pub(super) struct X86NaturalLoop {
+    /// The header and every block that reaches a latch without passing
+    /// through the header.
+    pub(super) body: std::collections::HashSet<LirBlock>,
+    /// The sources of the back edges into the header.
+    pub(super) latches: Vec<LirBlock>,
+}
+
+/// The natural loops of `func`, keyed by header. Dominators are computed on
+/// the blocks reachable from the entry (`block_order[0]`); a block that is not
+/// reachable belongs to no loop.
+pub(super) fn x86_natural_loops(func: &X86ISelFunction) -> HashMap<LirBlock, X86NaturalLoop> {
+    use std::collections::{HashMap as DepthMap, HashSet as DepthSet};
+    if func.block_order.is_empty() {
+        return DepthMap::new();
     }
 
     // Predecessor map.
@@ -19093,7 +19711,7 @@ fn x86_block_loop_depths(func: &X86ISelFunction) -> Vec<u32> {
     // Back-edges -> loop bodies (backward reachability from the latch, stopping
     // at the header), merged per header; depth = number of distinct headers
     // whose body contains the block.
-    let mut bodies: DepthMap<LirBlock, DepthSet<LirBlock>> = DepthMap::new();
+    let mut loops: DepthMap<LirBlock, X86NaturalLoop> = DepthMap::new();
     for &block in &func.block_order {
         let Some(b) = func.blocks.get(&block) else {
             continue;
@@ -19115,21 +19733,13 @@ fn x86_block_loop_depths(func: &X86ISelFunction) -> Vec<u32> {
                         }
                     }
                 }
-                bodies
-                    .entry(header)
-                    .and_modify(|existing| existing.extend(body.iter().copied()))
-                    .or_insert(body);
+                let natural_loop = loops.entry(header).or_default();
+                natural_loop.body.extend(body);
+                natural_loop.latches.push(latch);
             }
         }
     }
-    for body in bodies.values() {
-        for block in body {
-            if let Some(d) = depths.get_mut(block.0 as usize) {
-                *d = d.saturating_add(1);
-            }
-        }
-    }
-    depths
+    loops
 }
 
 /// The RETURN-MOVE WINDOW of a block whose `ret` delivers results in TrustCG's
@@ -19217,8 +19827,267 @@ fn x86_internal_return_window_start(
     Ok(Some((start, ret_index)))
 }
 
+#[cfg(test)]
 fn x86_isel_to_regalloc(func: &X86ISelFunction) -> Result<RegAllocFunction, X86PipelineError> {
-    let block_loop_depths = x86_block_loop_depths(func);
+    x86_isel_to_regalloc_with(func, &X86RegallocConversion::default())
+}
+
+/// How [`x86_isel_to_regalloc_with`] states two instruction shapes to the
+/// allocator. The default states both exactly as the historical conversion did.
+#[derive(Debug, Default)]
+pub(super) struct X86RegallocConversion {
+    /// State a formal-argument or return copy ([`x86_abi_copy_positions`]) as
+    /// a `PSEUDO_COPY` with an EXPLICIT physical operand, the form
+    /// `copy_register_hints` and the regalloc validator's identity-copy
+    /// carve-out recognize. Off: the physical register is an implicit operand
+    /// of an opaque `MovRR`, the hint the pipeline supplies for it is refused
+    /// by the reservation at its own copy point, and the copy survives as a
+    /// real move.
+    pub(super) abi_copies: bool,
+    /// Register copies that must stay opaque to the pre-RA coalescer: the
+    /// split copies `call_split` inserts around a call. Each such copy reads
+    /// or writes one of these virtual registers; stated as a `PSEUDO_COPY`,
+    /// the coalescer would merge the split temporary back into the value it
+    /// was split from and undo the split.
+    pub(super) pinned_copy_vregs: HashSet<VReg>,
+    /// Count every block of a cold call region ([`x86_cold_call_regions`])
+    /// one loop level shallower in the spill weights.
+    pub(super) cold_call_regions: bool,
+}
+
+/// The blocks of every COLD CALL REGION of `func`: for a two-way branch
+/// inside a natural loop whose successors are both in the loop and neither is
+/// its header, the region of one successor (the loop blocks every path from
+/// the header to them passes through that successor) when that successor has
+/// the branch as its only predecessor, its region holds a call and none of
+/// the loop's latches, and the other successor's region holds no call.
+///
+/// This is the static fact the branch-layout pass's cold-arm rule reads (a
+/// call-bearing arm of a loop diamond whose other arm calls nothing is the
+/// cold path); `Vec::push`'s grow path is the measured case. It is a
+/// PROFITABILITY estimate only: it lowers the spill weight of the uses in
+/// those blocks, so a value used only on the call's path no longer outbids a
+/// value the loop uses on every iteration for a callee-saved register. It
+/// changes no instruction, and the allocator's interference checks and
+/// validator are unaffected by any weight.
+pub(super) fn x86_cold_call_regions(func: &X86ISelFunction) -> HashSet<LirBlock> {
+    let has_call = |block: &LirBlock| {
+        func.blocks
+            .get(block)
+            .is_some_and(|b| b.insts.iter().any(|inst| inst.flags.is_call()))
+    };
+    let mut cold = HashSet::new();
+    // A call block with no successor (a panic or abort sink) is in no loop
+    // body, so a function whose calls are all such sinks has no cold call
+    // region; this spares the loop analysis there. No effect on the result.
+    let has_loop_call = |block: &LirBlock| {
+        has_call(block)
+            && func
+                .blocks
+                .get(block)
+                .is_some_and(|b| !b.successors.is_empty())
+    };
+    if !func.block_order.iter().any(has_loop_call) {
+        return cold;
+    }
+    let mut pred_count: HashMap<LirBlock, usize> = HashMap::new();
+    for block in &func.block_order {
+        if let Some(b) = func.blocks.get(block) {
+            for succ in &b.successors {
+                *pred_count.entry(*succ).or_default() += 1;
+            }
+        }
+    }
+    for (&header, natural_loop) in &x86_natural_loops(func) {
+        // A loop with no call in its body has no region that holds one, so
+        // nothing below can mark a block of it cold. Skipping it spares the
+        // two region walks per branch (measured: they were most of this
+        // switch's compile cost on 300 copies of the p4 kernel, whose calls
+        // are all panic sinks outside every loop). No effect on the result.
+        if !natural_loop.body.iter().any(has_call) {
+            continue;
+        }
+        // The loop blocks reachable from the header without entering `avoid`.
+        let reachable_avoiding = |avoid: LirBlock| {
+            let mut seen: HashSet<LirBlock> = HashSet::from([header]);
+            let mut work = vec![header];
+            while let Some(current) = work.pop() {
+                let Some(b) = func.blocks.get(&current) else {
+                    continue;
+                };
+                for &succ in &b.successors {
+                    if succ != avoid && natural_loop.body.contains(&succ) && seen.insert(succ) {
+                        work.push(succ);
+                    }
+                }
+            }
+            seen
+        };
+        let region = |entry: LirBlock| -> HashSet<LirBlock> {
+            let outside = reachable_avoiding(entry);
+            natural_loop
+                .body
+                .iter()
+                .copied()
+                .filter(|block| !outside.contains(block))
+                .collect()
+        };
+        for block in &natural_loop.body {
+            let Some(b) = func.blocks.get(block) else {
+                continue;
+            };
+            let [first, second] = b.successors.as_slice() else {
+                continue;
+            };
+            if first == second
+                || *first == header
+                || *second == header
+                || !natural_loop.body.contains(first)
+                || !natural_loop.body.contains(second)
+            {
+                continue;
+            }
+            let (first_region, second_region) = (region(*first), region(*second));
+            let first_calls = first_region.iter().any(has_call);
+            let second_calls = second_region.iter().any(has_call);
+            // An arm is entered only from the branch: a successor with another
+            // predecessor is a join every iteration may reach, not an arm.
+            // An arm also leaves the loop's back edges to the rest of the body:
+            // a region holding a latch is the tail every iteration runs (the
+            // exit of an inner loop into it, for one).
+            let only_from_branch = |succ: &LirBlock| pred_count.get(succ) == Some(&1);
+            let holds_latch = |region: &HashSet<LirBlock>| {
+                natural_loop
+                    .latches
+                    .iter()
+                    .any(|latch| region.contains(latch))
+            };
+            if first_calls
+                && !second_calls
+                && only_from_branch(first)
+                && !holds_latch(&first_region)
+            {
+                cold.extend(first_region);
+            } else if second_calls
+                && !first_calls
+                && only_from_branch(second)
+                && !holds_latch(&second_region)
+            {
+                cold.extend(second_region);
+            }
+        }
+    }
+    cold
+}
+
+/// An ABI register copy: `MovRR v, P` or `MovRR P, v` between a `Gpr64`
+/// virtual register and an allocatable 64-bit GPR, with no other operand,
+/// flag, call-argument record or fixed implicit operand. Returns the
+/// `(def, use)` pair of the explicit-operand copy. Only the 64-bit form is
+/// admitted: `copy_register_hints` width-aligns a 32-bit hint with the
+/// AArch64 W view, which names no x86 register, so a 32-bit copy keeps the
+/// historical opaque form.
+fn x86_abi_register_copy(inst: &X86ISelInst) -> Option<(RegAllocOperand, RegAllocOperand)> {
+    if inst.opcode != X86Opcode::MovRR
+        || inst.flags != Default::default()
+        || !inst.call_arg_regs.is_empty()
+    {
+        return None;
+    }
+    let (mut implicit_defs, mut implicit_uses) = (Vec::new(), Vec::new());
+    add_x86_fixed_implicit_operands(inst, &mut implicit_defs, &mut implicit_uses);
+    if !implicit_defs.is_empty() || !implicit_uses.is_empty() {
+        return None;
+    }
+    let allocatable = |p: X86PReg| {
+        if X86_ALLOCATABLE_GPRS.contains(&p) {
+            x86_fixed_operand_to_preg(p)
+        } else {
+            None
+        }
+    };
+    match inst.operands.as_slice() {
+        [X86ISelOperand::VReg(dst), X86ISelOperand::PReg(src)] if dst.class == RegClass::Gpr64 => {
+            Some((
+                RegAllocOperand::VReg(*dst),
+                RegAllocOperand::PReg(allocatable(*src)?),
+            ))
+        }
+        [X86ISelOperand::PReg(dst), X86ISelOperand::VReg(src)] if src.class == RegClass::Gpr64 => {
+            Some((
+                RegAllocOperand::PReg(allocatable(*dst)?),
+                RegAllocOperand::VReg(*src),
+            ))
+        }
+        _ => None,
+    }
+}
+
+/// The instruction indices of `block` whose ABI register copy
+/// ([`x86_abi_register_copy`]) is stated with an explicit physical operand:
+/// the leading run of formal-argument copies `MovRR v, P` of the entry block
+/// (nothing before them writes a register, so each reads the incoming
+/// argument), and the run of return copies `MovRR RAX|RDX, v` immediately
+/// before the block's `Ret`.
+///
+/// Other ABI copies keep the opaque form. A call-result copy or a fixed
+/// register read such as `MovRR v, RDX` after `Mul` would also take the hint,
+/// and then the identity move left behind is deleted after allocation; the
+/// post-RA dataflow check (TV-5) does not credit the implicit physical def of
+/// the call or the multiply to `v`, so it refuses the function
+/// (`call-severed-vreg-read`, measured on `p7_sieve` and `p4_matmul`). That
+/// check is not weakened; those copies are simply not offered.
+fn x86_abi_copy_positions(
+    is_entry: bool,
+    block: &trust_cg_lower::x86_64_isel::X86ISelBlock,
+) -> HashSet<usize> {
+    let mut positions = HashSet::new();
+    if is_entry {
+        for (idx, inst) in block.insts.iter().enumerate() {
+            match x86_abi_register_copy(inst) {
+                Some((RegAllocOperand::VReg(_), RegAllocOperand::PReg(_))) => {
+                    positions.insert(idx);
+                }
+                _ => break,
+            }
+        }
+    }
+    if let Some(ret) = block
+        .insts
+        .iter()
+        .rposition(|inst| inst.opcode == X86Opcode::Ret)
+    {
+        let return_reg = |preg: &trust_cg_regalloc::PReg| {
+            [x86_64_regs::RAX, x86_64_regs::RDX]
+                .iter()
+                .any(|reg| x86_fixed_operand_to_preg(*reg) == Some(*preg))
+        };
+        for idx in (0..ret).rev() {
+            match x86_abi_register_copy(&block.insts[idx]) {
+                Some((RegAllocOperand::PReg(preg), RegAllocOperand::VReg(_)))
+                    if return_reg(&preg) =>
+                {
+                    positions.insert(idx);
+                }
+                _ => break,
+            }
+        }
+    }
+    positions
+}
+
+pub(super) fn x86_isel_to_regalloc_with(
+    func: &X86ISelFunction,
+    conversion: &X86RegallocConversion,
+) -> Result<RegAllocFunction, X86PipelineError> {
+    let mut block_loop_depths = x86_block_loop_depths(func);
+    if conversion.cold_call_regions {
+        for block in x86_cold_call_regions(func) {
+            if let Some(depth) = block_loop_depths.get_mut(block.0 as usize) {
+                *depth = depth.saturating_sub(1);
+            }
+        }
+    }
 
     // Spill weight is `sum(base^loop_depth)/interval_length`, so if these depths
     // are all zero the weight degenerates to a pure (uses+defs)/length density
@@ -19271,6 +20140,11 @@ fn x86_isel_to_regalloc(func: &X86ISelFunction) -> Result<RegAllocFunction, X86P
         // wrote. Every other block converts exactly as before.
         let return_window = x86_internal_return_window_start(*blk, isel_block, &func.sig.returns)?;
         let mut return_window_defs: Vec<trust_cg_regalloc::PReg> = Vec::new();
+        let abi_copy_positions = if conversion.abi_copies {
+            x86_abi_copy_positions(*blk == func.block_order[0], isel_block)
+        } else {
+            HashSet::new()
+        };
 
         for (inst_index, isel_inst) in isel_block.insts.iter().enumerate() {
             let inst_id = InstId(ra_insts.len() as u32);
@@ -19278,8 +20152,32 @@ fn x86_isel_to_regalloc(func: &X86ISelFunction) -> Result<RegAllocFunction, X86P
             let in_return_window =
                 return_window.is_some_and(|(start, ret)| (start..ret).contains(&inst_index));
 
-            let opcode = x86_regalloc_opcode_for_isel_inst(isel_inst);
             let flags = isel_inst.flags;
+            if conversion.abi_copies
+                && !in_return_window
+                && abi_copy_positions.contains(&inst_index)
+                && let Some((def, use_)) = x86_abi_register_copy(isel_inst)
+            {
+                ra_insts.push(RegAllocInst {
+                    opcode: trust_cg_regalloc::phi_elim::PSEUDO_COPY,
+                    defs: vec![def],
+                    uses: vec![use_],
+                    implicit_defs: Vec::new(),
+                    implicit_uses: Vec::new(),
+                    tied_operands: Vec::new(),
+                    flags,
+                });
+                continue;
+            }
+            let pinned = x86_isel_copy_like_vregs(isel_inst).is_some_and(|(dst, src)| {
+                conversion.pinned_copy_vregs.contains(&dst)
+                    || conversion.pinned_copy_vregs.contains(&src)
+            });
+            let opcode = if pinned {
+                isel_inst.opcode as u16
+            } else {
+                x86_regalloc_opcode_for_isel_inst(isel_inst)
+            };
 
             let mut defs: Vec<RegAllocOperand> = Vec::new();
             let mut uses: Vec<RegAllocOperand> = Vec::new();
@@ -19961,8 +20859,25 @@ impl X86Pipeline {
         func: &mut X86ISelFunction,
         strategy: AllocStrategy,
     ) -> Result<X86RegAssignment, X86PipelineError> {
+        // 0. Split the GPR values live across a conditional in-loop call
+        //    around that call (`super::call_split`), so they cross no call on
+        //    the paths that do not reach it.
+        let quality = self.config.allocation_quality;
+        let split = if x86_ra_call_split_enabled_in(quality) {
+            super::call_split::split_around_conditional_calls(func)?
+        } else {
+            Default::default()
+        };
+
         // 1. Convert X86ISelFunction -> RegAllocFunction.
-        let mut ra_func = x86_isel_to_regalloc(func)?;
+        let (split_calls, split_temps) = (split.calls, split.temps.len());
+        let conversion_abi_copies = x86_ra_abi_copy_hints_enabled_in(quality);
+        let conversion = X86RegallocConversion {
+            abi_copies: conversion_abi_copies,
+            pinned_copy_vregs: split.temps,
+            cold_call_regions: x86_ra_cold_call_weight_enabled_in(quality),
+        };
+        let mut ra_func = x86_isel_to_regalloc_with(func, &conversion)?;
 
         // 2. Collect arg register hints from MOV vreg, PReg(X) patterns.
         //
@@ -19994,6 +20909,10 @@ impl X86Pipeline {
             AllocStrategy::Greedy => x86_64_greedy_alloc_config(),
         };
         apply_x86_abi_allocatable_regs(&mut config, self.config.call_abi);
+        if x86_ra_caller_saved_first_enabled_in(quality) {
+            x86_caller_saved_first_order(&mut config, self.config.call_abi);
+        }
+        config.avoid_claimed_hint_regs = conversion_abi_copies;
         config.hints = hints;
         // Snapshot the FULL pool before the scratch reservation, so the
         // stats-only counterfactual probe below can answer "would this function
@@ -20110,6 +21029,9 @@ impl X86Pipeline {
                 counterfactual,
             );
         }
+        if x86_ra_trace_enabled() {
+            x86_ra_trace_report(&ra_func, &result, split_calls, split_temps);
+        }
         let reported_spill_slots: HashSet<StackSlotId> =
             result.spills.iter().map(|spill| spill.slot).collect();
         let mut spill_plan = X86SpillPlan::default();
@@ -20134,7 +21056,7 @@ impl X86Pipeline {
         )?;
 
         // 5. Translate PReg -> X86PReg.
-        let mut allocation: HashMap<VReg, X86PReg> = translate_allocation(&result.allocation)
+        let mut allocation: X86Allocation = translate_allocation(&result.allocation)
             .into_iter()
             .collect();
         bind_x86_dead_volatile_load_defs(func, &mut allocation, self.config.call_abi)?;
@@ -20832,7 +21754,7 @@ impl X86Pipeline {
     fn run_x86_movrr_coalesce_with_captured_spec(
         &self,
         func: &mut X86ISelFunction,
-        alloc: &HashMap<VReg, X86PReg>,
+        alloc: &X86Allocation,
     ) -> Result<(), X86PipelineError> {
         if self.config.opt_level == trust_cg_opt::OptLevel::O0 || x86_movrr_coalesce_disabled() {
             return Ok(());
@@ -20919,7 +21841,7 @@ impl X86Pipeline {
     fn recheck_post_regalloc(
         &self,
         func: &X86ISelFunction,
-        alloc: &HashMap<VReg, X86PReg>,
+        alloc: &X86Allocation,
         spill_disps: &HashSet<i32>,
     ) -> Result<(), X86PipelineError> {
         validate_x86_resolved_function_layout(func)?;
@@ -24446,7 +25368,7 @@ impl X86Pipeline {
     fn encode_function_with_fixups(
         &self,
         func: &X86ISelFunction,
-        alloc: &HashMap<VReg, X86PReg>,
+        alloc: &X86Allocation,
     ) -> Result<(Vec<u8>, Vec<(usize, usize)>), X86PipelineError> {
         let (code, cp_fixups, _call_fixups, _global_ref_fixups) =
             self.encode_function_with_all_fixups(func, alloc)?;
@@ -24467,7 +25389,7 @@ impl X86Pipeline {
     fn encode_function_with_all_fixups(
         &self,
         func: &X86ISelFunction,
-        alloc: &HashMap<VReg, X86PReg>,
+        alloc: &X86Allocation,
     ) -> Result<
         (
             Vec<u8>,
@@ -24485,7 +25407,7 @@ impl X86Pipeline {
     fn encode_function_with_all_fixups_and_block_metadata(
         &self,
         func: &X86ISelFunction,
-        alloc: &HashMap<VReg, X86PReg>,
+        alloc: &X86Allocation,
         branch_targets: &HashMap<(LirBlock, usize), LirBlock>,
     ) -> Result<
         (
@@ -24651,7 +25573,11 @@ impl X86Pipeline {
                                 // already lies inside one line where it stands,
                                 // do nothing. This is the property the
                                 // 2026-07-16 pass lacked and the direct cause
-                                // of its b03 −56%.
+                                // of its b03 −56%. The one exception is an
+                                // installed relocation of contained loops
+                                // (certificate-free bridge compiles only, see
+                                // `set_x86_loop_align_relocate_contained`),
+                                // which pads them to the line start too.
                                 //
                                 // The body lies inside its line exactly when it
                                 // fits in the `pad` bytes left in that line, so
@@ -24669,7 +25595,10 @@ impl X86Pipeline {
                                     pad,
                                 )
                                 .is_some();
-                                if contained_now {
+                                if x86_loop_align_g6_declines(
+                                    contained_now,
+                                    x86_loop_align_relocate_contained(),
+                                ) {
                                     la_stats.decline_already_contained += 1;
                                 } else {
                                     // Here the body as it stands is LONGER than
@@ -24693,14 +25622,42 @@ impl X86Pipeline {
                                     // is bounded by one sub-iteration per entry
                                     // against one saved line crossing per
                                     // iteration.
-                                    let budget = if last_emitted_was_hard_terminator {
-                                        loop_align_max_skip
+                                    //
+                                    // That argument holds only for a STRADDLING
+                                    // body. A relocated contained loop
+                                    // (`contained_now`, admitted past G6 only by
+                                    // the installed relocation) has its own
+                                    // bound,
+                                    // `x86_loop_align_contained_pad_admitted`:
+                                    // a dead site as usual, a live seam only
+                                    // when the pad retires fewer instructions
+                                    // than one iteration of the body.
+                                    let admitted = if contained_now {
+                                        x86_span_retired_inst_floor(func, layout_idx, span_end_idx)
+                                            .is_some_and(|body_insts| {
+                                                x86_loop_align_contained_pad_admitted(
+                                                    pad,
+                                                    last_emitted_was_hard_terminator,
+                                                    loop_align_max_skip,
+                                                    loop_align_seam_pad,
+                                                    body_insts,
+                                                )
+                                            })
+                                    } else if last_emitted_was_hard_terminator {
+                                        pad <= loop_align_max_skip
                                     } else {
-                                        loop_align_seam_pad
+                                        pad <= loop_align_seam_pad
                                     };
-                                    if pad > budget {
-                                        la_stats.decline_live_seam += 1;
+                                    if !admitted {
+                                        if contained_now {
+                                            la_stats.decline_contained_pad += 1;
+                                        } else {
+                                            la_stats.decline_live_seam += 1;
+                                        }
                                     } else {
+                                        if contained_now {
+                                            la_stats.relocated_contained += 1;
+                                        }
                                         x86_emit_nop_run(
                                             &mut encoder,
                                             &mut dc_items,
@@ -25152,7 +26109,7 @@ impl X86Pipeline {
             eprintln!(
                 "[loop-align] `{}`: heads={} already={} padded={} (+{} bytes) miss={} | \
                  declines: nested_head={} pad_too_big={} body_too_big={} \
-                 already_contained={} live_seam={}",
+                 already_contained={} live_seam={} contained_pad={} | relocated_contained={}",
                 func.name,
                 la_stats.heads,
                 la_stats.already,
@@ -25164,6 +26121,8 @@ impl X86Pipeline {
                 la_stats.decline_body_too_big,
                 la_stats.decline_already_contained,
                 la_stats.decline_live_seam,
+                la_stats.decline_contained_pad,
+                la_stats.relocated_contained,
             );
         }
 
@@ -25292,7 +26251,7 @@ impl X86Pipeline {
     fn encode_function(
         &self,
         func: &X86ISelFunction,
-        alloc: &HashMap<VReg, X86PReg>,
+        alloc: &X86Allocation,
     ) -> Result<Vec<u8>, X86PipelineError> {
         let (code, _fixups) = self.encode_function_with_fixups(func, alloc)?;
         Ok(code)
@@ -25830,7 +26789,7 @@ mod tests {
         ] {
             assert!(
                 pipeline
-                    .encode_function_with_all_fixups(&fixture(operands), &HashMap::new())
+                    .encode_function_with_all_fixups(&fixture(operands), &X86Allocation::default())
                     .is_err()
             );
         }
@@ -25839,11 +26798,17 @@ mod tests {
         let function = fixture(vec![X86ISelOperand::VReg(virtual_reg), exact]);
         assert!(
             pipeline
-                .encode_function_with_all_fixups(&function, &HashMap::from([(virtual_reg, EAX)]))
+                .encode_function_with_all_fixups(
+                    &function,
+                    &X86Allocation::from_iter([(virtual_reg, EAX)])
+                )
                 .is_err()
         );
         let (_, _, _, fixups) = pipeline
-            .encode_function_with_all_fixups(&function, &HashMap::from([(virtual_reg, RAX)]))
+            .encode_function_with_all_fixups(
+                &function,
+                &X86Allocation::from_iter([(virtual_reg, RAX)]),
+            )
             .unwrap();
         assert_eq!(fixups[0].kind, X86SymbolRefFixupKind::ExactFunctionAddr);
         assert_eq!(fixups[0].symbol, "callee");
@@ -26128,7 +27093,11 @@ mod tests {
         let pipeline = X86Pipeline::new(X86PipelineConfig::default());
         let targets = collect_x86_branch_targets(func);
         let (_, _, _, _, block_offsets, _, _, _) = pipeline
-            .encode_function_with_all_fixups_and_block_metadata(func, &HashMap::new(), &targets)
+            .encode_function_with_all_fixups_and_block_metadata(
+                func,
+                &X86Allocation::default(),
+                &targets,
+            )
             .expect("fixture must encode");
         block_offsets[&Block(1)]
     }
@@ -26385,7 +27354,7 @@ mod tests {
                 let targets = collect_x86_branch_targets(func);
                 let layout_successor: HashMap<LirBlock, LirBlock> =
                     func.block_order.windows(2).map(|w| (w[0], w[1])).collect();
-                let alloc = HashMap::new();
+                let alloc: X86Allocation = X86Allocation::default();
                 let probe = X86SpanProbe {
                     func,
                     alloc: &alloc,
@@ -26468,7 +27437,7 @@ mod tests {
     #[test]
     fn x86_jcc_alignment_pads_branch_and_macro_fused_boundaries() {
         let ret = X86ISelInst::new(X86Opcode::Ret, vec![]);
-        let ret_ops = resolve_inst_operands(&ret, &HashMap::new());
+        let ret_ops = resolve_inst_operands(&ret, &X86Allocation::default());
         assert_eq!(
             x86_jcc_erratum_pad(
                 31,
@@ -26476,13 +27445,20 @@ mod tests {
                 &ret_ops,
                 std::slice::from_ref(&ret),
                 0,
-                &HashMap::new()
+                &X86Allocation::default()
             ),
             Some(1),
             "a RET ending exactly on byte 32 must move to the next fetch block"
         );
         assert_eq!(
-            x86_jcc_erratum_pad(30, X86Opcode::Ret, &ret_ops, &[ret], 0, &HashMap::new()),
+            x86_jcc_erratum_pad(
+                30,
+                X86Opcode::Ret,
+                &ret_ops,
+                &[ret],
+                0,
+                &X86Allocation::default()
+            ),
             None,
             "a RET wholly inside the fetch block needs no padding"
         );
@@ -26500,8 +27476,8 @@ mod tests {
                 ],
             ),
         ];
-        let cmp_ops = resolve_inst_operands(&pair[0], &HashMap::new());
-        let jcc_ops = resolve_inst_operands(&pair[1], &HashMap::new());
+        let cmp_ops = resolve_inst_operands(&pair[0], &X86Allocation::default());
+        let jcc_ops = resolve_inst_operands(&pair[1], &X86Allocation::default());
         let unit_len = x86_encoded_len(X86Opcode::CmpRI, &cmp_ops).unwrap()
             + x86_encoded_len(X86Opcode::Jcc, &jcc_ops).unwrap();
         assert!(unit_len < X86_JCC_BOUNDARY);
@@ -26513,7 +27489,7 @@ mod tests {
                 &cmp_ops,
                 &pair,
                 0,
-                &HashMap::new(),
+                &X86Allocation::default(),
             ),
             Some(X86_JCC_BOUNDARY - crossing_pos),
             "a crossing CMP+Jcc pair must be aligned at the CMP, not split at the Jcc"
@@ -26535,14 +27511,14 @@ mod tests {
         let disabled =
             crate::env_lock::with_env_overrides(&[("TCG_NO_X86_JCC_ALIGN", "1")], || {
                 pipeline
-                    .encode_function_with_all_fixups(&func, &HashMap::new())
+                    .encode_function_with_all_fixups(&func, &X86Allocation::default())
                     .unwrap()
                     .0
             });
         let enabled =
             crate::env_lock::with_env_overrides_removed(&["TCG_NO_X86_JCC_ALIGN"], || {
                 pipeline
-                    .encode_function_with_all_fixups(&func, &HashMap::new())
+                    .encode_function_with_all_fixups(&func, &X86Allocation::default())
                     .unwrap()
                     .0
             });
@@ -26738,7 +27714,7 @@ mod tests {
         let encoder_err = pipeline
             .encode_function_with_all_fixups_and_block_metadata(
                 &func,
-                &HashMap::new(),
+                &X86Allocation::default(),
                 &HashMap::new(),
             )
             .expect_err("the final encoder funnel must independently reject duplicates");
@@ -26867,7 +27843,7 @@ mod tests {
             .successors
             .push(successor);
         let tv5 = pipeline
-            .recheck_post_regalloc(&func, &HashMap::new(), &HashSet::new())
+            .recheck_post_regalloc(&func, &X86Allocation::default(), &HashSet::new())
             .expect_err("with exact CFG metadata TV5 must see the cross-block clobber");
         assert!(tv5.to_string().contains("POST-RA-DATAFLOW"));
     }
@@ -28318,7 +29294,7 @@ mod tests {
         let pipeline = raw_no_frame_x86_pipeline();
 
         let (code, cp_fixups, call_fixups, global_ref_fixups) = pipeline
-            .encode_function_with_all_fixups(&func, &HashMap::new())
+            .encode_function_with_all_fixups(&func, &X86Allocation::default())
             .unwrap();
 
         assert_eq!(code, vec![0xE8, 0, 0, 0, 0]);
@@ -28544,7 +29520,7 @@ mod tests {
         let pipeline = raw_no_frame_x86_pipeline();
 
         let (code, cp_fixups, call_fixups, global_ref_fixups) = pipeline
-            .encode_function_with_all_fixups(&func, &HashMap::new())
+            .encode_function_with_all_fixups(&func, &X86Allocation::default())
             .unwrap();
 
         assert_eq!(
@@ -28608,7 +29584,7 @@ mod tests {
 
         let pipeline = raw_no_frame_x86_pipeline();
         let (code, cp_fixups, call_fixups, global_ref_fixups) = pipeline
-            .encode_function_with_all_fixups(&func, &HashMap::new())
+            .encode_function_with_all_fixups(&func, &X86Allocation::default())
             .unwrap();
 
         assert_eq!(
@@ -29197,13 +30173,13 @@ mod tests {
 
         let pipeline = raw_no_frame_x86_pipeline();
 
-        let mut legacy_alloc = HashMap::new();
+        let mut legacy_alloc: X86Allocation = X86Allocation::default();
         legacy_alloc.insert(dst, EAX);
         legacy_alloc.insert(src, ECX);
         let legacy = pipeline.encode_function(&func, &legacy_alloc).unwrap();
         assert_eq!(legacy, vec![0x89, 0xC8]);
 
-        let mut extended_alloc = HashMap::new();
+        let mut extended_alloc: X86Allocation = X86Allocation::default();
         extended_alloc.insert(dst, R8D);
         extended_alloc.insert(src, R9D);
         let extended = pipeline.encode_function(&func, &extended_alloc).unwrap();
@@ -29243,6 +30219,130 @@ mod tests {
         );
         func.push_inst(Block(0), X86ISelInst::new(X86Opcode::Ret, vec![]));
         func
+    }
+
+    /// `x86_abi_copy_positions`: which ABI register copies are stated with an
+    /// explicit physical operand. Each condition is pinned by one case.
+    #[test]
+    fn abi_copy_conversion_states_only_formal_and_return_copies() {
+        use trust_cg_regalloc::phi_elim::PSEUDO_COPY;
+        let g64 = |id| VReg::new(id, RegClass::Gpr64);
+        let mov =
+            |a: X86ISelOperand, b: X86ISelOperand| X86ISelInst::new(X86Opcode::MovRR, vec![a, b]);
+        let mut func = minimal_func("abi_copies");
+        func.next_vreg = 10;
+        let insts = vec![
+            mov(
+                X86ISelOperand::VReg(g64(0)),
+                X86ISelOperand::PReg(x86_64_regs::RDI),
+            ), // formal
+            mov(
+                X86ISelOperand::VReg(g64(1)),
+                X86ISelOperand::PReg(x86_64_regs::RSI),
+            ), // formal
+            X86ISelInst::new(
+                X86Opcode::MovRI,
+                vec![X86ISelOperand::VReg(g64(2)), X86ISelOperand::Imm(1)],
+            ),
+            // After the leading run: not a formal copy.
+            mov(
+                X86ISelOperand::VReg(g64(3)),
+                X86ISelOperand::PReg(x86_64_regs::RDX),
+            ),
+            X86ISelInst::new(
+                X86Opcode::MovRI,
+                vec![X86ISelOperand::VReg(g64(4)), X86ISelOperand::Imm(2)],
+            ),
+            // A non-return register inside the run before `ret`: it ends the run.
+            mov(
+                X86ISelOperand::PReg(x86_64_regs::RCX),
+                X86ISelOperand::VReg(g64(1)),
+            ),
+            mov(
+                X86ISelOperand::PReg(x86_64_regs::RDX),
+                X86ISelOperand::VReg(g64(0)),
+            ), // return
+            mov(
+                X86ISelOperand::PReg(x86_64_regs::RAX),
+                X86ISelOperand::VReg(g64(3)),
+            ), // return
+            X86ISelInst::new(X86Opcode::Ret, vec![]),
+        ];
+        for inst in insts {
+            func.push_inst(Block(0), inst);
+        }
+        let on = X86RegallocConversion {
+            abi_copies: true,
+            ..Default::default()
+        };
+        let ra = x86_isel_to_regalloc_with(&func, &on).unwrap();
+        let copies: Vec<usize> = ra.blocks[0]
+            .insts
+            .iter()
+            .enumerate()
+            .filter(|(_, id)| ra.insts[id.0 as usize].opcode == PSEUDO_COPY)
+            .map(|(idx, _)| idx)
+            .collect();
+        assert_eq!(copies, vec![0, 1, 6, 7]);
+        let formal = &ra.insts[ra.blocks[0].insts[0].0 as usize];
+        assert_eq!(
+            formal.uses,
+            vec![RegAllocOperand::PReg(
+                x86_to_preg(x86_64_regs::RDI).unwrap()
+            )]
+        );
+        assert!(formal.implicit_uses.is_empty());
+        let ret = &ra.insts[ra.blocks[0].insts[7].0 as usize];
+        assert_eq!(
+            ret.defs,
+            vec![RegAllocOperand::PReg(
+                x86_to_preg(x86_64_regs::RAX).unwrap()
+            )]
+        );
+        assert!(ret.implicit_defs.is_empty());
+
+        // Off: the historical conversion, no copy is stated explicitly.
+        let off = x86_isel_to_regalloc_with(&func, &X86RegallocConversion::default()).unwrap();
+        assert!(off.insts.iter().all(|inst| inst.opcode != PSEUDO_COPY));
+    }
+
+    /// A 32-bit ABI copy keeps the opaque form (the copy hint width-aligns with
+    /// an AArch64 view), and so does a 64-bit copy with a non-default flag.
+    #[test]
+    fn abi_copy_conversion_refuses_narrow_and_flagged_copies() {
+        let mut func = minimal_func("abi_copy_narrow");
+        func.next_vreg = 4;
+        func.push_inst(
+            Block(0),
+            X86ISelInst::new(
+                X86Opcode::MovRR32,
+                vec![
+                    X86ISelOperand::VReg(VReg::new(0, RegClass::Gpr32)),
+                    X86ISelOperand::PReg(x86_64_regs::EDI),
+                ],
+            ),
+        );
+        func.push_inst(Block(0), X86ISelInst::new(X86Opcode::Ret, vec![]));
+        let on = X86RegallocConversion {
+            abi_copies: true,
+            ..Default::default()
+        };
+        let ra = x86_isel_to_regalloc_with(&func, &on).unwrap();
+        assert!(
+            ra.insts
+                .iter()
+                .all(|inst| inst.opcode != trust_cg_regalloc::phi_elim::PSEUDO_COPY)
+        );
+
+        let mut flagged = X86ISelInst::new(
+            X86Opcode::MovRR,
+            vec![
+                X86ISelOperand::VReg(VReg::new(1, RegClass::Gpr64)),
+                X86ISelOperand::PReg(x86_64_regs::RDI),
+            ],
+        );
+        flagged.flags = InstFlags::HAS_SIDE_EFFECTS;
+        assert!(x86_abi_register_copy(&flagged).is_none());
     }
 
     #[test]
@@ -37317,7 +38417,7 @@ mod tests {
     #[test]
     fn test_resolve_operand_vreg() {
         let v0 = VReg::new(0, RegClass::Gpr64);
-        let mut alloc = HashMap::new();
+        let mut alloc: X86Allocation = X86Allocation::default();
         alloc.insert(v0, RAX);
 
         assert_eq!(
@@ -37328,7 +38428,7 @@ mod tests {
 
     #[test]
     fn test_resolve_operand_preg() {
-        let alloc = HashMap::new();
+        let alloc: X86Allocation = X86Allocation::default();
         assert_eq!(
             resolve_operand(&X86ISelOperand::PReg(RDI), &alloc),
             Some(RDI)
@@ -37337,7 +38437,7 @@ mod tests {
 
     #[test]
     fn test_resolve_operand_imm_returns_none() {
-        let alloc = HashMap::new();
+        let alloc: X86Allocation = X86Allocation::default();
         assert_eq!(resolve_operand(&X86ISelOperand::Imm(42), &alloc), None);
     }
 
@@ -37783,7 +38883,7 @@ mod tests {
     #[test]
     fn full_regalloc_binds_dead_volatile_loads_to_reserved_scratch_registers() {
         let (func, dead_defs) = dead_volatile_load_function("dead_volatile_bind");
-        let mut allocation = HashMap::new();
+        let mut allocation: X86Allocation = X86Allocation::default();
         bind_x86_dead_volatile_load_defs(&func, &mut allocation, X86CallAbi::SystemV).unwrap();
 
         assert_eq!(allocation[&dead_defs[0]], R10D);
@@ -37889,7 +38989,7 @@ mod tests {
                 X86ISelOperand::Imm(1),
             ],
         );
-        let ops = resolve_inst_operands(&pinsrq, &HashMap::new());
+        let ops = resolve_inst_operands(&pinsrq, &X86Allocation::default());
         assert_eq!(ops.dst, Some(XMM8));
         assert_eq!(ops.src, Some(R9));
         assert_eq!(ops.imm, 1);
@@ -37902,7 +39002,7 @@ mod tests {
                 X86ISelOperand::Imm(0),
             ],
         );
-        let ops = resolve_inst_operands(&pextrq, &HashMap::new());
+        let ops = resolve_inst_operands(&pextrq, &X86Allocation::default());
         assert_eq!(ops.dst, Some(RAX));
         assert_eq!(ops.src, Some(XMM15));
         assert_eq!(ops.imm, 0);
@@ -37922,7 +39022,7 @@ mod tests {
             ],
         );
 
-        let ops = resolve_inst_operands(&inst, &HashMap::new());
+        let ops = resolve_inst_operands(&inst, &X86Allocation::default());
         assert_eq!(ops.dst, Some(XMM1));
         assert_eq!(ops.src, None);
         assert_eq!(ops.base, Some(RBP));
@@ -37943,7 +39043,7 @@ mod tests {
             ],
         );
 
-        let ops = resolve_inst_operands(&inst, &HashMap::new());
+        let ops = resolve_inst_operands(&inst, &X86Allocation::default());
         assert_eq!(ops.dst, Some(XMM1));
         assert_eq!(ops.src, None);
         assert_eq!(ops.base, Some(RBP));
@@ -37988,7 +39088,7 @@ mod tests {
                 ),
             );
             let (folded_code, _, _, _) = pipeline
-                .encode_function_with_all_fixups(&folded, &HashMap::new())
+                .encode_function_with_all_fixups(&folded, &X86Allocation::default())
                 .unwrap();
 
             let mut explicit = minimal_func("narrow_packed_explicit_reload_bytes");
@@ -38008,7 +39108,7 @@ mod tests {
                 ),
             );
             let (explicit_code, _, _, _) = pipeline
-                .encode_function_with_all_fixups(&explicit, &HashMap::new())
+                .encode_function_with_all_fixups(&explicit, &X86Allocation::default())
                 .unwrap();
 
             assert!(
@@ -38064,7 +39164,7 @@ mod tests {
             ),
         );
         let (folded_code, _, _, _) = pipeline
-            .encode_function_with_all_fixups(&folded, &HashMap::new())
+            .encode_function_with_all_fixups(&folded, &X86Allocation::default())
             .unwrap();
 
         let mut explicit = minimal_func("pshufd_explicit_reload_bytes");
@@ -38084,7 +39184,7 @@ mod tests {
             ),
         );
         let (explicit_code, _, _, _) = pipeline
-            .encode_function_with_all_fixups(&explicit, &HashMap::new())
+            .encode_function_with_all_fixups(&explicit, &X86Allocation::default())
             .unwrap();
 
         assert!(
@@ -40151,7 +41251,7 @@ mod tests {
 
     #[test]
     fn test_full_regalloc_callee_saved_collection_maps_gpr32_aliases_to_save_roots() {
-        let allocation = HashMap::from([
+        let allocation: X86Allocation = X86Allocation::from_iter([
             (VReg::new(0, RegClass::Gpr32), x86_64_regs::R12D),
             (VReg::new(1, RegClass::Gpr32), x86_64_regs::EDI),
             (VReg::new(2, RegClass::Gpr32), x86_64_regs::EAX),
@@ -41371,7 +42471,7 @@ mod tests {
             ),
         );
 
-        let mut alloc = HashMap::new();
+        let mut alloc: X86Allocation = X86Allocation::default();
         alloc.insert(v0, RAX);
         alloc.insert(v1, RCX);
         alloc.insert(v2, RDX);
@@ -41414,7 +42514,7 @@ mod tests {
             ),
         );
 
-        let mut alloc = HashMap::new();
+        let mut alloc: X86Allocation = X86Allocation::default();
         alloc.insert(lhs, RAX);
         alloc.insert(dst, RDX);
 
@@ -41452,7 +42552,7 @@ mod tests {
             ),
         );
 
-        let mut alloc = HashMap::new();
+        let mut alloc: X86Allocation = X86Allocation::default();
         alloc.insert(lhs, RAX);
         alloc.insert(dst, RDX);
 
@@ -41576,7 +42676,7 @@ mod tests {
             ),
         );
 
-        let mut alloc = HashMap::new();
+        let mut alloc: X86Allocation = X86Allocation::default();
         alloc.insert(src, RAX);
         alloc.insert(dst, RDX);
 
@@ -41622,7 +42722,7 @@ mod tests {
                 ),
             );
 
-            let mut alloc = HashMap::new();
+            let mut alloc: X86Allocation = X86Allocation::default();
             alloc.insert(lhs, XMM0);
             alloc.insert(rhs, XMM1);
             alloc.insert(dst, XMM1);
@@ -41683,7 +42783,7 @@ mod tests {
             ),
         );
 
-        let mut alloc = HashMap::new();
+        let mut alloc: X86Allocation = X86Allocation::default();
         alloc.insert(lhs, XMM0);
         alloc.insert(rhs, XMM1);
         alloc.insert(dst, XMM1);
@@ -41732,7 +42832,7 @@ mod tests {
             ),
         );
 
-        let mut alloc = HashMap::new();
+        let mut alloc: X86Allocation = X86Allocation::default();
         alloc.insert(v0, RAX);
         alloc.insert(v1, RCX);
 
@@ -41770,7 +42870,7 @@ mod tests {
             ),
         );
 
-        let mut alloc = HashMap::new();
+        let mut alloc: X86Allocation = X86Allocation::default();
         alloc.insert(v0, RAX);
         alloc.insert(v1, RCX);
 
@@ -41826,7 +42926,8 @@ mod tests {
                     ],
                 ),
             );
-            let alloc = HashMap::from([(dst, XMM2), (lhs, XMM0), (rhs, XMM1)]);
+            let alloc: X86Allocation =
+                X86Allocation::from_iter([(dst, XMM2), (lhs, XMM0), (rhs, XMM1)]);
 
             fixup_two_address(&mut func, &alloc, X86CallAbi::SystemV).unwrap();
 
@@ -41860,7 +42961,7 @@ mod tests {
 
         // Arm 3: dst(RAX) != lhs(RCX), rhs(RDX) disjoint -> bridge copy.
         let mut func = tv5_three_address_func(X86Opcode::AddRR);
-        let alloc = HashMap::from([
+        let alloc: X86Allocation = X86Allocation::from_iter([
             (test_vreg(0), RAX),
             (test_vreg(1), RCX),
             (test_vreg(2), RDX),
@@ -41883,7 +42984,7 @@ mod tests {
 
         // Arm 1: commutative, dst aliases rhs -> swap; op1 then aliases op0.
         let mut func = tv5_three_address_func(X86Opcode::AddRR);
-        let alloc = HashMap::from([
+        let alloc: X86Allocation = X86Allocation::from_iter([
             (test_vreg(0), RAX),
             (test_vreg(1), RCX),
             (test_vreg(2), RAX),
@@ -41905,7 +43006,7 @@ mod tests {
 
         // Arm 2: non-commutative, dst aliases rhs -> scratch triangle.
         let mut func = tv5_three_address_func(X86Opcode::SubRR);
-        let alloc = HashMap::from([
+        let alloc: X86Allocation = X86Allocation::from_iter([
             (test_vreg(0), RAX),
             (test_vreg(1), RCX),
             (test_vreg(2), RAX),
@@ -41943,7 +43044,7 @@ mod tests {
 
         let entry = Block(0);
         let mut func = tv5_three_address_func(X86Opcode::AddRR);
-        let alloc = HashMap::from([
+        let alloc: X86Allocation = X86Allocation::from_iter([
             (test_vreg(0), RAX),
             (test_vreg(1), RCX),
             (test_vreg(2), RDX),
@@ -41981,7 +43082,7 @@ mod tests {
 
         let entry = Block(0);
         let mut func = tv5_three_address_func(X86Opcode::AddRR);
-        let alloc = HashMap::from([
+        let alloc: X86Allocation = X86Allocation::from_iter([
             (test_vreg(0), RAX),
             (test_vreg(1), RCX),
             (test_vreg(2), RDX),
@@ -42098,7 +43199,7 @@ mod tests {
         );
         func.push_inst(entry, X86ISelInst::new(X86Opcode::Ret, vec![]));
 
-        let alloc: HashMap<VReg, X86PReg> = HashMap::new();
+        let alloc: X86Allocation = X86Allocation::default();
         let removed = coalesce_x86_redundant_movrr_copies(&mut func, &alloc);
         assert_eq!(removed, 1, "exactly the pure CSE copy must be coalesced");
 
@@ -42189,7 +43290,7 @@ mod tests {
         use trust_cg_verify::post_regalloc_recheck::PostRegallocRecheckMode;
 
         let (mut func, entry) = tied_bridge_func("tied_copy_elide");
-        let alloc: HashMap<VReg, X86PReg> = HashMap::new();
+        let alloc: X86Allocation = X86Allocation::default();
         let removed = coalesce_x86_redundant_movrr_copies(&mut func, &alloc);
         assert_eq!(removed, 1, "the tied bridge copy must be collapsed");
 
@@ -42243,7 +43344,7 @@ mod tests {
             .iter()
             .map(|i| (i.opcode, i.operands.clone()))
             .collect();
-        let alloc: HashMap<VReg, X86PReg> = HashMap::new();
+        let alloc: X86Allocation = X86Allocation::default();
         let removed = coalesce_x86_redundant_movrr_copies(&mut func, &alloc);
         assert_eq!(removed, 0, "a live bridge source must decline the collapse");
         let after: Vec<_> = func.blocks[&entry]
@@ -42281,7 +43382,7 @@ mod tests {
             .iter()
             .map(|i| (i.opcode, i.operands.clone()))
             .collect();
-        let alloc: HashMap<VReg, X86PReg> = HashMap::new();
+        let alloc: X86Allocation = X86Allocation::default();
         let removed = coalesce_x86_redundant_movrr_copies(&mut func, &alloc);
         assert_eq!(
             removed, 0,
@@ -42355,7 +43456,7 @@ mod tests {
         use trust_cg_verify::post_regalloc_recheck::PostRegallocRecheckMode;
 
         let (mut func, entry) = lea_self_writeback_func("lea_self_writeback");
-        let alloc: HashMap<VReg, X86PReg> = HashMap::new();
+        let alloc: X86Allocation = X86Allocation::default();
         let removed =
             with_lea_writeback_on(|| coalesce_x86_redundant_movrr_copies(&mut func, &alloc));
         assert_eq!(removed, 1, "the induction-variable writeback must collapse");
@@ -42429,7 +43530,7 @@ mod tests {
             .iter()
             .map(|i| (i.opcode, i.operands.clone()))
             .collect();
-        let alloc: HashMap<VReg, X86PReg> = HashMap::new();
+        let alloc: X86Allocation = X86Allocation::default();
         assert_eq!(
             with_lea_writeback_on(|| coalesce_x86_redundant_movrr_copies(&mut func, &alloc)),
             0,
@@ -42469,7 +43570,7 @@ mod tests {
             .iter()
             .map(|i| (i.opcode, i.operands.clone()))
             .collect();
-        let alloc: HashMap<VReg, X86PReg> = HashMap::new();
+        let alloc: X86Allocation = X86Allocation::default();
         assert_eq!(
             with_lea_writeback_on(|| coalesce_x86_redundant_movrr_copies(&mut func, &alloc)),
             0,
@@ -42540,7 +43641,7 @@ mod tests {
             .iter()
             .map(|i| (i.opcode, i.operands.clone()))
             .collect();
-        let alloc: HashMap<VReg, X86PReg> = HashMap::new();
+        let alloc: X86Allocation = X86Allocation::default();
         assert_eq!(
             with_lea_writeback_on(|| coalesce_x86_redundant_movrr_copies(&mut func, &alloc)),
             0,
@@ -42580,7 +43681,7 @@ mod tests {
                 "the arm is DEFAULT ON; absent the opt-out it must fire"
             );
             let (mut func, entry) = lea_self_writeback_func("lea_self_writeback_default");
-            let alloc: HashMap<VReg, X86PReg> = HashMap::new();
+            let alloc: X86Allocation = X86Allocation::default();
             assert_eq!(
                 coalesce_x86_redundant_movrr_copies(&mut func, &alloc),
                 1,
@@ -42594,7 +43695,7 @@ mod tests {
                 "the opt-out must disable the arm"
             );
             let (mut func, entry) = lea_self_writeback_func("lea_self_writeback_optout");
-            let alloc: HashMap<VReg, X86PReg> = HashMap::new();
+            let alloc: X86Allocation = X86Allocation::default();
             assert_eq!(
                 coalesce_x86_redundant_movrr_copies(&mut func, &alloc),
                 0,
@@ -42610,14 +43711,14 @@ mod tests {
         crate::env_lock::with_env_overrides_removed(&["TCG_NO_X86_TIED_COPY_ELIDE"], || {
             assert!(x86_tied_copy_elide_enabled());
             let (mut func, entry) = tied_bridge_func("tied_copy_elide_on");
-            let alloc: HashMap<VReg, X86PReg> = HashMap::new();
+            let alloc: X86Allocation = X86Allocation::default();
             assert_eq!(coalesce_x86_redundant_movrr_copies(&mut func, &alloc), 1);
             assert_eq!(func.blocks[&entry].insts.len(), 2);
         });
         crate::env_lock::with_env_overrides(&[("TCG_NO_X86_TIED_COPY_ELIDE", "1")], || {
             assert!(!x86_tied_copy_elide_enabled());
             let (mut func, entry) = tied_bridge_func("tied_copy_elide_off");
-            let alloc: HashMap<VReg, X86PReg> = HashMap::new();
+            let alloc: X86Allocation = X86Allocation::default();
             assert_eq!(
                 coalesce_x86_redundant_movrr_copies(&mut func, &alloc),
                 0,
@@ -42686,7 +43787,7 @@ mod tests {
         );
         func.push_inst(entry, X86ISelInst::new(X86Opcode::Ret, vec![]));
 
-        let mut alloc: HashMap<VReg, X86PReg> = HashMap::new();
+        let mut alloc: X86Allocation = X86Allocation::default();
         alloc.insert(d, RCX);
         alloc.insert(a, RBX);
         alloc.insert(b, RDX);
@@ -42758,7 +43859,7 @@ mod tests {
         );
         func.push_inst(entry, X86ISelInst::new(X86Opcode::Ret, vec![]));
 
-        let alloc: HashMap<VReg, X86PReg> = HashMap::new();
+        let alloc: X86Allocation = X86Allocation::default();
         let violation =
             post_ra_dataflow::evaluate(&func, &alloc, "x86_64", PostRegallocRecheckMode::Enforce)
                 .expect("a stale ghost sym after copy deletion must be refuted");
@@ -42798,7 +43899,7 @@ mod tests {
         );
         func.push_inst(entry, X86ISelInst::new(X86Opcode::Ret, vec![]));
 
-        let alloc: HashMap<VReg, X86PReg> = HashMap::new();
+        let alloc: X86Allocation = X86Allocation::default();
         let removed = coalesce_x86_redundant_movrr_copies(&mut func, &alloc);
         assert_eq!(removed, 0, "a tied op's bridge copy must never be deleted");
 
@@ -42887,7 +43988,7 @@ mod tests {
 
         crate::env_lock::with_env_overrides_removed(&["TCG_NO_X86_XMM_BRIDGE_COLLAPSE"], || {
             let mut func = xmm_bridge_paddd_fixture();
-            let alloc: HashMap<VReg, X86PReg> = HashMap::new();
+            let alloc: X86Allocation = X86Allocation::default();
             let removed = coalesce_x86_redundant_movrr_copies(&mut func, &alloc);
             assert_eq!(removed, 1, "the XMM bridge copy must be collapsed");
 
@@ -42983,7 +44084,7 @@ mod tests {
                 ),
             );
 
-            let alloc: HashMap<VReg, X86PReg> = HashMap::new();
+            let alloc: X86Allocation = X86Allocation::default();
             let removed = coalesce_x86_redundant_movrr_copies(&mut func, &alloc);
             assert_eq!(removed, 0, "src redef before a read of dst must decline");
 
@@ -43089,7 +44190,7 @@ mod tests {
                 ),
             );
 
-            let alloc: HashMap<VReg, X86PReg> = HashMap::new();
+            let alloc: X86Allocation = X86Allocation::default();
             let removed = coalesce_x86_redundant_movrr_copies(&mut func, &alloc);
             assert_eq!(removed, 2, "both bridges must collapse across two sweeps");
 
@@ -43180,7 +44281,7 @@ mod tests {
             );
             func.blocks.get_mut(&b0).unwrap().successors = vec![b1];
 
-            let alloc: HashMap<VReg, X86PReg> = HashMap::new();
+            let alloc: X86Allocation = X86Allocation::default();
             let removed = coalesce_x86_redundant_movrr_copies(&mut func, &alloc);
             assert_eq!(removed, 0, "a live-out source must decline the collapse");
             assert_eq!(func.blocks[&b0].insts.len(), 3, "stream must be untouched");
@@ -43229,7 +44330,7 @@ mod tests {
                 ),
             );
 
-            let alloc: HashMap<VReg, X86PReg> = HashMap::new();
+            let alloc: X86Allocation = X86Allocation::default();
             let removed = coalesce_x86_redundant_movrr_copies(&mut func, &alloc);
             assert_eq!(removed, 0, "a partial def of the source must decline");
             assert_eq!(
@@ -43295,7 +44396,7 @@ mod tests {
                 );
                 func
             };
-            let alloc: HashMap<VReg, X86PReg> = HashMap::new();
+            let alloc: X86Allocation = X86Allocation::default();
 
             let mut with_pblendvb = build(true);
             let removed = coalesce_x86_redundant_movrr_copies(&mut with_pblendvb, &alloc);
@@ -43324,7 +44425,7 @@ mod tests {
 
         crate::env_lock::with_env_overrides(&[("TCG_NO_X86_XMM_BRIDGE_COLLAPSE", "1")], || {
             let mut func = xmm_bridge_paddd_fixture();
-            let alloc: HashMap<VReg, X86PReg> = HashMap::new();
+            let alloc: X86Allocation = X86Allocation::default();
             let removed = coalesce_x86_redundant_movrr_copies(&mut func, &alloc);
             assert_eq!(removed, 0, "the kill switch must disable the XMM arm");
             let insts = &func.blocks[&Block(0)].insts;
@@ -43334,7 +44435,7 @@ mod tests {
         });
         crate::env_lock::with_env_overrides_removed(&["TCG_NO_X86_XMM_BRIDGE_COLLAPSE"], || {
             let mut func = xmm_bridge_paddd_fixture();
-            let alloc: HashMap<VReg, X86PReg> = HashMap::new();
+            let alloc: X86Allocation = X86Allocation::default();
             let removed = coalesce_x86_redundant_movrr_copies(&mut func, &alloc);
             assert_eq!(removed, 1, "default-on: the same stream must collapse");
         });
@@ -43733,7 +44834,7 @@ mod tests {
     /// pins what the spiller actually emits rather than a hand-written guess.
     fn reload_elide_fixture(
         extra: Vec<X86ISelInst>,
-    ) -> (X86ISelFunction, HashMap<VReg, u32>, HashMap<VReg, X86PReg>) {
+    ) -> (X86ISelFunction, HashMap<VReg, u32>, X86Allocation) {
         use trust_cg_ir::x86_64_regs::{RAX, RCX, RDX};
 
         let mut func = minimal_func("reload_elide");
@@ -43766,7 +44867,7 @@ mod tests {
         let installed = HashMap::from([(spilled, 0u32)]);
         // A COMPLETE allocation: rule 1b clears the map on any def this pass
         // cannot resolve, so an incomplete map would make every test vacuous.
-        let alloc = HashMap::from([(spilled, RAX), (a, RCX), (b, RDX)]);
+        let alloc: X86Allocation = X86Allocation::from_iter([(spilled, RAX), (a, RCX), (b, RDX)]);
         materialize_x86_spills(&mut func, &installed, X86CallAbi::SystemV).unwrap();
         (func, installed, alloc)
     }
@@ -43914,7 +45015,7 @@ mod tests {
         func.push_inst(next, X86ISelInst::new(X86Opcode::Ret, vec![]));
 
         let installed = HashMap::from([(spilled, 0u32)]);
-        let alloc = HashMap::from([(spilled, RAX), (a, RCX)]);
+        let alloc: X86Allocation = X86Allocation::from_iter([(spilled, RAX), (a, RCX)]);
         materialize_x86_spills(&mut func, &installed, X86CallAbi::SystemV).unwrap();
         let evidence = elide_redundant_x86_spill_reloads(&mut func, &installed, &alloc);
         assert_eq!(evidence.total(), 0);
@@ -44334,7 +45435,7 @@ mod tests {
         // reachable); a completeness gap only if a real program ever hits
         // an all-spilled non-commutative dst==rhs, in which case this
         // pinned error message says exactly what to widen.
-        let alloc: HashMap<VReg, X86PReg> = HashMap::new();
+        let alloc: X86Allocation = X86Allocation::default();
         let err = fixup_two_address(&mut func, &alloc, X86CallAbi::SystemV)
             .expect_err("all-spilled non-commutative dst/rhs alias fail-closes");
         assert!(
@@ -45884,7 +46985,7 @@ mod tests {
         // Allocation: v0 -> RCX (clash!), v1 -> RBX.
         // If emitted sequentially as MOV RCX,RDI; MOV RBX,RCX, the second
         // move reads a clobbered RCX. The fixup must fix this.
-        let mut alloc = HashMap::new();
+        let mut alloc: X86Allocation = X86Allocation::default();
         alloc.insert(v0, RCX);
         alloc.insert(v1, RBX);
 
@@ -45962,7 +47063,7 @@ mod tests {
         }
         func.push_inst(entry, X86ISelInst::new(X86Opcode::Ret, vec![]));
 
-        let mut alloc = HashMap::new();
+        let mut alloc: X86Allocation = X86Allocation::default();
         alloc.insert(v0, ECX);
         alloc.insert(v1, ESI);
         alloc.insert(v2, EDX);
@@ -46056,7 +47157,7 @@ mod tests {
         );
         func.push_inst(entry, X86ISelInst::new(X86Opcode::Ret, vec![]));
 
-        let mut alloc = HashMap::new();
+        let mut alloc: X86Allocation = X86Allocation::default();
         alloc.insert(gpr_lane, RAX);
         alloc.insert(xmm_lane, XMM1);
         alloc.insert(following_xmm, XMM0);
@@ -46172,7 +47273,7 @@ mod tests {
         );
         func.push_inst(entry, X86ISelInst::new(X86Opcode::Ret, vec![]));
 
-        let mut alloc = HashMap::new();
+        let mut alloc: X86Allocation = X86Allocation::default();
         alloc.insert(v0, ESI);
         alloc.insert(v1, RDI);
 
@@ -46234,7 +47335,7 @@ mod tests {
         );
         func.push_inst(entry, X86ISelInst::new(X86Opcode::Ret, vec![]));
 
-        let mut alloc = HashMap::new();
+        let mut alloc: X86Allocation = X86Allocation::default();
         alloc.insert(v0, EDX);
         alloc.insert(v1, RCX);
 
@@ -46318,7 +47419,7 @@ mod tests {
         );
         func.push_inst(entry, X86ISelInst::new(X86Opcode::Ret, vec![]));
 
-        let mut alloc = HashMap::new();
+        let mut alloc: X86Allocation = X86Allocation::default();
         alloc.insert(v0, RAX);
         alloc.insert(v_stack, RCX);
         alloc.insert(v2, RBX);
@@ -46395,7 +47496,7 @@ mod tests {
         );
         func.push_inst(entry, X86ISelInst::new(X86Opcode::Ret, vec![]));
 
-        let mut alloc = HashMap::new();
+        let mut alloc: X86Allocation = X86Allocation::default();
         alloc.insert(v0, RDX);
         alloc.insert(v1, RBX);
         alloc.insert(v2, RAX);
@@ -46497,7 +47598,7 @@ mod tests {
         func.push_inst(entry, mov(v3, XMM4));
         func.push_inst(entry, X86ISelInst::new(X86Opcode::Ret, vec![]));
 
-        let mut alloc = HashMap::new();
+        let mut alloc: X86Allocation = X86Allocation::default();
         alloc.insert(v1, XMM2);
         alloc.insert(v_stack, XMM5);
         alloc.insert(v2, XMM6);
@@ -46580,7 +47681,7 @@ mod tests {
         }
         func.push_inst(entry, X86ISelInst::new(X86Opcode::Ret, vec![]));
 
-        let mut alloc = HashMap::new();
+        let mut alloc: X86Allocation = X86Allocation::default();
         alloc.insert(vregs[0], RBX);
         alloc.insert(vregs[1], R13);
         alloc.insert(vregs[2], R14);
@@ -46644,7 +47745,7 @@ mod tests {
         params: usize,
         items: &[FormalPrefixFixture],
         assignment: &[(u32, X86PReg)],
-    ) -> (X86ISelFunction, Block, HashMap<VReg, X86PReg>) {
+    ) -> (X86ISelFunction, Block, X86Allocation) {
         let sig = Signature {
             params: vec![Type::I64; params],
             returns: vec![],
@@ -46693,7 +47794,7 @@ mod tests {
         }
         func.push_inst(entry, X86ISelInst::new(X86Opcode::Ret, vec![]));
         func.next_vreg = highest + 1;
-        let alloc: HashMap<VReg, X86PReg> = assignment
+        let alloc: X86Allocation = assignment
             .iter()
             .map(|(id, preg)| (VReg::new(*id, RegClass::Gpr64), *preg))
             .collect();
@@ -47051,7 +48152,7 @@ mod tests {
                 },
             ],
         );
-        let empty_alloc: HashMap<VReg, X86PReg> = HashMap::new();
+        let empty_alloc: X86Allocation = X86Allocation::default();
         let empty_spills: HashMap<VReg, u32> = HashMap::new();
         let err = formal_stack_arg_load_destination(&load, &empty_alloc, &empty_spills)
             .expect_err("an unresolved destination must fail closed");
@@ -47060,7 +48161,7 @@ mod tests {
             "{err:?}"
         );
 
-        let both_alloc: HashMap<VReg, X86PReg> =
+        let both_alloc: X86Allocation =
             [(VReg::new(1, RegClass::Gpr64), RAX)].into_iter().collect();
         let both_spills: HashMap<VReg, u32> = [(VReg::new(1, RegClass::Gpr64), 2u32)]
             .into_iter()
@@ -47453,7 +48554,7 @@ mod tests {
         );
         func.push_inst(entry, X86ISelInst::new(X86Opcode::Ret, vec![]));
 
-        let mut alloc = HashMap::new();
+        let mut alloc: X86Allocation = X86Allocation::default();
         alloc.insert(v0, XMM1);
         alloc.insert(v1, XMM0);
 

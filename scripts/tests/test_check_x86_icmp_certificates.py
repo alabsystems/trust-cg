@@ -56,6 +56,44 @@ class WorkspaceToolResolution(unittest.TestCase):
                          ["--purpose", "workspace", "--print", "targo"])
 
 
+class ResourceDescriptorTransport(unittest.TestCase):
+    def test_invalid_resource_locator_refuses_before_starting_a_child(self):
+        for environment in ({"TRUST_CPU_IMPLICIT_FD": "2"},
+                            {"ATERM_WORKLOAD_CPU_FDS_V1": "9999999"},
+                            {"TRUST_FIXED_ADMISSION_FD_V1": "requires-live-ancestor-v1"}):
+            with self.subTest(environment=environment), \
+                    mock.patch.object(GATE, "descendants", return_value=[]), \
+                    mock.patch.object(GATE.subprocess, "Popen") as launch:
+                with self.assertRaises(GATE.Finding) as raised:
+                    GATE.run_admitted_build(["never-start"], ROOT, environment, None, 10)
+                self.assertEqual(raised.exception.code, "inherited-resources-invalid")
+                launch.assert_not_called()
+
+    def test_advertised_descriptor_reaches_the_actual_build_child(self):
+        """A numeric pipe fixture tests transport, not native CPU authority."""
+        read_fd, write_fd = os.pipe()
+        try:
+            environment = GATE.build_environment()
+            # Keep this isolated from a real outer resource advertisement.
+            for name in ("ATERM_SDK_LEASE_V3", "ATERM_WORKLOAD_HOST_STORE_FD_V1",
+                         "TRUST_CPU_IMPLICIT_FD", "TRUST_FIXED_ADMISSION_FD_V1",
+                         "ATERM_WORKLOAD_CPU_FDS_V1", "BUILD_SLOT_FENCE_FDS",
+                         "CARGO_MAKEFLAGS", "MAKEFLAGS", "MFLAGS"):
+                environment.pop(name, None)
+            environment["TRUST_CPU_IMPLICIT_FD"] = str(write_fd)
+            with tempfile.TemporaryFile(mode="w+") as output:
+                code = GATE.run_admitted_build(
+                    [sys.executable, "-c",
+                     "import os; os.write(int(os.environ['TRUST_CPU_IMPLICIT_FD']), b'transported')"],
+                    ROOT, environment, output, 10)
+                output.seek(0)
+                self.assertEqual(code, 0, output.read())
+            self.assertEqual(os.read(read_fd, 11), b"transported")
+        finally:
+            os.close(read_fd)
+            os.close(write_fd)
+
+
 IR, AY, OTHER, CLEAN_REV = "1" * 40, "a" * 40, "b" * 40, "d" * 40
 SCHEME = "git" + "+"
 
@@ -239,7 +277,13 @@ class AyExportTests(unittest.TestCase):
     def test_the_clean_banner_is_exactly_its_version(self):
         clean = GATE.Tool("clean", CLEAN_REV, "0.9.0", ("-p", "clean"), ())
         self.assertTrue(GATE.banner_is_the_rules(clean, "clean 0.9.0"))
-        for banner in ("clean 0.9.1", "clean 0.9.0+dirty", "ay 0.9.0", ""):
+        self.assertTrue(GATE.banner_is_the_rules(clean, "clean 0.9.0+g" + CLEAN_REV))
+        unknown = "clean 0.9.0 (git sha unknown: built without git provenance)"
+        self.assertTrue(GATE.banner_is_the_rules(clean, unknown))
+        for banner in ("clean 0.9.1", "clean 0.9.0+dirty", "ay 0.9.0", "",
+                       "clean 0.9.0+g" + OTHER, "clean 0.9.0+g" + CLEAN_REV[:12],
+                       "clean 0.9.0+gunknown", unknown + " junk", unknown + "\n", " " + unknown,
+                       unknown.replace("0.9.0", "0.9.1"), unknown.replace("unknown:", "unknown")):
             with self.subTest(banner=banner):
                 self.assertFalse(GATE.banner_is_the_rules(clean, banner))
 
@@ -526,6 +570,72 @@ class ToolBuildTests(unittest.TestCase):
         admissions = list(cache.glob("build-*/admissions.log"))
         self.assertEqual(len(admissions), 1, admissions)
         self.assertEqual(admissions[0].read_text(), f"admitted {weight} x86-icmp-clean-{rev[:12]}\n")
+
+    def test_resume_revalidates_source_and_runs_the_normal_command_preserving_failed_outputs(self):
+        identity, cache, rev = self.cold_clean()
+        tool = GATE.Tool("clean", rev, "0.9.0", ("-p", "clean", "--features", "clean/carcara-verify"), ())
+        # A completed but unpublished build has its original work and no slot.
+        shutil.rmtree(cache / tool.cache_key)
+        work = next(cache.glob("build-*")).resolve()
+        old_log = (work / "build.log").read_bytes()
+        old_image = (work / "clean").read_bytes() if (work / "clean").exists() else b"failed staged image"
+        (work / "clean").write_bytes(old_image)
+        repo = self.base / "clean-source"
+        targo = self.base / "bin/targo"
+        with mock.patch.object(GATE, "resolve_targo", return_value=targo):
+            resumed = GATE.obtain_build(tool, cache, repo, False,
+                GATE.heavy_gate_admission(tool, repo), resume_work=work)
+        self.assertEqual(resumed["sha256"], identity["sha256"])
+        self.assertTrue(resumed["resumed_build"]["source_checked_before_and_after"])
+        self.assertEqual((work / "build.log").read_bytes(), old_log)
+        self.assertEqual((work / "clean").read_bytes(), old_image)
+        self.assertTrue(Path(resumed["resumed_build"]["log"]).is_file())
+        admissions = list(work.glob("resume-admission-*/admissions.log"))
+        self.assertEqual(len(admissions), 1)
+        self.assertIn("x86-icmp-clean-build-resume:", admissions[0].read_text())
+
+    def test_resume_refuses_changed_missing_or_extra_source_before_any_build(self):
+        _, cache, rev = self.cold_clean()
+        tool = GATE.Tool("clean", rev, "0.9.0", ("-p", "clean", "--features", "clean/carcara-verify"), ())
+        work = next(cache.glob("build-*")).resolve()
+        source = work / "src/src/main.rs"
+        original = source.read_bytes()
+        for mutation in ("changed", "missing", "extra"):
+            with self.subTest(mutation=mutation), mock.patch.object(GATE, "run_admitted_build") as build:
+                if mutation == "changed": source.write_bytes(original + b"changed")
+                elif mutation == "missing": source.unlink()
+                else: (work / "src/Targo.toml").write_text("[workspace]\n")
+                with self.assertRaises(GATE.Finding) as refused:
+                    GATE.check_resumed_export(tool, cache.resolve(), work.resolve(), self.base / "clean-source")
+                self.assertEqual(refused.exception.code, "clean-resume-source-mismatch")
+                build.assert_not_called()
+                source.write_bytes(original)
+                (work / "src/Targo.toml").unlink(missing_ok=True)
+
+    def test_resume_refuses_foreign_target_descendants_before_a_build(self):
+        _, cache, rev = self.cold_clean()
+        tool = GATE.Tool("clean", rev, "0.9.0", ("-p", "clean", "--features", "clean/carcara-verify"), ())
+        work = next(cache.glob("build-*")).resolve()
+        target = work / "target"
+        foreign = self.base / "foreign-target"
+        foreign.mkdir(mode=0o700)
+        foreign_binary = foreign / "clean"
+        foreign_binary.write_text("foreign")
+        for case in ("release", "binary"):
+            path = target / "release" if case == "release" else target / "release/clean"
+            saved = path.with_name(path.name + ".saved")
+            path.rename(saved)
+            path.symlink_to(foreign if case == "release" else foreign_binary,
+                            target_is_directory=case == "release")
+            with self.subTest(case=case), mock.patch.object(GATE, "run_admitted_build") as build:
+                with self.assertRaises(GATE.Finding) as refused:
+                    GATE.check_resumed_export(tool, cache.resolve(), work, self.base / "clean-source")
+                self.assertEqual(refused.exception.code, "clean-resume-target-not-private")
+                build.assert_not_called()
+            path.unlink()
+            saved.rename(path)
+        (target / "confined-link").symlink_to("release/clean")
+        GATE.check_resumed_export(tool, cache.resolve(), work, self.base / "clean-source")
 
     def test_cold_legacy_export_discloses_manifest_and_preserves_repository_inputs(self):
         original = '[package]\nname = "clean"\nversion = "0.9.0"\n[trust]\nfunction_budget_ms = 3000\n'

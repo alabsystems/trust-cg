@@ -143,6 +143,16 @@ fn cleanup(dir: &Path) {
     let _ = fs::remove_dir_all(dir);
 }
 
+/// Leave a copy of an emitted object under
+/// `CARGO_TARGET_TMPDIR/<test target>/<test_name>_ty_bfs_kernel.o` (the
+/// per-test directory is removed) so a runtime or instruction-count
+/// measurement links the same bytes.
+fn keep_object(test_name: &str, bytes: &[u8]) {
+    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join(env!("CARGO_CRATE_NAME"));
+    fs::create_dir_all(&dir).expect("create kept-object dir");
+    fs::write(dir.join(format!("{test_name}_ty_bfs_kernel.o")), bytes).expect("write kept object");
+}
+
 // ---------------------------------------------------------------------------
 // Compilation helper
 // ---------------------------------------------------------------------------
@@ -179,16 +189,55 @@ fn compile_trust_ir(
     #[cfg(target_arch = "x86_64")]
     {
         let _ = trust_ir_func;
-        Compiler::new(CompilerConfig {
-            opt_level,
-            target: Target::X86_64,
-            ..CompilerConfig::default()
-        })
-        .with_codegen_license(permit_unlicensed())
-        .compile(module)
-        .map(|result| result.object_code)
-        .map_err(|e| format!("compiler: {:?}", e))
+        // The TY ahead-of-time driver keeps no proof certificates and asks
+        // for the certificate-free allocation.
+        compile_x86(module, opt_level, false, true)
     }
+}
+
+/// One x86-64 object compile of `module` as a TY driver configures it.
+#[cfg(target_arch = "x86_64")]
+fn compile_x86(
+    module: &TrustIrModule,
+    opt_level: OptLevel,
+    emit_proofs: bool,
+    x86_certificate_free_allocation: bool,
+) -> Result<Vec<u8>, String> {
+    install_driver_ra_policy();
+    Compiler::new(CompilerConfig {
+        opt_level,
+        target: Target::X86_64,
+        emit_proofs,
+        x86_certificate_free_allocation,
+        ..CompilerConfig::default()
+    })
+    .with_codegen_license(permit_unlicensed())
+    .compile(module)
+    .map(|result| result.object_code)
+    .map_err(|e| format!("compiler: {:?}", e))
+}
+
+/// The x86-64 allocation policy this binary's driver installs before it
+/// compiles. As the `ty_bfs_minimal` target it installs none, which is what
+/// the TY AOT path does: it requests the certificate-free allocation through
+/// `CompilerConfig::x86_certificate_free_allocation` instead, and
+/// `Compiler::compile` applies the four allocation-quality changes itself.
+/// The `ty_bfs_ra_quality` target compiles this same file as a driver that
+/// installs them enabled, as the rustc bridge does for a compile with
+/// `no-proof-certs`.
+#[cfg(target_arch = "x86_64")]
+fn install_driver_ra_policy() {
+    if env!("CARGO_CRATE_NAME") != "ty_bfs_ra_quality" {
+        return;
+    }
+    assert!(trust_cg_codegen::set_x86_ra_abi_copy_hints_disabled(false));
+    assert!(trust_cg_codegen::set_x86_ra_caller_saved_first_disabled(
+        false
+    ));
+    assert!(trust_cg_codegen::set_x86_ra_cold_call_weight_disabled(
+        false
+    ));
+    assert!(trust_cg_codegen::set_x86_ra_call_split_disabled(false));
 }
 
 fn assert_valid_macho(bytes: &[u8], ctx: &str) {
@@ -455,6 +504,7 @@ fn run_ty_bfs_e2e(opt_level: OptLevel, test_name: &str) {
     assert_valid_macho(&obj_bytes, test_name);
 
     let obj_path = write_object_file(&dir, "ty_bfs_kernel.o", &obj_bytes);
+    keep_object(test_name, &obj_bytes);
     let driver_path = write_c_driver(&dir, "driver.c", C_DRIVER);
     let binary = link_with_cc(&dir, &driver_path, &obj_path, "ty_bfs_test");
 
@@ -503,6 +553,96 @@ fn test_ty_bfs_compiles_o3() {
     let obj_bytes =
         compile_trust_ir(&func, &module, OptLevel::O3).expect("ty_bfs_kernel should compile at O3");
     assert_valid_macho(&obj_bytes, "ty_bfs O3");
+}
+
+/// The `.text` bytes of a 64-bit little-endian ELF relocatable object.
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+fn elf_text(obj: &[u8]) -> Vec<u8> {
+    let u16_at = |o: usize| u16::from_le_bytes([obj[o], obj[o + 1]]) as usize;
+    let u32_at = |o: usize| u32::from_le_bytes(obj[o..o + 4].try_into().unwrap()) as usize;
+    let u64_at = |o: usize| u64::from_le_bytes(obj[o..o + 8].try_into().unwrap()) as usize;
+    let (shoff, shentsize, shnum, shstrndx) =
+        (u64_at(0x28), u16_at(0x3a), u16_at(0x3c), u16_at(0x3e));
+    let sh = |i: usize| shoff + i * shentsize;
+    let strtab = u64_at(sh(shstrndx) + 0x18);
+    for i in 0..shnum {
+        let name_at = strtab + u32_at(sh(i));
+        let end = obj[name_at..].iter().position(|&c| c == 0).unwrap();
+        if &obj[name_at..name_at + end] == b".text" {
+            let (off, size) = (u64_at(sh(i) + 0x18), u64_at(sh(i) + 0x20));
+            return obj[off..off + size].to_vec();
+        }
+    }
+    panic!("no .text section");
+}
+
+/// A TY compile that keeps no proof certificates and requests the
+/// certificate-free allocation gets the x86-64 allocation-quality changes
+/// from `Compiler::compile` itself, with no policy installed by its driver
+/// (`X86AllocationQuality::CertificateFree`): the leaf kernel saves no
+/// callee-saved register and keeps its arguments in their registers. The
+/// historical allocation is 75 bytes and saves RBX after the frame setup
+/// (`test_ty_bfs_historical_allocation_without_the_request`).
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[test]
+fn test_ty_bfs_certificate_free_compile_gets_the_quality_allocation() {
+    let (func, module) = build_ty_bfs_kernel();
+    let obj = compile_trust_ir(&func, &module, OptLevel::O2).expect("O2 compile");
+    let text = elf_text(&obj);
+    assert_eq!(
+        &text[..4],
+        &[0x55, 0x48, 0x89, 0xe5],
+        "push %rbp; mov %rsp,%rbp"
+    );
+    let push_callee_saved =
+        text[4] == 0x53 || (text[4] == 0x41 && (0x54..=0x57).contains(&text[5]));
+    assert!(
+        !push_callee_saved,
+        "no callee-saved register is saved: {text:02x?}"
+    );
+    assert!(
+        text.len() < 0x4b,
+        "shorter than the historical 75 bytes: {}",
+        text.len()
+    );
+}
+
+/// Whether `.text` is the historical allocation of the O2 kernel: RBX saved
+/// right after the frame setup, 75 bytes.
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+fn is_historical_allocation(text: &[u8]) -> bool {
+    text.len() == 0x4b && text[..5] == [0x55, 0x48, 0x89, 0xe5, 0x53]
+}
+
+/// Without the request, and with it when the compile keeps proof
+/// certificates, the TY kernel keeps the historical allocation: a default
+/// configuration emits the same bytes with and without certificates, and a
+/// certificate-keeping compile withholds the changes whatever was requested
+/// (`X86AllocationQuality::Installed` / `Withheld`). Only meaningful where no
+/// policy is installed, i.e. in the `ty_bfs_minimal` target.
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[test]
+fn test_ty_bfs_historical_allocation_without_the_request() {
+    if env!("CARGO_CRATE_NAME") != "ty_bfs_minimal" {
+        return;
+    }
+    let (_func, module) = build_ty_bfs_kernel();
+    let plain = compile_x86(&module, OptLevel::O2, false, false).expect("O2 compile");
+    assert!(
+        is_historical_allocation(&elf_text(&plain)),
+        "{:02x?}",
+        elf_text(&plain)
+    );
+    let requested = compile_x86(&module, OptLevel::O2, false, true).expect("O2 compile");
+    assert!(!is_historical_allocation(&elf_text(&requested)));
+    match compile_x86(&module, OptLevel::O2, true, true) {
+        Ok(with_certificates) => assert_eq!(
+            elf_text(&with_certificates),
+            elf_text(&plain),
+            "a certificate-keeping compile keeps the historical allocation"
+        ),
+        Err(error) => panic!("certificate-keeping O2 compile failed: {error}"),
+    }
 }
 
 #[test]

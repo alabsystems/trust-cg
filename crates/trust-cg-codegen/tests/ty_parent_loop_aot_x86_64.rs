@@ -369,9 +369,12 @@ fn opt_name(opt_level: OptLevel) -> &'static str {
 }
 
 fn compile_object(module: &trust_ir::Module, opt_level: OptLevel) -> Vec<u8> {
+    // As the TY ahead-of-time driver compiles: no proof certificates, and the
+    // certificate-free allocation requested.
     let bytes = Compiler::new(CompilerConfig {
         opt_level,
         target: Target::X86_64,
+        x86_certificate_free_allocation: true,
         ..CompilerConfig::default()
     })
     .with_codegen_license(permit_unlicensed())

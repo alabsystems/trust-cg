@@ -168,6 +168,7 @@ fn linear_scan_spills_when_pressure_exceeds_pregs() {
         hints: BTreeMap::new(),
         callee_saved_regs: Default::default(),
         coalesce_tuning: Default::default(),
+        avoid_claimed_hint_regs: false,
     };
 
     let result = allocate(&mut func, &config).expect("allocation should succeed");
@@ -205,6 +206,7 @@ fn linear_scan_no_overlap_in_physical_assignments() {
         hints: BTreeMap::new(),
         callee_saved_regs: Default::default(),
         coalesce_tuning: Default::default(),
+        avoid_claimed_hint_regs: false,
     };
 
     let result = allocate(&mut func, &config).expect("allocation should succeed");

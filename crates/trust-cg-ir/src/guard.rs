@@ -45,7 +45,6 @@ use crate::inst::ProofAnnotation;
 // ---------------------------------------------------------------------------
 
 const FNV_OFFSET_BASIS_128: u128 = 0x6c62272e07bb0142_62b821756295c58d;
-const FNV_PRIME_128: u128 = 0x0000000001000000_000000000000013B;
 
 #[derive(Debug, Clone)]
 struct Fnv128(u128);
@@ -58,8 +57,26 @@ impl Fnv128 {
 
     #[inline]
     fn write_u8(&mut self, b: u8) {
-        self.0 ^= b as u128;
-        self.0 = self.0.wrapping_mul(FNV_PRIME_128);
+        let lo = self.0 as u64;
+        let hi = (self.0 >> 64) as u64;
+        let byte = u64::from(b);
+        // Trust emits the primitive operations below.  The Clean composition
+        // theorems bind this exact call graph to the checked full limb step.
+        // Keep the input limbs intact: both outputs depend on the original low
+        // limb, while the carry path uses the intermediate low product.
+        let mixed = crate::trust_cg_fnv128_xor(lo, byte);
+        let next_lo = crate::trust_cg_fnv128_mul315(mixed);
+        let low_product = crate::trust_cg_fnv128_mul315(crate::trust_cg_fnv128_mask32(mixed));
+        let high_product = crate::trust_cg_fnv128_add(
+            crate::trust_cg_fnv128_mul315(crate::trust_cg_fnv128_shift32(mixed)),
+            crate::trust_cg_fnv128_shift32(low_product),
+        );
+        let next_hi = crate::trust_cg_fnv128_add3(
+            crate::trust_cg_fnv128_mul315(hi),
+            crate::trust_cg_fnv128_mul_2pow24(mixed),
+            crate::trust_cg_fnv128_shift32(high_product),
+        );
+        self.0 = (u128::from(next_hi) << 64) | u128::from(next_lo);
     }
 
     #[inline]
@@ -850,6 +867,81 @@ impl GuardSiteLedger {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fnv128_byte_step_matches_wide_integer_oracle() {
+        let check = |state: u128, byte: u8| {
+            let mut actual = Fnv128(state);
+            actual.write_u8(byte);
+            let expected =
+                (state ^ u128::from(byte)).wrapping_mul(0x0000000001000000_000000000000013B);
+            assert_eq!(
+                actual.finish(),
+                expected,
+                "state={state:032x} byte={byte:02x}"
+            );
+        };
+        for state in [
+            0,
+            1,
+            u128::MAX,
+            0xffff_ffff,
+            0x1_0000_0000,
+            u128::from(u64::MAX),
+            1u128 << 64,
+            1u128 << 127,
+            0x6c62272e07bb0142_62b821756295c58d,
+        ] {
+            for byte in 0..=u8::MAX {
+                check(state, byte);
+            }
+        }
+        let mut state = 0x6c62272e07bb0142_62b821756295c58d_u128;
+        for i in 0..100_000u64 {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(u128::from(i) + 1);
+            check(state, (i ^ (i >> 8)) as u8);
+        }
+    }
+
+    #[test]
+    fn operand_fingerprint_encoding_has_fixed_vectors() {
+        // Independently calculated from domain bytes plus zero terminator,
+        // little-endian u64 count, and ordered (tag, little-endian u64) entries.
+        let cases: &[(&[GuardOperandRef], u128)] = &[
+            (&[], 0xe604ff6a589557cded7f5eb5834bcb96),
+            (
+                &[GuardOperandRef::Reg(0)],
+                0x21c350cffa2a098919ac79b781a88dcd,
+            ),
+            (
+                &[GuardOperandRef::Imm(-1)],
+                0x7a1e1b22cd2a0642797dc2760da54e4a,
+            ),
+            (
+                &[
+                    GuardOperandRef::Reg(u32::MAX),
+                    GuardOperandRef::Imm(i64::MIN),
+                ],
+                0x8c40a07dd2bee9c1b2d8dd7eb12eb793,
+            ),
+            (
+                &[
+                    GuardOperandRef::Imm(i64::MIN),
+                    GuardOperandRef::Reg(u32::MAX),
+                ],
+                0xec504cc5ec2d368cd29df40162749859,
+            ),
+        ];
+        for (operands, expected) in cases {
+            assert_eq!(
+                fingerprint_operands(operands),
+                *expected,
+                "operands={operands:?}"
+            );
+        }
+    }
 
     fn bounds_ops() -> GuardOperandIdentity {
         GuardOperandIdentity::new(vec![

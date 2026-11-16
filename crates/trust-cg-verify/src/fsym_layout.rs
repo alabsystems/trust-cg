@@ -134,6 +134,14 @@ enum Visit {
 /// declared offsets, preserving padding and conservative nested enum rules.
 /// Missing/conflicting targets or malformed layouts remain named refusals;
 /// no function-pointer word or source/ABI authority is inferred from bytes.
+/// At trust-ir933e34fa, nominal `FnItem` values gained their zero-byte image
+/// and DirectWithUninhabited enums gained checked dead-row storage profiles.
+/// Bounded fsym admits neither surface: function-item identity requires a
+/// dedicated source-level model, while DirectWithUninhabited is refused by
+/// name in [`Self::enum_layout_unguarded`] before any physical row is used.
+/// The ordinary admitted layout/coverage rules are unchanged; the refreshed
+/// source fingerprints also cover the interpreter's typed-value versus
+/// memory-image uninhabited diagnostic split.
 pub const FSYM_LAYOUT_PORTED_FROM: &[(&str, u64)] = &[
     ("pointer_bits", 0xf928c342cfd35470),
     ("pointer_bytes", 0xdabcdd464382c4d9),
@@ -146,7 +154,7 @@ pub const FSYM_LAYOUT_PORTED_FROM: &[(&str, u64)] = &[
     ("eval_store", 0x8e3472405e9fff8e),
     ("byte_size", 0x263ee81a230b286f),
     ("with_layout_visit", 0x634043d91c719db0),
-    ("byte_size_in", 0xb129e1e20668a28d),
+    ("byte_size_in", 0x0b914728c4e31620),
     ("struct_layout_in", 0x7ee9bcabf44f23c9),
     ("struct_layout_unguarded", 0xff26ba1f5ac0bb05),
     ("declared_struct_layout", 0xdbe8ac259aa3046a),
@@ -155,11 +163,11 @@ pub const FSYM_LAYOUT_PORTED_FROM: &[(&str, u64)] = &[
     ("descriptor_field_size", 0xe33711e8baecfcba),
     ("descriptor_field_align", 0x4092533baed5921f),
     ("enum_layout_in", 0x2a3638e63d746667),
-    ("enum_layout_unguarded", 0x94cb0a8d05fd86dd),
+    ("enum_layout_unguarded", 0x25a61aad6471249a),
     ("byte_align", 0x68710b1cce47d0e9),
-    ("byte_align_in", 0x08577c781eb421bd),
-    ("encode_image", 0x434f76e08bd7441a),
-    ("first_uninit_covered", 0x2861888e8de3aff4),
+    ("byte_align_in", 0x1a81b1d5ef70432b),
+    ("encode_image", 0xa0d3ff547fcfadfd),
+    ("first_uninit_covered", 0xaddb3fa4314a7a12),
     ("alloc_with_slack", 0xe8f833caf49a31ec),
     ("align_addr", 0x550bc2c9d6df8f10),
     ("align_up", 0x7e5fc57dcfbe11af),
@@ -728,6 +736,12 @@ impl<'m> FsymLayout<'m> {
                         offset: *tag_offset,
                         size: tag_size,
                     }
+                }
+                EnumTagEncoding::DirectWithUninhabited { .. } => {
+                    return Err(format!(
+                        "enum {ty} uses direct-with-uninhabited storage profiles, which the \
+                         bounded fsym layout model does not yet represent"
+                    ));
                 }
                 EnumTagEncoding::Niche {
                     untagged_variant,

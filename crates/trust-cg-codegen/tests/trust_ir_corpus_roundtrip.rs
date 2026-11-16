@@ -213,6 +213,10 @@ enum NonModule {
     /// A native verification bundle; it CARRIES a module, which is driven
     /// through trust-cg's writers and readers like any other.
     NativeBundle,
+    /// Frozen schema8 carrier: decode faithfully, refuse admission explicitly.
+    HistoricalNativeBundle,
+    /// Exact provenance and byte commitments for the historical carrier.
+    HistoricalBundleOrigin,
     /// A level-S generic template (amendment S, wire v57) in one of its four
     /// formats: the `TRUST_IS` blob (`.tmbs`), the template text
     /// (`.trust_irs`) or its serde JSON / MessagePack form. Not a module and
@@ -274,6 +278,21 @@ const NON_MODULE_FILES: &[(Dir, &str, NonModule)] = &[
         "native_request_trust_bundle.msgpack",
         NonModule::NativeBundle,
     ),
+    (
+        Dir::Compat,
+        "pre_thir_native_request_trust_bundle.json",
+        NonModule::HistoricalNativeBundle,
+    ),
+    (
+        Dir::Compat,
+        "pre_thir_native_request_trust_bundle.msgpack",
+        NonModule::HistoricalNativeBundle,
+    ),
+    (
+        Dir::Compat,
+        "pre_thir_native_request_trust_bundle.ORIGIN.json",
+        NonModule::HistoricalBundleOrigin,
+    ),
     (Dir::Live, "vector_mask_oracles.json", NonModule::Data),
     (
         Dir::V41ReaderCompat,
@@ -318,10 +337,10 @@ fn non_module_kind(dir: Dir, name: &str) -> Option<NonModule> {
 }
 
 /// The template files the corpus holds at the pinned revision (the
-/// `compat/` pin's two formats and `templates/`' nine goldens in four), each
+/// `compat/` pin's two formats and `templates/`' ten goldens in four), each
 /// read by trust-ir's template codec and refused by trust-cg's module
 /// readers. A pin move that adds or drops one fails the census by name.
-const TEMPLATE_FILES: usize = 38;
+const TEMPLATE_FILES: usize = 42;
 
 /// The frozen v41 roster keeps its historical spelling; a live fixture renamed
 /// since is mapped here (trust-ir `conformance.rs` `LEGACY_ROSTER_RENAMES`).
@@ -386,12 +405,6 @@ const TMBC_READER_REFUSALS: &[(Dir, &str, &str, &str)] = &[
     ),
     (
         Dir::Live,
-        "storage_only",
-        PRODUCER_OMISSION,
-        "v64 geometry golden; root is bodied and unstamped, not a source license",
-    ),
-    (
-        Dir::Live,
         "text_directives",
         PRODUCER_OMISSION,
         "v41 golden; `sink` is bodied and unstamped",
@@ -428,7 +441,6 @@ const JSON_TEXT_ADMIT_WHAT_THE_BINARY_READER_REFUSES: &[(Dir, &str)] = &[
     (Dir::Live, "composition"),
     (Dir::Live, "import_scheme"),
     (Dir::Live, "spec_carrier"),
-    (Dir::Live, "storage_only"),
     (Dir::Live, "text_directives"),
     (Dir::Refuse, "body_gate_omitted_at_contract_surface"),
 ];
@@ -536,36 +548,28 @@ type CensusRow = (Dir, Format, usize, usize, &'static [(&'static str, usize)]);
 /// round-trips it and module validation must refuse `InvalidMakeClosure`.
 /// Measured 94 tMBC (73 round-tripped), 74 JSON and 74 MessagePack files;
 /// no live, compat, reader-compat, frame, template or exception row moved.)
-/// (trust-ir `96f7ff19`, wire v68–v70 tensor regions, gather/scatter and the
-/// weight-blob table: the live corpus gained `tensor_map_reduce_view`,
-/// `tensor_gather_scatter` and `tensor_weight_blob` (tMBC, JSON, text and
-/// MessagePack each), all three round-tripped. `refuse/` gained eleven module
-/// rows (`tensor_blob_{codegen,digest_mismatch,extents_do_not_fit_its_bytes,missing}`,
-/// `tensor_gather_{coordinate_count_is_not_the_data_rank,scatter_codegen}`,
-/// `tensor_map_{lane_out_of_scope,reduce_view_codegen}`,
-/// `tensor_reduce_axes_not_ascending`, `tensor_scatter_init_is_not_the_result_type`,
-/// `tensor_view_shape_reads_a_coordinate`) in tMBC, JSON and MessagePack, and
-/// four poisoned bytes rows (`blob_tensor_*_below_its_version`,
-/// `blob_tensor_blob_table_not_canonical`). Measured 64 live tMBC (55
-/// round-tripped), 114 refuse tMBC (88 round-tripped, 25 poisoned), 89 refuse
-/// JSON and 89 refuse MessagePack files; no compat, reader-compat, frame,
-/// template or exception row moved.)
+/// (trust-ir `933e34fa`, BoxDeref wire v74 over the current v70-v73 source:
+/// the live corpus gained `box_deref` in all four formats and refreshed
+/// `storage_only` to an explicit Ungated body, so 57 of 65 live tMBC files
+/// round-trip and eight remain producer omissions. `refuse/` gained 33
+/// BoxDeref tMBC rows (two poisoned bytes rows) and 31 JSON / MessagePack
+/// rows. `templates/` gained one four-format thin-pointer template.)
 const CENSUS: &[CensusRow] = &[
     (
         Dir::Live,
         Format::Tmbc,
-        64,
-        55,
-        &[("reader: producer omission (v41+ header, unstamped body)", 9)],
+        65,
+        57,
+        &[("reader: producer omission (v41+ header, unstamped body)", 8)],
     ),
-    (Dir::Live, Format::Json, 64, 64, &[]),
-    (Dir::Live, Format::Text, 64, 64, &[]),
+    (Dir::Live, Format::Json, 65, 65, &[]),
+    (Dir::Live, Format::Text, 65, 65, &[]),
     (
         Dir::Live,
         Format::Msgpack,
-        64,
+        65,
         0,
-        &[("not a trust-cg input format (MessagePack)", 64)],
+        &[("not a trust-cg input format (MessagePack)", 65)],
     ),
     (
         Dir::Compat,
@@ -593,20 +597,20 @@ const CENSUS: &[CensusRow] = &[
     (
         Dir::Refuse,
         Format::Tmbc,
-        114,
-        88,
+        147,
+        119,
         &[
-            ("reader: manifest Binary verdict (poisoned bytes row)", 25),
+            ("reader: manifest Binary verdict (poisoned bytes row)", 27),
             ("reader: producer omission (v41+ header, unstamped body)", 1),
         ],
     ),
-    (Dir::Refuse, Format::Json, 89, 89, &[]),
+    (Dir::Refuse, Format::Json, 120, 120, &[]),
     (
         Dir::Refuse,
         Format::Msgpack,
-        89,
+        120,
         0,
-        &[("not a trust-cg input format (MessagePack)", 89)],
+        &[("not a trust-cg input format (MessagePack)", 120)],
     ),
     (Dir::FrameCfg, Format::Text, 5, 5, &[]),
 ];
@@ -1340,6 +1344,87 @@ fn run_non_module(census: &mut Census, dir: Dir, path: &Path) {
                     check_writers(census, &case, &bundle.module);
                 }
                 Err(e) => census.finding(format!("{label}: bundle refused: {e}")),
+            }
+        }
+        (NonModule::HistoricalNativeBundle, Some(ext)) => {
+            let json = fs::read(path.with_extension("json")).expect("historical JSON");
+            let msgpack = fs::read(path.with_extension("msgpack")).expect("historical MessagePack");
+            let old = serde_json::from_slice::<NativeVerificationBundle>(&json)
+                .expect("historical bundle JSON decodes");
+            let twin = rmp_serde::from_slice::<NativeVerificationBundle>(&msgpack)
+                .expect("historical bundle MessagePack decodes");
+            assert_eq!(old, twin, "historical carrier codecs disagree: {ext}");
+            // The corpus consumer enables serde/binary, not the generator's
+            // `all` feature. Compare the actual current carrier, whose module
+            // and two codecs are also driven by the live non-module rows.
+            let current = fs::read(corpus_root().join("native_request_trust_bundle.json"))
+                .expect("current native carrier JSON");
+            let mut expected = serde_json::from_slice::<NativeVerificationBundle>(&current)
+                .expect("current native carrier decodes");
+            expected.validate().expect("current carrier positive");
+            expected.schema_version = 8;
+            expected.serialization.schema_version = 8;
+            assert_eq!(
+                old, expected,
+                "historical carrier changed beyond schema fields"
+            );
+            let errors = old
+                .validate()
+                .expect_err("historical schema8 must be refused");
+            assert!(
+                errors.contains(
+                    &trust_ir::NativeVerificationBundleError::UnsupportedSchemaVersion(8)
+                )
+            );
+            assert!(errors.contains(
+                &trust_ir::NativeVerificationBundleError::UnsupportedSerializationSchemaVersion(8)
+            ));
+            // The rejected carrier still contains a module; exercise its writers.
+            census.bundle_modules += 1;
+            let case = Case {
+                dir,
+                stem: format!("{name}#module"),
+                files: BTreeMap::new(),
+            };
+            check_writers(census, &case, &old.module);
+        }
+        (NonModule::HistoricalBundleOrigin, _) => {
+            use sha2::{Digest, Sha256};
+            let origin: serde_json::Value =
+                serde_json::from_slice(&bytes).expect("historical origin JSON");
+            assert_eq!(
+                origin["source_commit"],
+                "45d8f57e21f7228c5981645b236770059b01c94e"
+            );
+            assert_eq!(
+                origin["source_tree"],
+                "a546495c1042ff70eceb98bf5e15c9c3ae1749f3"
+            );
+            let rows = origin["files"].as_array().expect("origin file roster");
+            assert_eq!(rows.len(), 2);
+            for (row, (ext, len, digest)) in rows.iter().zip([
+                (
+                    "json",
+                    66153u64,
+                    "aacbfe6d13f3f3b27b0138462496aceb72b5baf70d67c8fec7b5f46015c76e06",
+                ),
+                (
+                    "msgpack",
+                    17002u64,
+                    "54cd11cab1dbc824c84408aba31536b4edec9d94de1a9462f856f73663a0dc21",
+                ),
+            ]) {
+                let filename = format!("pre_thir_native_request_trust_bundle.{ext}");
+                assert_eq!(
+                    row["path"],
+                    format!("crates/trust-ir-conformance/tests/fixtures/compat/{filename}")
+                );
+                let payload =
+                    fs::read(path.parent().unwrap().join(filename)).expect("origin payload");
+                assert_eq!(row["bytes"], len);
+                assert_eq!(payload.len() as u64, len);
+                assert_eq!(row["sha256"], digest);
+                assert_eq!(format!("{:x}", Sha256::digest(&payload)), digest);
             }
         }
         (NonModule::Template, Some(ext)) => {

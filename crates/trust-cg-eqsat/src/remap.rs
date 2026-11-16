@@ -37,7 +37,10 @@ pub(crate) fn for_each_operand_mut(inst: &mut Inst, visit: &mut dyn FnMut(&mut V
         Inst::SeqMapAddK { seq, .. } | Inst::SeqMapNot { seq, .. } | Inst::SeqMap { seq, .. } => {
             visit(seq);
         }
-        Inst::UnOp { operand, .. } | Inst::Cast { operand, .. } | Inst::Copy { operand, .. } => {
+        Inst::UnOp { operand, .. }
+        | Inst::Cast { operand, .. }
+        | Inst::Copy { operand, .. }
+        | Inst::BoxDeref { operand, .. } => {
             visit(operand);
         }
         Inst::Load { ptr, .. }

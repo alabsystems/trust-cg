@@ -44,6 +44,12 @@ if name == "targo":
     if arguments[:1] == ["metadata"]:
         print(json.dumps(facts["metadata"]))
         sys.exit(0)
+    if (arguments[:2] == ["--unverified", "rustc"]
+            and arguments[-2:] == ["--", "--print=sysroot"]):
+        # scripts/trust_toolchain.py asks through Targo's scheduled rustc unit;
+        # this fixture has no compiler child, so answer the exact bounded query.
+        print(package)
+        sys.exit(0)
     sys.exit(64)
 if arguments == ["-vV"]:
     print(facts["version"])

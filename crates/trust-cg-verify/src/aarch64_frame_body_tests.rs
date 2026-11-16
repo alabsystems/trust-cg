@@ -1018,7 +1018,7 @@ fn frame_body_readonly_leaf_requires_real_replay_and_exact_linked_endpoints() {
             InstId(6),
             certificate,
             &request,
-            &[argument.clone()],
+            std::slice::from_ref(&argument),
             &memory,
         )
         .unwrap();
@@ -1062,7 +1062,7 @@ fn frame_body_readonly_leaf_requires_real_replay_and_exact_linked_endpoints() {
             InstId(7),
             certificate,
             &request,
-            &[argument.clone()],
+            std::slice::from_ref(&argument),
             &memory
         )
         .is_err()
@@ -1096,7 +1096,7 @@ fn frame_body_readonly_leaf_requires_real_replay_and_exact_linked_endpoints() {
             InstId(6),
             certificate,
             &request,
-            &[argument.clone()],
+            std::slice::from_ref(&argument),
             &Arc::new(crate::smt::SmtExpr::bv_const(0, 64))
         )
         .is_err()

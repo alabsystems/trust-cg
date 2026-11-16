@@ -77,7 +77,8 @@ class MatrixRunsThePackageTests(unittest.TestCase):
         # The preludes answer the questions the matrix asks: a census with a
         # package no shard covers, and a nightly compiler.
         FIXTURE.lying_shim(self.shims / "targo", self.package / "bin" / "targo", self.log,
-                           {"metadata*": json.dumps(ghost_metadata(self.metadata))})
+                           {"metadata*": json.dumps(ghost_metadata(self.metadata),
+                                                   separators=(",", ":"))})
         FIXTURE.lying_shim(self.shims / "trustc", self.package / "bin" / "trustc", self.log,
                            {"--version": "rustc 1.99.0-nightly (forged by a prelude)",
                             "--print sysroot": str(self.root)})

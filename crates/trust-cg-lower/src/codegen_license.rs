@@ -110,6 +110,7 @@ use trust_ir::{BodyGate, FuncId, Function, Module};
 use trust_ir_build::ValidationError;
 
 use crate::adapter::AdapterError;
+use crate::box_deref::{BoxDerefDisclosure, BoxValidityFloor};
 use crate::linked_imports::AuthenticatedImportSet;
 
 /// The gate authority the Clean compiler stamps on a body its in-process
@@ -257,6 +258,15 @@ pub struct CodegenLicensePolicy {
     /// [`Self::with_authenticated_imports`] sets it, from a set only
     /// [`crate::authenticate_linked_imports`] mints.
     authenticated_imports: Option<Arc<AuthenticatedImportSet>>,
+    /// The evidence floor this consumer holds trust-ir `Inst::BoxDeref`
+    /// (wire v74) to, stated as the report an opt-in owes: `None` is
+    /// [`BoxValidityFloor::Refuse`] (the default), `Some` is
+    /// [`BoxValidityFloor::NamedPremise`] together with the place every
+    /// admission under it is reported. Private: only
+    /// [`Self::with_named_premise_box_floor`] sets it, so the named-premise
+    /// floor without a report is not representable, and there is no value
+    /// below trust-ir's `NamedPremise` floor.
+    box_named_premise_disclosure: Option<BoxDerefDisclosure>,
 }
 
 impl Default for CodegenLicensePolicy {
@@ -269,6 +279,7 @@ impl Default for CodegenLicensePolicy {
             unlicensed: UnlicensedBodyPolicy::Refuse,
             refuse_unbacked_claims_on_checks: false,
             authenticated_imports: None,
+            box_named_premise_disclosure: None,
         }
     }
 }
@@ -284,6 +295,7 @@ impl CodegenLicensePolicy {
             unlicensed: UnlicensedBodyPolicy::Refuse,
             refuse_unbacked_claims_on_checks: false,
             authenticated_imports: None,
+            box_named_premise_disclosure: None,
         }
     }
 
@@ -349,6 +361,71 @@ impl CodegenLicensePolicy {
         }
     }
 
+    /// Lower the evidence floor for trust-ir `Inst::BoxDeref` to
+    /// [`BoxValidityFloor::NamedPremise`], reporting every admission to
+    /// `disclosure`.
+    ///
+    /// The default is [`BoxValidityFloor::Refuse`]: every `BoxDeref` is
+    /// refused ([`AdapterError::BoxDerefNotAdmitted`]), because the only
+    /// evidence the pinned format admits is a named assumption and a named
+    /// assumption is not something a proof-required lane may rest on.
+    /// This is the diagnostic lane's opt-in and the only way to select the
+    /// named-premise floor: the module is then compiled UNDER NAMED
+    /// ASSUMPTIONS, and each verdict of this policy that admits a module
+    /// holding a `BoxDeref` records the manifest in `disclosure` before it
+    /// returns ([`BoxDerefDisclosure::records`], [`BoxDerefDisclosure::lines`]),
+    /// which the caller must publish with what it compiled. It is never
+    /// proof evidence and licenses no transformation.
+    #[must_use]
+    pub fn with_named_premise_box_floor(mut self, disclosure: &BoxDerefDisclosure) -> Self {
+        self.box_named_premise_disclosure = Some(disclosure.clone());
+        self
+    }
+
+    /// The evidence floor this policy holds `Inst::BoxDeref` to.
+    #[must_use]
+    pub fn box_validity_floor(&self) -> BoxValidityFloor {
+        match self.box_named_premise_disclosure {
+            Some(_) => BoxValidityFloor::NamedPremise,
+            None => BoxValidityFloor::Refuse,
+        }
+    }
+
+    /// The report of [`Self::with_named_premise_box_floor`], when this
+    /// policy opted in.
+    #[must_use]
+    pub fn box_deref_disclosure(&self) -> Option<&BoxDerefDisclosure> {
+        self.box_named_premise_disclosure.as_ref()
+    }
+
+    /// The ONE acceptance check for `Inst::BoxDeref`
+    /// ([`crate::box_deref::admit_box_derefs`]) at this policy's floor.
+    /// Every license entry of this type runs it, so a module holding a
+    /// `BoxDeref` below the floor is refused on every path that enforces a
+    /// license, on every target; and an admission is recorded in the
+    /// policy's report before this returns, so no entry admits silently.
+    pub fn admit_box_derefs(
+        &self,
+        module: &Module,
+    ) -> Result<crate::box_deref::BoxDerefManifest, AdapterError> {
+        let manifest = crate::box_deref::admit_box_derefs(module, self.box_validity_floor())?;
+        match &self.box_named_premise_disclosure {
+            Some(disclosure) => disclosure.record(module, &manifest),
+            // Unreachable while `Refuse` admits no fact; kept as a refusal
+            // so an admission can never go unreported if that changes.
+            None if !manifest.rows.is_empty() => {
+                return Err(AdapterError::InvalidTrustIr(format!(
+                    "box deref: module `{}` was admitted with no report to carry its {} \
+                     assumption(s)",
+                    module.name,
+                    manifest.rows.len()
+                )));
+            }
+            None => {}
+        }
+        Ok(manifest)
+    }
+
     /// Set whether a bare safety claim on a runtime check is refused
     /// ([`Self::refuse_unbacked_claims_on_checks`]).
     #[must_use]
@@ -397,7 +474,17 @@ impl CodegenLicensePolicy {
             .functions
             .iter()
             .filter(|function| function.id == id)
-            .try_for_each(|function| self.function_verdict(function, &findings))
+            .try_for_each(|function| self.function_verdict(function, &findings))?;
+        // A Box validity fact is validated against its module, so the
+        // verdict for one function holding a `BoxDeref` is the module's.
+        if module
+            .functions
+            .iter()
+            .any(|function| function.id == id && crate::box_deref::function_has_box_deref(function))
+        {
+            self.admit_box_derefs(module)?;
+        }
+        Ok(())
     }
 
     /// Apply the license to every function of `module`, in module order,
@@ -416,6 +503,7 @@ impl CodegenLicensePolicy {
             .functions
             .iter()
             .try_for_each(|function| self.function_verdict(function, &findings))?;
+        self.admit_box_derefs(module)?;
         self.unbacked_claim_refusal(module)
     }
 
@@ -451,6 +539,9 @@ impl CodegenLicensePolicy {
             imports.bind_root(module)?;
         }
         let findings = FormatLicenseFindings::of(module)?;
+        // The Box validity verdict reads the whole module (the fact's rules
+        // do), so it is the module's `Err`, as the claim rule's is.
+        self.admit_box_derefs(module)?;
         self.unbacked_claim_refusal(module)?;
         Ok(module
             .functions
@@ -561,8 +652,10 @@ impl CodegenLicensePolicy {
     /// authorities=<a>,<b>,...` (sorted, so equal policies print equal),
     /// followed by `;linked=<root digest>` when the policy carries an import
     /// authentication (WS7.9) and then `;unbacked_claims=refuse` only when
-    /// that knob is set, so every policy without either keeps its earlier
-    /// identity byte for byte.
+    /// that knob is set, and then `;box_validity_floor=<tier>` only when the
+    /// Box validity floor is lowered from its refusing default, so every
+    /// policy without any of the three keeps its earlier identity byte for
+    /// byte.
     #[must_use]
     pub fn canonical_identity(&self) -> String {
         let authorities = self
@@ -581,6 +674,12 @@ impl CodegenLicensePolicy {
         );
         if self.refuse_unbacked_claims_on_checks {
             identity.push_str(";unbacked_claims=refuse");
+        }
+        // Appended only when lowered from the default, so every policy that
+        // refuses `BoxDeref` keeps its earlier identity byte for byte.
+        if self.box_validity_floor() != BoxValidityFloor::Refuse {
+            identity.push_str(";box_validity_floor=");
+            identity.push_str(self.box_validity_floor().name());
         }
         identity
     }

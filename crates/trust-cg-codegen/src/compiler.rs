@@ -1004,6 +1004,8 @@ pub enum CoreJitProofGradeQualificationError {
         "proof-grade Core JIT qualification requires an empty link-unit definition set, found {count} name(s)"
     )]
     LinkUnitDefinitionsSet { count: usize },
+    #[error("proof-grade Core JIT qualification has no x86-64 certificate-free allocation policy")]
+    X86CertificateFreeAllocation,
     #[error("compiler external-symbol policy must be ExplicitOnly, found {actual:?}")]
     CompilerExternalSymbolResolution {
         actual: JitExternalSymbolResolutionPolicy,
@@ -1616,6 +1618,60 @@ fn warn_jit_unchecked_engaged(target: Target, via_env: bool) {
     }
 }
 
+/// The allocation-quality policy of an x86-64 object compile: a compile that
+/// emits proof certificates keeps the historical allocation whatever a driver
+/// installed or requested (`Withheld`); one that emits none and requests it
+/// (`CompilerConfig::x86_certificate_free_allocation`, which a TY
+/// ahead-of-time driver sets) gets the allocation-quality changes unless an
+/// installed policy opted out of one (`CertificateFree`); any other compile
+/// follows the installed process policy alone (`Installed`), so a default
+/// configuration emits the same bytes with and without certificates
+/// ([`crate::x86_64::pipeline::X86AllocationQuality`]).
+pub(crate) fn x86_object_allocation_quality(
+    emit_proofs: bool,
+    certificate_free_requested: bool,
+) -> crate::x86_64::pipeline::X86AllocationQuality {
+    use crate::x86_64::pipeline::X86AllocationQuality;
+    if emit_proofs {
+        X86AllocationQuality::Withheld
+    } else if certificate_free_requested {
+        X86AllocationQuality::CertificateFree
+    } else {
+        X86AllocationQuality::Installed
+    }
+}
+
+#[cfg(test)]
+mod x86_object_allocation_quality_tests {
+    use super::x86_object_allocation_quality;
+    use crate::x86_64::pipeline::X86AllocationQuality;
+
+    #[test]
+    fn a_certificate_keeping_compile_keeps_the_historical_allocation() {
+        // Certificates kept: withheld, even when certificate-free is requested.
+        assert_eq!(
+            x86_object_allocation_quality(true, true),
+            X86AllocationQuality::Withheld
+        );
+        assert_eq!(
+            x86_object_allocation_quality(true, false),
+            X86AllocationQuality::Withheld
+        );
+        // Only an explicit request makes a compile certificate-free.
+        assert_eq!(
+            x86_object_allocation_quality(false, true),
+            X86AllocationQuality::CertificateFree
+        );
+        // The default configuration follows the installed policy, so
+        // `emit_proofs` alone never changes the allocation.
+        assert_eq!(
+            x86_object_allocation_quality(false, false),
+            X86AllocationQuality::Installed
+        );
+        assert!(!super::CompilerConfig::default().x86_certificate_free_allocation);
+    }
+}
+
 /// Configuration for the [`Compiler`].
 #[derive(Debug, Clone)]
 pub struct CompilerConfig {
@@ -1897,6 +1953,23 @@ pub struct CompilerConfig {
     /// default digest is unchanged; refused at the closed-JIT Core proof-grade
     /// boundary like every other non-default control.
     pub link_unit_definitions: BTreeSet<String>,
+    /// Give an x86-64 object compile the register-allocation quality changes
+    /// the rustc bridge installs for `no-proof-certs` (ABI copy hints,
+    /// caller-saved-first order, cold-call weighting, the conditional-call
+    /// split), unless an installed process policy opted out of one
+    /// ([`crate::x86_64::pipeline::X86AllocationQuality::CertificateFree`]).
+    ///
+    /// A driver that keeps no proof certificates and installs no policy (the
+    /// TY ahead-of-time path) sets this to get them. It changes emitted bytes,
+    /// so it is an Artifact field of the compile policy (present only when
+    /// on), and the compile's bytes are then NOT the bytes a certificate-
+    /// keeping compile of the same module emits. With `emit_proofs` set it is
+    /// overridden: a certificate-keeping compile keeps the historical
+    /// allocation whatever this says or a driver installed
+    /// (`X86AllocationQuality::Withheld`). Refused at the closed-JIT Core
+    /// proof-grade boundary. Ignored for other targets. Default: `false`, the
+    /// process policy alone (`X86AllocationQuality::Installed`).
+    pub x86_certificate_free_allocation: bool,
 }
 
 impl Default for CompilerConfig {
@@ -1922,6 +1995,7 @@ impl Default for CompilerConfig {
             eh_frames_cannot_unwind: false,
             eh_nounwind_callees: BTreeSet::new(),
             link_unit_definitions: BTreeSet::new(),
+            x86_certificate_free_allocation: false,
         }
     }
 }
@@ -1981,6 +2055,7 @@ impl CompilerConfig {
             eh_nounwind_callees: BTreeSet::new(),
             // The module is its own link unit.
             link_unit_definitions: BTreeSet::new(),
+            x86_certificate_free_allocation: false,
         }
     }
 
@@ -5943,6 +6018,7 @@ fn qualify_proof_grade_core_jit_plan(
         // Read only with `eh_frames_cannot_unwind`, which is refused below.
         eh_nounwind_callees: _,
         link_unit_definitions,
+        x86_certificate_free_allocation,
     } = compiler_config;
     if *target != target_spec.architecture {
         return Err(
@@ -6023,6 +6099,12 @@ fn qualify_proof_grade_core_jit_plan(
                 count: link_unit_definitions.len(),
             },
         );
+    }
+    // A certificate-free allocation policy is an object-compile control that
+    // states certificates are not kept; it must not cross the proof-grade
+    // boundary.
+    if *x86_certificate_free_allocation {
+        return Err(CoreJitProofGradeQualificationError::X86CertificateFreeAllocation);
     }
     if *jit_external_symbol_resolution != JitExternalSymbolResolutionPolicy::ExplicitOnly {
         return Err(
@@ -16117,6 +16199,25 @@ impl Compiler {
             .collect()
     }
 
+    /// A proof-grade lane's verdict on trust-ir `Inst::BoxDeref`: the ONE
+    /// acceptance check
+    /// ([`trust_cg_lower::admit_box_derefs`]) at
+    /// [`trust_cg_lower::BoxValidityFloor::Refuse`], so a license that opted
+    /// into the named-premise floor cannot carry a Box deref into a compile
+    /// that emits proof certificates. A compile that emits none is decided
+    /// by the license's own floor in the ingestion admission.
+    fn refuse_box_derefs_for_proof_claim(
+        &self,
+        module: &trust_ir::Module,
+        proof_claim: bool,
+    ) -> Result<(), CompileError> {
+        if proof_claim {
+            trust_cg_lower::admit_box_derefs(module, trust_cg_lower::BoxValidityFloor::Refuse)
+                .map_err(CompileError::from_admission)?;
+        }
+        Ok(())
+    }
+
     /// Compile a trust_ir module to an object file.
     ///
     /// Translates each function in the module through the full pipeline:
@@ -16142,6 +16243,14 @@ impl Compiler {
         // lookup or rewrite (a cached artifact must never bypass a refusal; a
         // clone must never launder `Ungated` to `None`). Every finding refuses
         // (`crate::ingest`).
+        // trust-ir v74 `Inst::BoxDeref` on a proof-grade compile: refused
+        // whatever floor the license names. The only evidence the pinned
+        // format admits is a named assumption, and certificates emitted
+        // beside code compiled under one would read as covering it.
+        self.refuse_box_derefs_for_proof_claim(
+            module,
+            self.config.emit_proofs || self.requires_verified_proof_promotion(),
+        )?;
         let received = crate::ingest::admit_module(
             module,
             &self.codegen_license,
@@ -17740,6 +17849,10 @@ impl Compiler {
             panic_unwind: self.config.panic_unwind,
             macho_build_version,
             weak_function_definitions: weak_function_definitions(trust_ir_module),
+            allocation_quality: x86_object_allocation_quality(
+                self.config.emit_proofs,
+                self.config.x86_certificate_free_allocation,
+            ),
             ..X86PipelineConfig::default()
         });
 
@@ -19618,6 +19731,16 @@ impl Compiler {
         // WS7.3 INGESTION ADMISSION: trust-ir's own codegen validator plus the
         // v41 codegen LICENSE, decided on the caller's module before any cache
         // lookup or rewrite (see `Self::compile`).
+        // trust-ir v74 `Inst::BoxDeref` on a proof-grade compile: refused
+        // whatever floor the license names. The only evidence the pinned
+        // format admits is a named assumption, and certificates emitted
+        // beside code compiled under one would read as covering it.
+        self.refuse_box_derefs_for_proof_claim(
+            module,
+            self.config.emit_proofs
+                || self.requires_verified_proof_promotion()
+                || validation_mode.requires_jit_verification(),
+        )?;
         let received = crate::ingest::admit_module(
             module,
             &self.codegen_license,
@@ -25963,6 +26086,24 @@ mod tests {
             |plan| {
                 plan.effective_options
                     .compiler_config
+                    .x86_certificate_free_allocation = true;
+            },
+            |error| {
+                matches!(
+                    error,
+                    CoreJitProofGradeQualificationError::X86CertificateFreeAllocation
+                )
+            },
+        );
+        plan.effective_options
+            .compiler_config
+            .x86_certificate_free_allocation = false;
+
+        plan = assert_exact_plan_recovery(
+            plan,
+            |plan| {
+                plan.effective_options
+                    .compiler_config
                     .jit_external_symbol_resolution =
                     JitExternalSymbolResolutionPolicy::ExplicitThenProcess;
             },
@@ -29929,6 +30070,7 @@ mod tests {
             eh_frames_cannot_unwind: false,
             eh_nounwind_callees: BTreeSet::new(),
             link_unit_definitions: BTreeSet::new(),
+            x86_certificate_free_allocation: false,
         };
         let compiler = Compiler::new(config).with_codegen_license(permit_unlicensed());
         assert_eq!(compiler.config().opt_level, OptLevel::O0);

@@ -328,13 +328,17 @@ impl<'a, 'tcx> Flow<'a, 'tcx> {
     }
 
     /// Every escape of the body, given each call's callee summary.
+    /// `summarize` answers a call's callee summary and shape given the call's
+    /// argument values, or `None` when the caller does not need that call's
+    /// escapes at all (see [`retained_address_locals`]); the call then
+    /// contributes no seed.
     fn escapes(
         &self,
         summarize: &mut dyn FnMut(
             &Flow<'a, 'tcx>,
             &Operand<'tcx>,
-            usize,
-        ) -> (CalleeSummary, CallShape),
+            &[BTreeSet<Obj>],
+        ) -> Option<(CalleeSummary, CallShape)>,
         returned: bool,
     ) -> Vec<(BTreeSet<Obj>, EscapeReason)> {
         let mut out: Vec<(BTreeSet<Obj>, EscapeReason)> = Vec::new();
@@ -403,7 +407,9 @@ impl<'a, 'tcx> Flow<'a, 'tcx> {
                     if values.iter().all(BTreeSet::is_empty) {
                         continue;
                     }
-                    let (summary, shape) = summarize(self, func, args.len());
+                    let Some((summary, shape)) = summarize(self, func, &values) else {
+                        continue;
+                    };
                     for (index, value) in values.into_iter().enumerate() {
                         let capture = shape.capture(&summary, index);
                         let reason = EscapeReason::CallArgument {
@@ -817,12 +823,12 @@ impl<'m, 'tcx> Summaries<'m, 'tcx> {
         flow: &Flow<'tcx, 'tcx>,
     ) -> CalleeSummary {
         let seeds = flow.escapes(
-            &mut |flow, func, arg_len| {
+            &mut |flow, func, values| {
                 let callee = Self::resolve(flow, func);
-                (
-                    self.lookup(tmp, callee, arg_len),
-                    self.shape(callee, arg_len),
-                )
+                Some((
+                    self.lookup(tmp, callee, values.len()),
+                    self.shape(callee, values.len()),
+                ))
             },
             true,
         );
@@ -1019,41 +1025,137 @@ pub(super) fn retained_address_locals<'tcx>(
         memo,
         done: HashMap::new(),
     };
+    let typing_env = ty::TypingEnv::fully_monomorphized();
+    // Whether an escaped object can be reported below.
+    let reportable = |obj: Obj| match obj {
+        Obj::Local(local, writable) => {
+            writable
+                || !flow
+                    .mono(body.local_decls[local].ty)
+                    .is_freeze(tcx, typing_env)
+        }
+        // Not produced by a body analyzed without argument objects; counted
+        // as reportable so it never lets a call be skipped.
+        Obj::Arg(_) | Obj::ArgDeep(_) => true,
+    };
+    // A call whose arguments can reach no reportable object is not
+    // summarized: whatever its callee keeps, everything that escapes through
+    // it is in the closure of its argument values under `Flow::contents`, so
+    // it adds no reported local, and no reported local's first reason is set
+    // through it (an object reached from it is in that closure too). Its
+    // callee's summary request is DEFERRED, not dropped: `Summaries::summary`
+    // counts a request's reach net of the summaries this body already holds,
+    // so the reach cap of a later request depends on the earlier ones. Every
+    // deferred request is therefore replayed, in call order, before the next
+    // request that is answered, so every answered request sees the summaries
+    // it saw when all requests were made. On `std::rt::lang_start`, whose only
+    // address-carrying call passes a shared borrow of a `Freeze` closure to
+    // `lang_start_internal`, this skips summarizing that function's whole
+    // callee reach in every program.
+    let mut deferred: Vec<Instance<'tcx>> = Vec::new();
     let seeds = flow.escapes(
-        &mut |flow, func, arg_len| {
+        &mut |flow, func, values| {
             let callee = Summaries::resolve(flow, func);
+            if !reaches_reportable(values, |obj| flow.contents(obj), &reportable) {
+                deferred.extend(callee);
+                return None;
+            }
+            for earlier in deferred.drain(..) {
+                summaries.summary(earlier);
+            }
             let summary = match callee {
                 Some(callee) => {
                     summaries.summary(callee);
-                    summaries.lookup(&HashMap::new(), Some(callee), arg_len)
+                    summaries.lookup(&HashMap::new(), Some(callee), values.len())
                 }
                 None => CalleeSummary::All,
             };
-            (summary, summaries.shape(callee, arg_len))
+            Some((summary, summaries.shape(callee, values.len())))
         },
         false,
     );
-    let typing_env = ty::TypingEnv::fully_monomorphized();
     let mut out: BTreeMap<Local, String> = BTreeMap::new();
     for (obj, reason) in flow.close(seeds) {
-        let Obj::Local(local, writable) = obj else {
-            continue;
-        };
-        if !writable
-            && flow
-                .mono(body.local_decls[local].ty)
-                .is_freeze(tcx, typing_env)
-        {
+        if !reportable(obj) {
             continue;
         }
+        let Obj::Local(local, _) = obj else {
+            continue;
+        };
         out.entry(local).or_insert_with(|| reason.describe(tcx));
     }
     out
 }
 
+/// Whether the closure of `values` under `contents` holds an object for which
+/// `reportable` is true.
+fn reaches_reportable(
+    values: &[BTreeSet<Obj>],
+    contents: impl Fn(Obj) -> BTreeSet<Obj>,
+    reportable: impl Fn(Obj) -> bool,
+) -> bool {
+    let mut seen: BTreeSet<Obj> = BTreeSet::new();
+    let mut work: Vec<Obj> = values.iter().flatten().copied().collect();
+    while let Some(obj) = work.pop() {
+        if !seen.insert(obj) {
+            continue;
+        }
+        if reportable(obj) {
+            return true;
+        }
+        work.extend(contents(obj));
+    }
+    false
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{ArgCapture, CallShape, CalleeSummary, components_callees_first};
+    use super::{
+        ArgCapture, CallShape, CalleeSummary, Obj, components_callees_first, reaches_reportable,
+    };
+    use std::collections::{BTreeMap, BTreeSet};
+
+    /// A call is skipped only when NO object in the closure of its argument
+    /// values is reportable: a reportable object reached only through memory
+    /// (two `contents` steps, across a cycle) still counts, and the walk ends
+    /// on a cycle that reaches none. Fails if the walk stops at the argument
+    /// values themselves or does not follow `contents`.
+    #[test]
+    fn reaches_reportable_follows_the_whole_contents_closure() {
+        let local =
+            |i: u32, writable: bool| Obj::Local(rustc_middle::mir::Local::from_u32(i), writable);
+        // 0 -> 1 -> {0, 2}; 2 -> 3 (writable). 4 <-> 5, neither writable.
+        let edges: BTreeMap<Obj, BTreeSet<Obj>> = [
+            (local(0, false), BTreeSet::from([local(1, false)])),
+            (
+                local(1, false),
+                BTreeSet::from([local(0, false), local(2, false)]),
+            ),
+            (local(2, false), BTreeSet::from([local(3, true)])),
+            (local(4, false), BTreeSet::from([local(5, false)])),
+            (local(5, false), BTreeSet::from([local(4, false)])),
+        ]
+        .into_iter()
+        .collect();
+        let contents = |obj: Obj| edges.get(&obj).cloned().unwrap_or_default();
+        let writable = |obj: Obj| matches!(obj, Obj::Local(_, true));
+        assert!(reaches_reportable(
+            &[BTreeSet::new(), BTreeSet::from([local(0, false)])],
+            contents,
+            writable
+        ));
+        assert!(!reaches_reportable(
+            &[BTreeSet::from([local(4, false)])],
+            contents,
+            writable
+        ));
+        assert!(!reaches_reportable(&[BTreeSet::new()], contents, writable));
+        assert!(reaches_reportable(
+            &[BTreeSet::from([local(4, false)])],
+            contents,
+            |obj| obj == local(5, false)
+        ));
+    }
 
     /// Components come callees first, a cycle is one component, and a chain
     /// deeper than any thread stack is walked without recursion.

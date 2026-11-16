@@ -88,7 +88,7 @@
         {
           "kind": "lean_module",
           "uri": "reports/fixtures/ProofIndexedExtraction.lean",
-          "digest": "sha256:c0e60991c21c8fe96c70c2166ca07c4646f1658874f5277a8a8ec89ae840eb33",
+          "digest": "sha256:7c7bba15a64aa37cd72d8d97376a7e44815b006c91f0684693ed1083559dc0de",
           "media_type": "text/plain",
           "placeholder_transport": null
         }
@@ -124,7 +124,7 @@
         {
           "kind": "lean_module",
           "uri": "reports/fixtures/ProofIndexedExtraction.lean",
-          "digest": "sha256:c0e60991c21c8fe96c70c2166ca07c4646f1658874f5277a8a8ec89ae840eb33",
+          "digest": "sha256:7c7bba15a64aa37cd72d8d97376a7e44815b006c91f0684693ed1083559dc0de",
           "media_type": "text/plain",
           "placeholder_transport": null
         }
@@ -156,7 +156,7 @@
     {
       "kind": "lean_module",
       "uri": "reports/fixtures/ProofIndexedExtraction.lean",
-      "digest": "sha256:c0e60991c21c8fe96c70c2166ca07c4646f1658874f5277a8a8ec89ae840eb33",
+      "digest": "sha256:7c7bba15a64aa37cd72d8d97376a7e44815b006c91f0684693ed1083559dc0de",
       "media_type": "text/plain",
       "placeholder_transport": null
     }

@@ -491,8 +491,19 @@ const fn min_nonzero(left: NonZeroUsize, right: NonZeroUsize) -> NonZeroUsize {
     }
 }
 
+/// The host's available parallelism, probed once per process.
+///
+/// On Linux `std::thread::available_parallelism` reads the affinity mask and
+/// the cgroup CPU quota files on every call; the backend captures a snapshot
+/// several times per compiled module, and the probes were about 0.6 ms of a
+/// small program's compile (2026-11-15). The value only sizes worker pools
+/// (a budget changes how compilation runs, never what it emits; see
+/// [`ArtifactNeutralExecutorBudget::resolve`]); an affinity or quota change
+/// made while the process runs is not observed. Memory is still probed on
+/// every capture.
 fn capture_available_parallelism() -> NonZeroUsize {
-    std::thread::available_parallelism().unwrap_or(NonZeroUsize::MIN)
+    static PROBED: std::sync::OnceLock<NonZeroUsize> = std::sync::OnceLock::new();
+    *PROBED.get_or_init(|| std::thread::available_parallelism().unwrap_or(NonZeroUsize::MIN))
 }
 
 /// Host-available memory in bytes, or `None` when it cannot be determined.

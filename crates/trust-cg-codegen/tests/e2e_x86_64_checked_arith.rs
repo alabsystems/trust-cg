@@ -94,6 +94,7 @@ fn compile_trust_ir_module_x86_64(module: &TrustIrModule) -> Vec<u8> {
         eh_frames_cannot_unwind: false,
         eh_nounwind_callees: Default::default(),
         link_unit_definitions: Default::default(),
+        x86_certificate_free_allocation: false,
     })
     .with_codegen_license(permit_unlicensed());
     let result = compiler

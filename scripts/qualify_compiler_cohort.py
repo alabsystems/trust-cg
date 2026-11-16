@@ -5,7 +5,9 @@ Run through normal build-slot admission in an isolated clean checkout. The
 maintained pin owner and certificate gate remain the authorities. This driver
 publishes only to a feature/qualification branch, never main or attest refs.
 Logs and JSON stay in a new private directory outside the checkout. A red check
-may publish a FAILED narrative, but never its candidate pin changes.
+may publish a FAILED narrative, but never its candidate pin changes. The IR
+revision must already be published: unpublished certificate-rule candidates use
+the pin owner's separate qualification-only staging mode before this driver.
 """
 from __future__ import annotations
 
@@ -56,7 +58,7 @@ def validate_ref(ref):
     return ref
 
 
-def validate_report(report, root_revision, ay_revision):
+def validate_report(report, root_revision, ay_revision, ir_version):
     require(isinstance(report, dict), "certificate report is not an object")
     require(report.get("schema") == "trust-cg.x86-icmp-certificates.v2", "unknown certificate schema")
     require(type(report.get("exit")) is int and report["exit"] == 0,
@@ -67,8 +69,9 @@ def validate_report(report, root_revision, ay_revision):
     require(report.get("trust_ir_rev") == root_revision and report.get("ay_rev") == ay_revision,
             "certificate source identities differ from the requested cohort")
     build = report.get("trust_ir_build")
-    require(isinstance(build, str) and f"+g{root_revision[:12]}." in build,
-            "compiled TrustIR build does not name the requested revision")
+    require(isinstance(build, str)
+            and build.startswith(f"{ir_version}+g{root_revision[:12]}."),
+            "compiled TrustIR build does not name the requested version and revision")
     for key, count in (("certificate_cells", 32), ("instruction_model_cells", 8), ("fail_closed_cells", 0)):
         require(type(report.get(key)) is int and report[key] == count,
                 f"reviewed reader inventory changed: {key}")
@@ -149,13 +152,14 @@ def run_stage(root, output, name, argv):
 def receipt_text(args, passed, phase, logs, report):
     text = ("# Compiler cohort qualification\n\n"
             f"Outcome: **{'PASS' if passed else 'FAILED'}**. Last phase: {phase}.\n\n"
-            f"CG input: `{args.source_head}`. TrustIR: `{args.root_revision}`. "
+            f"CG input: `{args.source_head}`. TrustIR: `{args.root_revision}` "
+            f"(`{args.selected_ir_version}`). Clean packages: `{args.selected_clean_version}`. "
             f"AY: `{args.ay_revision}`.\n\n"
             "This is explicit unverified Rust compilation, named test execution and\n"
             "the canonical external-certificate gate. It is not a compiler, source/native,\n"
             "provider, DDC, release or full-toolchain soundness attestation.\n\n")
     if passed:
-        text += ("All seven maintained pin guards passed. Four reviewed pointer controls\n"
+        text += ("All eight maintained pin guards passed. Four reviewed pointer controls\n"
                  "executed individually; the complete reader inventory accounts for\n"
                  "32 certificate cells and eight instruction-model cells, with regenerated\n"
                  "queries, no missing inputs and no findings.\n\n")
@@ -192,17 +196,33 @@ def publish(root, output, args, relative, passed):
     return after
 
 
-def main(argv=None):
+def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("root_revision")
     parser.add_argument("--ay-revision", required=True)
+    parser.add_argument("--ir-version", choices=[pin.IR_VERSION_MIGRATION[1]])
+    parser.add_argument("--clean-version", choices=[pin.CLEAN_VERSION_MIGRATION[1]])
     parser.add_argument("--source-head", required=True)
     parser.add_argument("--publication-ref", required=True)
     parser.add_argument("--targo", required=True)
     parser.add_argument("--ay-source", type=Path, required=True)
     parser.add_argument("--clean-source", type=Path, required=True)
     parser.add_argument("--evidence-dir", type=Path, required=True)
-    args = parser.parse_args(argv)
+    return parser.parse_args(argv)
+
+
+def pin_owner_command(args):
+    command = [sys.executable, "scripts/bump_trust_ir_pin.py", args.root_revision,
+               "--ay-revision", args.ay_revision, "--targo", args.targo]
+    if args.ir_version is not None:
+        command.extend(("--ir-version", args.ir_version))
+    if args.clean_version is not None:
+        command.extend(("--clean-version", args.clean_version))
+    return command
+
+
+def main(argv=None):
+    args = parse_args(argv)
     root = Path(__file__).resolve().parents[1]
     for value in (args.root_revision, args.ay_revision, args.source_head):
         pin.exact_sha(value)
@@ -211,6 +231,9 @@ def main(argv=None):
     os.environ["TRUST_TARGO"] = args.targo
     require(git(root, "rev-parse", "HEAD") == args.source_head and not changed(root),
             "qualification needs the exact clean committed source")
+    initial_state = pin.current(root, pin.snapshot(root))
+    args.selected_ir_version = pin.selected_ir_version(initial_state, args.ir_version)
+    args.selected_clean_version = pin.selected_clean_version(initial_state, args.clean_version)
     output = args.evidence_dir
     require(output.is_absolute() and not output.exists(), "evidence directory must be new and absolute")
     require(not output.resolve().is_relative_to(root), "evidence payloads must stay outside the checkout")
@@ -220,8 +243,7 @@ def main(argv=None):
     output = Path(private_cache.require_private(output))
     phase, passed, report = "pin-owner", False, None
     try:
-        run_stage(root, output, phase, [sys.executable, "scripts/bump_trust_ir_pin.py",
-                  args.root_revision, "--ay-revision", args.ay_revision, "--targo", args.targo])
+        run_stage(root, output, phase, pin_owner_command(args))
         for number, name in enumerate(POINTER_TESTS):
             phase = f"pointer-{number}"
             log = run_stage(root, output, phase, ["scripts/trust_cargo.sh", "test", "--locked",
@@ -232,9 +254,13 @@ def main(argv=None):
         run_stage(root, output, phase, [sys.executable, "scripts/check_x86_icmp_certificates.py",
                   "--ay-source", str(args.ay_source), "--clean-source", str(args.clean_source),
                   "--keep-work", str(output / "work"), "--json-out", str(path)])
-        report = validate_report(json.loads(path.read_text()), args.root_revision, args.ay_revision)
+        report = validate_report(json.loads(path.read_text()), args.root_revision, args.ay_revision,
+                                 args.selected_ir_version)
         state = pin.current(root, pin.snapshot(root))
-        require(state.ir == args.root_revision and state.ay == args.ay_revision, "final pin state differs")
+        require(state.ir == args.root_revision and state.ay == args.ay_revision
+                and set(state.ir_packages.values()) == {args.selected_ir_version}
+                and set(state.clean_packages.values()) == {args.selected_clean_version},
+                "final pin state differs")
         passed = True
     except (Refusal, ValueError, OSError, pin.Refusal) as error:
         print(f"Qualification FAILED at {phase}: {error}", file=sys.stderr)

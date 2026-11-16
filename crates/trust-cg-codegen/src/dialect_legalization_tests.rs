@@ -1398,6 +1398,74 @@ fn nominal_types_take_their_carrier_everywhere_with_one_receipt() {
 }
 
 #[test]
+fn box_deref_legalization_preserves_fact_and_operand_and_revalidates_pointee() {
+    use trust_ir::box_validity::{
+        BoxDerefSite, BoxFactSession, BoxPointee, BoxValidityFact, PremiseRoot,
+    };
+
+    let fact = BoxValidityFact::premise(
+        BoxDerefSite {
+            item: [0x5a; 16],
+            ordinal: 3,
+        },
+        BoxFactSession::PROOF_SNAPSHOT,
+        PremiseRoot::ParamByValue,
+    );
+    let mut legalized = module_with(
+        vec![Ty::Ptr],
+        vec![Ty::Ptr],
+        vec![
+            InstrNode::new(Inst::BoxDeref {
+                ptr_ty: Ty::Ptr,
+                pointee: BoxPointee::Sized { ty: handle_ty() },
+                operand: v(0),
+                fact: Box::new(fact.clone()),
+            })
+            .with_result(v(1)),
+            ret(&[1]),
+        ],
+    );
+
+    // A nominal Box pointee is deliberately not a valid pre-legalization
+    // module: trust-ir permits nominal values only in exact-typed transport
+    // or their owning dialect operation. Exercise phase 6 directly so this
+    // test pins the Box arm of carrier substitution without weakening that
+    // source admission rule, then rerun the ordinary validator on the result.
+    let carriers = HashMap::from([(DialectTy::new(NS, "handle", 1), Ty::Ptr)]);
+    let touched = substitute_module_types(&mut legalized, &carriers);
+    assert_eq!(touched, BTreeSet::from([0]));
+    let findings = trust_ir_build::validate_module(&legalized);
+    assert!(
+        findings.is_empty(),
+        "the carrier-substituted Box must be revalidated: {findings:?}"
+    );
+
+    let node = &legalized.functions[0].blocks[0].body[0];
+    let Inst::BoxDeref {
+        ptr_ty,
+        pointee,
+        operand,
+        fact: legalized_fact,
+    } = &node.inst
+    else {
+        panic!("legalization changed the Box instruction shape")
+    };
+    assert_eq!(*ptr_ty, Ty::Ptr);
+    assert_eq!(*operand, v(0), "the Box pointer operand is not a type");
+    assert_eq!(node.results, vec![v(1)], "the result id is preserved");
+    assert_eq!(
+        legalized_fact.as_ref(),
+        &fact,
+        "the judged fact is preserved"
+    );
+    assert_eq!(
+        pointee,
+        &BoxPointee::Sized { ty: Ty::Ptr },
+        "the nominal pointee is replaced by its registered carrier"
+    );
+}
+
+#[test]
 fn payload_descriptor_bytes_are_exact() {
     let mut op = DialectInst::new("d", "o")
         .with_attr("a", AttrValue::I64(-2))
