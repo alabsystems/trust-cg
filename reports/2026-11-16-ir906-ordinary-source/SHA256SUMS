@@ -1,7 +1,9 @@
-77eacc647e43ae26c86f68773fb2a3bba1e0f82df90ab854ef86157d5c872e59  reports/2026-11-16-ir906-ordinary-source/README.md
+0ddf8fdf6cb1dcf7c8e3b148547260e0417e35abc284f560a6435cb6f33b843f  reports/2026-11-16-ir906-ordinary-source/README.md
 f12d2512a611c1fd2d54caa94690f51e915e6b6ceaabf582bf7c98c8ea764832  reports/2026-11-16-ir906-ordinary-source/controls/commands.json
 e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  reports/2026-11-16-ir906-ordinary-source/controls/documentation.stderr.txt
 367a2819b366278854f46d55efa2665fcda90bf59ecc31cdd73cba6f9438e898  reports/2026-11-16-ir906-ordinary-source/controls/documentation.stdout.txt
+e96b13e202260c82720c571cfc2a5ab64b1497e32339a097219474302a3a2365  reports/2026-11-16-ir906-ordinary-source/failures/report-push-preflight.stderr.txt
+23f55cc002600593ee24bd89aa8fac5c2ac95ba4fafac8bedc1824d4729c55bc  reports/2026-11-16-ir906-ordinary-source/failures/report-push-preflight.stdout.txt
 451ee14ac693dbfb45bdfd79ab799915d34761ffb01daa9c8afdc228eb21c7aa  reports/2026-11-16-ir906-ordinary-source/host/canonical-targo-version.stdout
 ab4081b63656675eb1a5c07d6fc6d07100ebc48974e0458e170c9287271572f5  reports/2026-11-16-ir906-ordinary-source/host/canonical-tools.json
 76dd7442f72c698b4a8ce544fc4d9056ad55b5c4d9b8b9dce0629a4f675179a6  reports/2026-11-16-ir906-ordinary-source/host/canonical-trustc-version.stdout
