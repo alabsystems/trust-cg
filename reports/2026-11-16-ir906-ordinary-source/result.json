@@ -40,5 +40,18 @@
     "No SDK/native-worker/proof/model/performance/benchmark claim",
     "The unverified owner command was not executed because the exact public source could not be authenticated",
     "Public input substitution and history rewriting were not attempted"
-  ]
+  ],
+  "unavailable_work": [
+    "Authenticate exact d22 as public source",
+    "Authenticate exact IR906 as public source",
+    "Run original same-target owner, all three locked metadata/graph checks, and all eight guards / 82 tests",
+    "Publish a passing qualification receipt for exact public d22"
+  ],
+  "decision": {
+    "disposition": "DEFERRED_UNAVAILABLE_PUBLIC_INPUTS",
+    "reason": "Authenticated public d22 lookup and immutable source intake refuse the exact commit; authenticated public IR906 lookup also refuses its exact commit. No source-equivalence substitution can establish these public identities.",
+    "scope": "Only the unavailable-source evidence can proceed; no compiler, SDK, guard, cohort or TY result is promoted.",
+    "resumption_condition": "Both exact requested commits are supplied by their original authenticated public source authorities.",
+    "cleanup": "Disposable working checkouts are removed after verified local source/evidence archival. No implementation or qualification changes remain parked."
+  }
 }
