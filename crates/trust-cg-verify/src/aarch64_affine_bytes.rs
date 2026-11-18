@@ -83,6 +83,7 @@ pub struct CheckedAarch64TrustIrAffineBytes<'a> {
     lir: &'a Function,
     code: &'a [u8],
     statistics: AffineByteStatistics,
+    normal_return_memory: super::super::NormalReturnMemoryEffect,
     // The existing independent source/LIR/word comparison's exact result.
     // Kept private; a composed callee may retain this finite normal form only
     // after separately checking captured proof/request custody.
@@ -90,6 +91,9 @@ pub struct CheckedAarch64TrustIrAffineBytes<'a> {
 }
 
 impl<'a> CheckedAarch64TrustIrAffineBytes<'a> {
+    pub(crate) fn normal_return_memory_effect(&self) -> super::super::NormalReturnMemoryEffect {
+        self.normal_return_memory
+    }
     pub(super) fn scalar_result(&self) -> Option<ScalarValue> {
         self.result
     }
@@ -577,11 +581,28 @@ pub fn check_aarch64_trust_ir_affine_bytes<'a>(
     if actual != source.result {
         return Err(AffineByteError::ReturnMismatch);
     }
+    // The complete linear/control evaluator has already checked every path,
+    // exact common restore and RET. Retain its closed effect class, including
+    // the actual canonical frame prefix, rather than making downstream users
+    // infer a memory contract from a diagnostic stack-byte count.
+    let normal_return_memory = match private_stack_bytes {
+        0 => super::super::NormalReturnMemoryEffect::Unchanged,
+        16 if word(code, 0) == 0xa9bf7bfd && word(code, 1) == 0x910003fd => {
+            super::super::NormalReturnMemoryEffect::StandardFpLrRecord
+        }
+        _ => {
+            return Err(invalid(
+                0,
+                "complete byte observer has no exact memory effect",
+            ));
+        }
+    };
     Ok(CheckedAarch64TrustIrAffineBytes {
         module,
         source: selected,
         lir,
         code,
+        normal_return_memory,
         statistics: AffineByteStatistics {
             trust_ir_instructions: source.instruction_count,
             lir_instructions: lir

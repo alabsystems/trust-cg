@@ -70,7 +70,8 @@
 //! standalone) disables the pass. Default ON at O2/O3, mirroring
 //! `TCG_NO_VECTORIZE` / `TCG_NO_X86_SROA`.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use crate::fast_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
+use std::collections::VecDeque;
 
 use trust_cg_ir::regs::VReg;
 use trust_cg_ir::x86_64_ops::{X86CondCode, X86Opcode};
@@ -268,7 +269,7 @@ impl X86MachinePass for X86BoundsCheckElimination {
         if bce_carrier_enabled() {
             let sites = find_carrier_eliminations(func);
             if !sites.is_empty() {
-                let mut by_block: HashMap<Block, Vec<usize>> = HashMap::new();
+                let mut by_block: HashMap<Block, Vec<usize>> = HashMap::default();
                 for (b, i) in &sites {
                     by_block.entry(*b).or_default().push(*i);
                 }
@@ -577,7 +578,7 @@ fn carrier_region_redefines_root(
         guard_scan_start: d_from,
     } = region;
     // Forward reachability from `t`, never entering `d`.
-    let mut fwd: HashSet<Block> = HashSet::new();
+    let mut fwd: HashSet<Block> = HashSet::default();
     let mut work: VecDeque<Block> = VecDeque::new();
     fwd.insert(t);
     work.push_back(t);
@@ -592,7 +593,7 @@ fn carrier_region_redefines_root(
         }
     }
     // Backward reachability from `c_blk`, never entering `d`.
-    let mut bwd: HashSet<Block> = HashSet::new();
+    let mut bwd: HashSet<Block> = HashSet::default();
     work.clear();
     bwd.insert(c_blk);
     work.push_back(c_blk);
@@ -1633,8 +1634,8 @@ fn same_value_operand(
 /// Build the single-def index (vregs with EXACTLY one definition in the
 /// function). A hit means "this vreg has a unique, globally-fixed value".
 fn build_single_def_index(func: &X86ISelFunction) -> HashMap<VReg, (Block, usize)> {
-    let mut counts: HashMap<VReg, u32> = HashMap::new();
-    let mut single: HashMap<VReg, (Block, usize)> = HashMap::new();
+    let mut counts: HashMap<VReg, u32> = HashMap::default();
+    let mut single: HashMap<VReg, (Block, usize)> = HashMap::default();
     for block_id in &func.block_order {
         let Some(block) = func.blocks.get(block_id) else {
             continue;
@@ -1697,7 +1698,7 @@ fn operand_redefined_between(
 /// Reads are checked before writes so a read-modify-writes flag op (ADC/SBB)
 /// counts as a reader.
 fn compare_flags_dead_after(func: &X86ISelFunction, start: Block) -> bool {
-    let mut visited: HashSet<Block> = HashSet::new();
+    let mut visited: HashSet<Block> = HashSet::default();
     let mut queue: VecDeque<Block> = VecDeque::new();
     queue.push_back(start);
     while let Some(b) = queue.pop_front() {

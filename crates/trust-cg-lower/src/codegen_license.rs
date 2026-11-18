@@ -260,13 +260,19 @@ pub struct CodegenLicensePolicy {
     authenticated_imports: Option<Arc<AuthenticatedImportSet>>,
     /// The evidence floor this consumer holds trust-ir `Inst::BoxDeref`
     /// (wire v74) to, stated as the report an opt-in owes: `None` is
-    /// [`BoxValidityFloor::Refuse`] (the default), `Some` is
+    /// [`BoxValidityFloor::Refuse`] (the default) or, with
+    /// `box_locally_rederived`, [`BoxValidityFloor::LocallyRederived`]
+    /// (which admits no assumption and so owes no report); `Some` is
     /// [`BoxValidityFloor::NamedPremise`] together with the place every
     /// admission under it is reported. Private: only
     /// [`Self::with_named_premise_box_floor`] sets it, so the named-premise
     /// floor without a report is not representable, and there is no value
     /// below trust-ir's `NamedPremise` floor.
     box_named_premise_disclosure: Option<BoxDerefDisclosure>,
+    /// Whether the policy opted into [`BoxValidityFloor::LocallyRederived`]
+    /// ([`Self::with_locally_rederived_box_floor`]). Ignored when
+    /// `box_named_premise_disclosure` is set (that floor admits a superset).
+    box_locally_rederived: bool,
 }
 
 impl Default for CodegenLicensePolicy {
@@ -280,6 +286,7 @@ impl Default for CodegenLicensePolicy {
             refuse_unbacked_claims_on_checks: false,
             authenticated_imports: None,
             box_named_premise_disclosure: None,
+            box_locally_rederived: false,
         }
     }
 }
@@ -296,6 +303,7 @@ impl CodegenLicensePolicy {
             refuse_unbacked_claims_on_checks: false,
             authenticated_imports: None,
             box_named_premise_disclosure: None,
+            box_locally_rederived: false,
         }
     }
 
@@ -368,7 +376,8 @@ impl CodegenLicensePolicy {
     /// The default is [`BoxValidityFloor::Refuse`]: every `BoxDeref` is
     /// refused ([`AdapterError::BoxDerefNotAdmitted`]), because the only
     /// evidence the pinned format admits is a named assumption and a named
-    /// assumption is not something a proof-required lane may rest on.
+    /// assumption is not something a proof-required lane may rest on; this
+    /// backend's own re-derivation is not consulted at the default.
     /// This is the diagnostic lane's opt-in and the only way to select the
     /// named-premise floor: the module is then compiled UNDER NAMED
     /// ASSUMPTIONS, and each verdict of this policy that admits a module
@@ -382,12 +391,37 @@ impl CodegenLicensePolicy {
         self
     }
 
+    /// Lower the evidence floor for trust-ir `Inst::BoxDeref` to
+    /// [`BoxValidityFloor::LocallyRederived`]: a `BoxDeref` is admitted only
+    /// when this backend re-derives every conjunct of its fact from the
+    /// deref's own function (`crate::box_deref_rederive`), so an admitted
+    /// row assumes nothing and nothing is disclosed. Opt-in by name: the
+    /// verdict is this consumer's local analysis, not trust-ir's
+    /// `ConsumerRederived` tier, and the policy's identity says so
+    /// (`;box_validity_floor=trust_cg_locally_rederived_v1`). It is never
+    /// proof evidence, licenses no transformation, and does not reach a
+    /// proof-emitting, verified-promotion or JIT-verified compile, which
+    /// refuses every `BoxDeref` at [`BoxValidityFloor::Refuse`] whatever the
+    /// policy says. One production entry selects it, by explicit opt-in: the
+    /// rustc bridge's `box-deref-locally-rederived` knob
+    /// (`TCG_BOX_DEREF_LOCALLY_REDERIVED`, default off). Nothing selects it by
+    /// default.
+    #[must_use]
+    pub fn with_locally_rederived_box_floor(mut self) -> Self {
+        self.box_locally_rederived = true;
+        self
+    }
+
     /// The evidence floor this policy holds `Inst::BoxDeref` to.
     #[must_use]
     pub fn box_validity_floor(&self) -> BoxValidityFloor {
-        match self.box_named_premise_disclosure {
-            Some(_) => BoxValidityFloor::NamedPremise,
-            None => BoxValidityFloor::Refuse,
+        match (
+            &self.box_named_premise_disclosure,
+            self.box_locally_rederived,
+        ) {
+            (Some(_), _) => BoxValidityFloor::NamedPremise,
+            (None, true) => BoxValidityFloor::LocallyRederived,
+            (None, false) => BoxValidityFloor::Refuse,
         }
     }
 
@@ -411,14 +445,20 @@ impl CodegenLicensePolicy {
         let manifest = crate::box_deref::admit_box_derefs(module, self.box_validity_floor())?;
         match &self.box_named_premise_disclosure {
             Some(disclosure) => disclosure.record(module, &manifest),
-            // Unreachable while `Refuse` admits no fact; kept as a refusal
-            // so an admission can never go unreported if that changes.
-            None if !manifest.rows.is_empty() => {
+            // `Refuse` admits no row, and `LocallyRederived` only rows this
+            // backend wholly re-derived, which assume nothing; a row resting
+            // on a premise with no report to carry it is refused, so an
+            // assumption can never go unreported.
+            None if manifest.rows.iter().any(|row| row.is_assumption()) => {
                 return Err(AdapterError::InvalidTrustIr(format!(
                     "box deref: module `{}` was admitted with no report to carry its {} \
                      assumption(s)",
                     module.name,
-                    manifest.rows.len()
+                    manifest
+                        .rows
+                        .iter()
+                        .filter(|row| row.is_assumption())
+                        .count()
                 )));
             }
             None => {}
@@ -652,10 +692,13 @@ impl CodegenLicensePolicy {
     /// authorities=<a>,<b>,...` (sorted, so equal policies print equal),
     /// followed by `;linked=<root digest>` when the policy carries an import
     /// authentication (WS7.9) and then `;unbacked_claims=refuse` only when
-    /// that knob is set, and then `;box_validity_floor=<tier>` only when the
-    /// Box validity floor is lowered from its refusing default, so every
-    /// policy without any of the three keeps its earlier identity byte for
-    /// byte.
+    /// that knob is set, and then `;box_validity_floor=<name>` only when the
+    /// Box validity floor is lowered from its refusing default (the name is
+    /// [`BoxValidityFloor::name`]: `named_premise`, or
+    /// `trust_cg_locally_rederived_v1` for this backend's own re-derived
+    /// floor), so every policy without any of the three keeps its earlier
+    /// identity byte for byte; the default floor admits exactly what it
+    /// admitted before the re-derived floor existed (nothing).
     #[must_use]
     pub fn canonical_identity(&self) -> String {
         let authorities = self

@@ -616,6 +616,11 @@ impl<'m> FsymLayout<'m> {
         let tag_align = self.align_in(&tag_ty, visiting)?;
 
         if let Some(desc) = &def.layout {
+            if matches!(desc.encoding, EnumTagEncoding::DirectWithUninhabited { .. }) {
+                return Err(format!(
+                    "enum {ty} DirectWithUninhabited storage profiles are outside bounded fsym layout support"
+                ));
+            }
             if desc.align == 0
                 || !desc.align.is_power_of_two()
                 || !desc.size.is_multiple_of(desc.align)

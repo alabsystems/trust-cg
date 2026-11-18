@@ -60,7 +60,8 @@ example : ([[], [0x48], [0x48, 0xC1], [0x48, 0xC1, 0xE8],
 
 elab "#audit_shr" : command => do
   let env ← getEnv
-  let names := [``shrCount64_lt, ``encode_shrRI_immediate, ``decode_encode_shrRI,
+  let names := [``modrmByte_bits, ``shr64Word_bytes, ``encode_shrRI_bytes, ``shrCount64_lt,
+    ``encode_shrRI_immediate, ``decode_encode_shrRI,
     ``execInstrChoice_false, ``execInstrChoice_shrRI_regs,
     ``execInstrChoice_shrRI_flags, ``execInstrChoice_shrRI_frame,
     ``x86Step_decode_choice, ``shrResident]
@@ -70,5 +71,5 @@ elab "#audit_shr" : command => do
     let axioms := (← liftCoreM (Lean.collectAxioms name)).toList
     let extra := axioms.filter fun ax => !allowed.contains ax
     unless extra.isEmpty do throwError "forbidden axioms in {name}: {extra}"
-  logInfo "SHR-CHECKS axioms=foundational-only declarations=9 prefixes=16 backend_cases=4096 resident_choices=2 decoder_refusals=9"
+  logInfo "SHR-CHECKS axioms=foundational-only declarations=12 prefixes=16 backend_cases=4096 resident_choices=2 decoder_refusals=9"
 #audit_shr

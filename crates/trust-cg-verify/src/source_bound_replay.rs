@@ -49,6 +49,10 @@ mod sealed {
     impl Sealed for crate::read_only_replay::ReadOnlyReplayPart<'_> {}
     impl Sealed for crate::read_only_replay::ScalarMemoryReplayPart<'_> {}
     impl Sealed for crate::read_only_replay::ScalarReturnReplayPart<'_> {}
+    #[cfg(feature = "source-defined-call")]
+    impl Sealed for crate::void_memory_observation::Part<'_> {}
+    #[cfg(feature = "source-defined-call")]
+    impl Sealed for crate::word_status_observation::Part<'_> {}
     impl Sealed for crate::aarch64_trap_expansion::TrapExpansionReplay {}
 }
 
@@ -207,6 +211,13 @@ impl SourceBoundReplay for crate::read_only_replay::ScalarReturnReplayPart<'_> {
     }
 }
 
+#[cfg(feature = "source-defined-call")]
+impl SourceBoundReplay for crate::void_memory_observation::Part<'_> {
+    fn replayed_obligation(&self) -> &ProofObligation {
+        self.obligation()
+    }
+}
+
 impl SourceBoundReplay for crate::aarch64_trap_expansion::TrapExpansionReplay {
     fn replayed_obligation(&self) -> &ProofObligation {
         self.obligation()
@@ -252,6 +263,13 @@ impl SourceBoundReplay for crate::source_bound_defined_call::DefinedCallTraceRep
 }
 
 impl SourceBoundReplay for crate::aarch64_affine_lowering::CheckedDefinedPeerCall<'_> {
+    fn replayed_obligation(&self) -> &ProofObligation {
+        self.obligation()
+    }
+}
+
+#[cfg(feature = "source-defined-call")]
+impl SourceBoundReplay for crate::word_status_observation::Part<'_> {
     fn replayed_obligation(&self) -> &ProofObligation {
         self.obligation()
     }

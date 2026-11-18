@@ -217,3 +217,153 @@ fn actual_original_ty_first_core_lir_return_raw_proof_is_inspected_before_cleanu
         },
     );
 }
+
+/// The mandatory compiler test reaches these parts after its Core/LIR checks.
+/// Preserve the actual rejected target problem and producer explanation; this
+/// inspection grants no acceptance and leaves the all-part gate unchanged.
+#[test]
+fn actual_original_ty_first_target_returns_are_inspected_before_cleanup() {
+    use trust_cg_codegen::pipeline::{
+        OptLevel, Pipeline, PipelineConfig, encode_function_with_fixups_for_pipeline,
+    };
+
+    crate::env_lock::with_env_overrides(
+        &[
+            ("TCG_REFINE_SOLVER", "1"),
+            ("TCG_NO_PROOF_CACHE", "1"),
+            ("TCG_BLOCKING_IDENTITY", "1"),
+        ],
+        || {
+            let capture: serde_json::Value = serde_json::from_str(include_str!(
+                "../tests/fixtures/ty_original_read_only_predicate.json"
+            ))
+            .unwrap();
+            let original: trust_ir::Module =
+                serde_json::from_value(capture["module"].clone()).unwrap();
+            assert!(original.target_info.is_none());
+            let host = CoreHostJitTarget::detect().expect("actual supported host target");
+            let mut module = original.clone();
+            module.target_info = Some(host.trust_ir_target_info().clone());
+            let mut restored = module.clone();
+            restored.target_info = None;
+            assert_eq!(
+                restored, original,
+                "only ordinary host target context changes"
+            );
+            assert_eq!(module.functions[0].id.index(), 60_004);
+            let function = &module.functions[0];
+            let (lir, proof_context) = trust_cg_lower::translate_function_with_license(
+                function,
+                &module,
+                &crate::license_test_support::permit_unlicensed(),
+            )
+            .unwrap();
+            let source = bind_read_only_source(&module, 0, &lir).unwrap();
+            let pipeline = Pipeline::new(PipelineConfig {
+                opt_level: OptLevel::O0,
+                verify: false,
+                ..PipelineConfig::for_target(host.target_spec().triple())
+            });
+            let (machine, _) = pipeline
+                .prepare_function_with_metrics_and_trust_ir_module(
+                    &lir,
+                    Some(&proof_context),
+                    &module,
+                    function,
+                )
+                .unwrap();
+            // Match the mandatory Core encoder's enforcing policy, retaining
+            // the prepared stream and leaving its private fixup-site primitive
+            // private. This profile requires no symbolic fixups at all.
+            let encoder = pipeline.with_proof_grade_aarch64_publication();
+            assert!(encoder.proof_grade_aarch64_publication());
+            let (bytes, fixups) =
+                encode_function_with_fixups_for_pipeline(&encoder, &machine).unwrap();
+            assert!(fixups.is_empty(), "actual complete post-encoding endpoint");
+            let relations = ReadOnlyCompilerRelations::bind(&source, &machine, &bytes).unwrap();
+            assert_eq!(
+                relations.len(),
+                28,
+                "same mandatory original-source inventory"
+            );
+            let verifier = FunctionVerifier::with_config(VerificationConfig::for_proof_promotion());
+            let request = verifier.capture_request_with_mode(ProvenanceXCheckMode::Enforce);
+            assert!(
+                !request.recording_active(),
+                "diagnostic cannot be a recorder"
+            );
+            assert!(request.reuse_identity().is_none());
+            let scope = FunctionDischargeContext::new(&request);
+            let mut inspections = 0;
+            for stage in [
+                ReadOnlyRelationStage::CoreToMachine,
+                ReadOnlyRelationStage::CoreToFinalBytes,
+            ] {
+                let id = ReadOnlyRelationId {
+                    stage,
+                    kind: ReadOnlyRelationKind::Return,
+                    index: 0,
+                };
+                let part = relations.parts().find(|part| part.id() == id).unwrap();
+                let expected = match stage {
+                    ReadOnlyRelationStage::CoreToMachine => {
+                        &relations.machine_queries().return_obligations()[0]
+                    }
+                    ReadOnlyRelationStage::CoreToFinalBytes => {
+                        &relations.byte_queries().return_obligations()[0]
+                    }
+                    ReadOnlyRelationStage::CoreToLir => unreachable!(),
+                };
+                assert!(std::ptr::eq(part.obligation(), expected));
+                for producer in [false, true] {
+                    let diagnostic = request.with_policy(|| {
+                        let config = crate::verdict_db::live_source_bound_config();
+                        let diagnostic = if producer {
+                            request
+                                .ay()
+                                .inspect_fresh_source_bound_producer(&part, &config)
+                        } else {
+                            request.ay().inspect_fresh_source_bound(&part, &config)
+                        }
+                        .expect("actual target proof inspection must run, not skip");
+                        assert_eq!(
+                            diagnostic.smt2,
+                            crate::ay_bridge::generate_smt2_query_raw(part.obligation(), &config)
+                        );
+                        assert_eq!(diagnostic.timeout_ms, config.timeout_ms);
+                        diagnostic
+                    });
+                    println!(
+                        "TY_READ_ONLY_TARGET_PROOF_ARTIFACT={}",
+                        serde_json::json!({
+                            "format": "ty-read-only-first-target-return-proof-v1",
+                            "scope": "O0 first target return diagnostic only; mandatory all28-part acceptance unchanged",
+                            "selection": capture["selection"],
+                            "original_function_id": function.id.index(),
+                            "targeted_original_module": &module,
+                            "actual_lir_debug": format!("{lir:#?}"),
+                            "actual_machine_debug": format!("{machine:#?}"),
+                            "final_bytes": &bytes,
+                            "part": format!("{id:?}"),
+                            "production_selected_print_view": producer,
+                            "encoder_proof_grade_integrity": encoder.proof_grade_aarch64_publication(),
+                            "query_sha256": format!("{:x}", Sha256::digest(diagnostic.smt2.as_bytes())),
+                            "diagnostic": &diagnostic,
+                            "authority_credit": false,
+                        })
+                    );
+                    assert_eq!(
+                        diagnostic.solver_sha256,
+                        request.ay_solver().unwrap().sha256()
+                    );
+                    inspections += 1;
+                }
+            }
+            assert_eq!(
+                inspections, 4,
+                "both genuine endpoints, raw and producer views"
+            );
+            assert!(scope.replays_bound(), "inspection minted no replay receipt");
+        },
+    );
+}

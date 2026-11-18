@@ -67,7 +67,7 @@
 //! than shipping a half-done multi-predecessor analysis that could be unsound
 //! at merges or loops.
 
-use std::collections::{HashMap, HashSet};
+use crate::fast_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 use trust_cg_ir::regs::{RegClass, VReg};
 use trust_cg_ir::{InstFlags, X86Opcode};
@@ -156,7 +156,7 @@ fn run_impl(func: &mut X86ISelFunction) -> bool {
     let order_index: HashMap<Block, usize> =
         order.iter().enumerate().map(|(i, b)| (*b, i)).collect();
     let predecessors = predecessor_map(func);
-    let mut block_exit: HashMap<Block, HashMap<ExprKey, AvailableExpr>> = HashMap::new();
+    let mut block_exit: HashMap<Block, HashMap<ExprKey, AvailableExpr>> = HashMap::default();
 
     for block_id in order {
         let Some(block) = func.blocks.get_mut(&block_id) else {
@@ -171,7 +171,7 @@ fn run_impl(func: &mut X86ISelFunction) -> bool {
                 .get(&pred)
                 .map(carry_across_edge)
                 .unwrap_or_default(),
-            None => HashMap::new(),
+            None => HashMap::default(),
         };
 
         // Exit available set used to seed single-predecessor successors. A
@@ -375,7 +375,7 @@ fn make_candidate(insts: &[X86ISelInst], index: usize) -> Option<Candidate> {
         return None;
     }
 
-    let mut source_vregs = HashSet::new();
+    let mut source_vregs = HashSet::default();
     let mut canon_operands = Vec::with_capacity(source_operands.len());
     for operand in source_operands {
         collect_source_vregs(operand, &mut source_vregs)?;

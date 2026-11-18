@@ -130,6 +130,7 @@ pub const RUNNER_TEST_ONLY_ENV: [&str; 2] = ["TCG_TEST_BACKEND_PATH", "TCG_TEST_
 #[allow(dead_code)]
 pub fn rustc_driver_command() -> Command {
     let mut command = Command::new(BUILD_COMPILER);
+    trust_cg_process_env::trust_child::inherit_resources(&mut command);
     for name in RUNNER_TEST_ONLY_ENV {
         command.env_remove(name);
     }

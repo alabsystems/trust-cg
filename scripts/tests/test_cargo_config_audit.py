@@ -79,6 +79,26 @@ class CargoConfigAuditTests(unittest.TestCase):
         # A relative HOME is relative to the directory Cargo starts in too.
         self.assertEqual(AUDIT.cargo_home({"HOME": "h"}, self.checkout), self.checkout / "h" / ".cargo")
 
+    def test_native_home_config_is_audited_without_changing_stock_cargo_selection(self):
+        native = self.checkout / "native-home"
+        planted = self.write(native / "config.toml", '[env]\nPROPTEST_CASES = "0"\n')
+        environment = {**self.environment, "TARGO_HOME": "native-home"}
+        record = AUDIT.audit(self.checkout, environment, tool="targo", native_targo=True)
+        self.assertEqual(record["cargo_home"], str(native))
+        self.assertTrue(record["native_targo_home"])
+        self.assertEqual(record["problems"], [f"{planted}: [env]"])
+        stock = AUDIT.audit(self.checkout, environment)
+        self.assertEqual(stock["cargo_home"], str(self.home / ".cargo"))
+        self.assertEqual(stock["problems"], [])
+        # Native semantics are explicit context, never inferred from a basename.
+        named_only = AUDIT.audit(self.checkout, environment, tool="targo")
+        self.assertEqual(named_only["cargo_home"], stock["cargo_home"])
+        self.assertEqual(named_only["problems"], [])
+        environment["CARGO_HOME"] = ""
+        selected = AUDIT.audit(self.checkout, environment, tool="targo", native_targo=True)
+        self.assertEqual(selected["cargo_home"], stock["cargo_home"])
+        self.assertEqual(selected["problems"], [])
+
     def test_keys_that_change_the_build_or_the_tests_are_problems(self):
         for text, expected in (
             ('[env]\nPROPTEST_CASES = { value = "0", force = true }\n', ["[env]"]),
@@ -295,8 +315,8 @@ class CargoConfigAuditTests(unittest.TestCase):
 @unittest.skipUnless(INSTALLED_TARGO, "no BRIDGE_PROBE_TARGO and no targo on PATH")
 class InstalledTargoTests(unittest.TestCase):
     """Pins the audit's model of the installed Targo: it maps TARGO_<KEY> and
-    CARGO_<KEY> onto config keys, and reads no `.targo/` directory and no
-    TARGO_HOME. An `[alias]` shows whether a source was read without
+    CARGO_<KEY> onto config keys, and reads no `.targo/` directory.
+    Native TARGO_HOME follows compatibility precedence. An `[alias]` shows whether a source was read without
     compiling anything."""
 
     def setUp(self):
@@ -306,7 +326,7 @@ class InstalledTargoTests(unittest.TestCase):
         self.targo = INSTALLED_TARGO
         self.environment = {
             key: value for key, value in os.environ.items()
-            if not key.startswith(("CARGO_", "TARGO_", "RUSTUP_")) or key in ("CARGO_HOME", "RUSTUP_HOME")
+            if not key.startswith(("CARGO_", "TARGO_", "RUSTUP_")) or key == "RUSTUP_HOME"
         }
 
     def alias_runs(self, cwd: Path, **extra: str) -> bool:
@@ -337,8 +357,19 @@ class InstalledTargoTests(unittest.TestCase):
         self.alias_file(targo_directory / ".targo" / "config.toml")
         self.assertFalse(self.alias_runs(targo_directory))
         home = self.alias_file(self.root / "home" / "config.toml")
-        self.assertFalse(self.alias_runs(self.root, TARGO_HOME=str(home)))
+        self.assertTrue(self.alias_runs(self.root, TARGO_HOME=str(home)))
         self.assertTrue(self.alias_runs(self.root, CARGO_HOME=str(home)))
+
+
+    def test_native_home_precedence_matches_the_installed_frontend(self):
+        native = self.alias_file(self.root / "native-home" / "config.toml")
+        compatibility = self.root / "compatibility-home"
+        compatibility.mkdir()
+        self.assertTrue(self.alias_runs(self.root, TARGO_HOME="native-home"))
+        self.assertFalse(self.alias_runs(self.root, TARGO_HOME=str(native), CARGO_HOME=str(compatibility)))
+        self.assertFalse(self.alias_runs(self.root, TARGO_HOME=str(native), CARGO_HOME=""))
+        self.assertTrue(self.alias_runs(self.root, TARGO_HOME=str(compatibility), CARGO_HOME="native-home"))
+        self.assertFalse(self.alias_runs(self.root, TARGO_HOME=""))
 
 
 if __name__ == "__main__":

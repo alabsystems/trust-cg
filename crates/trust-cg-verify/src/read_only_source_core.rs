@@ -58,6 +58,7 @@ fn binary(op: BinOp, profile: Profile) -> Result<Opcode> {
 fn stride(ty: &Ty, profile: Profile) -> Result<u64> {
     match ty {
         Ty::U8 => Ok(1),
+        Ty::I8 if profile.void_memory() => Ok(1),
         Ty::I32 | Ty::U32 if profile.writable() => Ok(4),
         Ty::I64 | Ty::U64 if profile.writable() => Ok(8),
         _ => Err(refuse("requires an admitted scalar GEP stride")),
@@ -153,7 +154,9 @@ fn result_type(inst: &Inst, profile: Profile) -> Result<Option<Ty>> {
             align,
             ..
         } if profile.writable() => {
-            numeric(ty, profile)?;
+            if !(profile.void_memory() && *ty == Ty::Ptr) {
+                numeric(ty, profile)?;
+            }
             if *volatile || align.is_some_and(|a| a == 0 || a > 8 || !a.is_power_of_two()) {
                 return Err(refuse(
                     "requires nonvolatile scalar stores with valid alignment",
@@ -182,7 +185,7 @@ fn result_type(inst: &Inst, profile: Profile) -> Result<Option<Ty>> {
         Inst::Return { values }
             if values.len() == 1
                 || profile.vector_returns() && (1..=8).contains(&values.len())
-                || profile.native_events() && values.is_empty() =>
+                || (profile.native_events() || profile.void_memory()) && values.is_empty() =>
         {
             return Ok(None);
         }
@@ -254,6 +257,55 @@ enum Metadata {
     Ordinary,
     #[cfg(feature = "source-defined-call")]
     LicensedReadonly,
+    #[cfg(feature = "source-defined-call")]
+    LicensedByteEntry,
+    #[cfg(feature = "source-defined-call")]
+    LicensedWordStatusEntry,
+}
+
+#[cfg(feature = "source-defined-call")]
+pub(super) fn graph_licensed_byte_entry(
+    family: &trust_ir_build::source_byte_entry::CheckedByteEntrySource<'_>,
+) -> Result<(usize, Graph)> {
+    let module = family.module();
+    let function = family
+        .function_in(module)
+        .map_err(|_| refuse("foreign byte-entry source"))?;
+    let ordinal = module
+        .functions
+        .iter()
+        .position(|f| f.id == function)
+        .ok_or_else(|| refuse("checked byte-entry function is absent"))?;
+    let graph = graph_impl(
+        module,
+        ordinal,
+        Profile::VoidMemory(scalar_memory::Endpoint::Core),
+        None,
+        Metadata::LicensedByteEntry,
+    )?;
+    Ok((ordinal, graph))
+}
+#[cfg(feature = "source-defined-call")]
+pub(super) fn graph_licensed_word_status_entry(
+    family: &trust_ir_build::source_word_status_entry::CheckedWordStatusEntrySource<'_>,
+) -> Result<(usize, Graph)> {
+    let module = family.module();
+    let id = family
+        .function_in(module)
+        .map_err(|_| refuse("foreign word/status source"))?;
+    let ordinal = module
+        .functions
+        .iter()
+        .position(|f| f.id == id)
+        .ok_or_else(|| refuse("checked word/status function absent"))?;
+    let graph = graph_impl(
+        module,
+        ordinal,
+        Profile::ScalarMemory(scalar_memory::Endpoint::Core),
+        None,
+        Metadata::LicensedWordStatusEntry,
+    )?;
+    Ok((ordinal, graph))
 }
 #[cfg(feature = "source-defined-call")]
 pub(super) fn graph_licensed_readonly(
@@ -299,8 +351,11 @@ fn graph_impl(
     if !(source.calling_conv == CallingConv::C
         || profile.vector_returns() && source.calling_conv == CallingConv::Fast)
         || signature.is_vararg
+        || profile.void_memory() && signature.abi.is_some()
         || !(1..=8).contains(&signature.params.len())
-        || if profile.vector_returns() {
+        || if profile.void_memory() {
+            signature.params != [Ty::Ptr, Ty::Ptr] || !signature.returns.is_empty()
+        } else if profile.vector_returns() {
             !(1..=8).contains(&signature.returns.len())
                 && !(profile.native_events() && signature.returns.is_empty())
         } else {
@@ -325,7 +380,7 @@ fn graph_impl(
         for ty in &signature.returns {
             kind(ty, profile)?;
         }
-    } else {
+    } else if !profile.void_memory() {
         word(returned_ty)?;
     }
     let mut count = 0usize;
@@ -525,7 +580,7 @@ fn graph_impl(
                     else_args: edge_args(&blocks, &values, else_target.index(), else_args)?,
                 },
                 Inst::Return { values }
-                    if profile.native_events()
+                    if (profile.native_events() || profile.void_memory())
                         && signature.returns.is_empty()
                         && values.is_empty() =>
                 {

@@ -526,6 +526,7 @@ print("REAL_PIPE_ARGV_CWD_ENV_OK")
         self.assertEqual((head_file.stat().st_ino, head_file.stat().st_mtime_ns, head_file.read_bytes()), before)
         self.assertEqual(self.log.read_text().splitlines(), [f"source-check {candidate}"])
         self.assertEqual(self.remote_records(candidate), "")
+        self.assertEqual(self.git(self.repo, "for-each-ref", "refs/agh/"), "")
         self.assertIn("no checkout or recreation", result.stdout)
         self.assertIn("NOT ATTESTED", result.stdout)
 
@@ -563,6 +564,17 @@ print("REAL_PIPE_ARGV_CWD_ENV_OK")
         self.assertEqual((worktree / "README").read_text(), "owned dirty input\n")
         self.assertEqual(self.git(worktree, "rev-parse", "HEAD"), candidate)
 
+    def test_source_resume_uses_real_candidate_ancestry_without_replacements(self):
+        worktree, candidate = self.resume_candidate()
+        lane_b = self.git(self.repo, "rev-parse", "lane-b")
+        self.git(self.repo, "replace", "--graft", candidate, lane_b)
+        self.git(worktree, "merge-base", "--is-ancestor", lane_b, candidate)
+        result = self.resume_train(worktree, candidate, "lane-b")
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("lane lane-b is not an ancestor", result.stderr)
+        self.assertEqual(self.remote_main(), self.base)
+        self.assertEqual(self.log.read_text(), "")
+
     def test_source_resume_refuses_main_outside_candidate_ancestry(self):
         worktree, candidate = self.resume_candidate()
         self.git(self.other, "push", "-q", "--no-verify", "origin", "HEAD:refs/heads/main")
@@ -571,6 +583,7 @@ print("REAL_PIPE_ARGV_CWD_ENV_OK")
         self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("main advanced beyond", result.stderr)
         self.assertEqual(self.remote_main(), advanced)
+        self.assertEqual(self.git(self.repo, "rev-parse", "refs/remotes/origin/main"), advanced)
         self.assertEqual(self.git(worktree, "rev-parse", "HEAD"), candidate)
         self.assertEqual(self.log.read_text(), "")
 

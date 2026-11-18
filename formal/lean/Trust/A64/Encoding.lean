@@ -44,6 +44,10 @@
   ─────────────────────────────────────────────────────────────────────────────────────────────
 -/
 
+import Trust.A64.AddSubImmBits
+import Trust.A64.LogicalImmBits
+import Trust.A64.MoveWideBits
+
 namespace Trust
 namespace A64
 
@@ -273,11 +277,69 @@ theorem encodeNat_lt (i : Instr) : encodeNat i < 2 ^ 32 := by
   cases i <;> simp only [encodeNat] <;> omega
 
 /-- The 32-bit instruction word (little-endian in memory). -/
-def encode (i : Instr) : UInt32 := UInt32.ofNat (encodeNat i)
+def encode : Instr → UInt32
+  | .addSubImm sf op s sh imm12 rn rd =>
+      trust_cg_a64_add_sub_imm_word (UInt32.ofNat (sf.val * 4 + op.val * 2 + s.val))
+        (UInt32.ofNat sh.val) (UInt32.ofNat imm12.val) (UInt32.ofNat rn.val) (UInt32.ofNat rd.val)
+  | .logicalImm sf opc n immr imms rn rd =>
+      trust_cg_a64_logical_imm_word (UInt32.ofNat sf.val) (UInt32.ofNat opc.val)
+        (UInt32.ofNat n.val) (UInt32.ofNat immr.val) (UInt32.ofNat imms.val)
+        (UInt32.ofNat rn.val) (UInt32.ofNat rd.val)
+  | .moveWide sf opc hw imm16 rd =>
+      trust_cg_a64_move_wide_word (UInt32.ofNat (sf.val * 4 + opc.val))
+        (UInt32.ofNat hw.val) (UInt32.ofNat imm16.val) (UInt32.ofNat rd.val)
+  | i => UInt32.ofNat (encodeNat i)
+
+/-- The Trust-compiled ADD/SUB immediate word equals the architectural field layout. -/
+theorem encode_addSubImm_toNat
+    (sf op s sh : Fin 2) (imm12 : Fin 4096) (rn rd : Reg) :
+    (encode (.addSubImm sf op s sh imm12 rn rd)).toNat =
+      encodeNat (.addSubImm sf op s sh imm12 rn rd) := by
+  have fields :
+      0x11000000 + (sf.val * 4 + op.val * 2 + s.val) * 0x20000000
+        + sh.val * 0x00400000 + imm12.val * 1024 + rn.val * 32 + rd.val =
+      encodeNat (.addSubImm sf op s sh imm12 rn rd) := by
+    simp only [encodeNat, Nat.add_mul, Nat.mul_assoc, Nat.reducePow, Nat.reduceMul]
+    ac_rfl
+  simp only [encode, trust_cg_a64_add_sub_imm_word, UInt32.toNat_add, UInt32.toNat_mul,
+    UInt32.toNat_ofNat, UInt32.toNat_ofNat', Nat.mod_add_mod, Nat.add_mod_mod,
+    Nat.mod_mul_mod, Nat.mul_mod_mod]
+  rw [fields, Nat.mod_eq_of_lt (encodeNat_lt _)]
+
+/-- The Trust-compiled logical-immediate word equals the architectural field layout. -/
+theorem encode_logicalImm_toNat
+    (sf n : Fin 2) (opc : Fin 4) (immr imms : Fin 64) (rn rd : Reg) :
+    (encode (.logicalImm sf opc n immr imms rn rd)).toNat =
+      encodeNat (.logicalImm sf opc n immr imms rn rd) := by
+  simp only [encode, trust_cg_a64_logical_imm_word, UInt32.toNat_add, UInt32.toNat_mul,
+    UInt32.toNat_ofNat, UInt32.toNat_ofNat', Nat.mod_add_mod, Nat.add_mod_mod,
+    Nat.mod_mul_mod, Nat.mul_mod_mod]
+  rw [← Nat.mod_eq_of_lt (encodeNat_lt (.logicalImm sf opc n immr imms rn rd))]
+  congr 1
+  simp only [encodeNat, Nat.reducePow, Nat.reduceMul]
+  ac_rfl
+
+/-- The Trust-compiled move-wide word equals the architectural field layout. -/
+theorem encode_moveWide_toNat (sf : Fin 2) (opc hw : Fin 4) (imm16 : Fin 65536) (rd : Reg) :
+    (encode (.moveWide sf opc hw imm16 rd)).toNat = encodeNat (.moveWide sf opc hw imm16 rd) := by
+  have fields :
+      0x12800000 + (sf.val * 4 + opc.val) * 0x20000000 + hw.val * 0x00200000
+          + imm16.val * 32 + rd.val = encodeNat (.moveWide sf opc hw imm16 rd) := by
+    simp only [encodeNat, Nat.add_mul, Nat.mul_assoc, Nat.reducePow, Nat.reduceMul]
+    ac_rfl
+  simp only [encode, trust_cg_a64_move_wide_word, UInt32.toNat_add, UInt32.toNat_mul,
+    UInt32.toNat_ofNat, UInt32.toNat_ofNat', Nat.mod_add_mod, Nat.add_mod_mod,
+    Nat.mod_mul_mod, Nat.mul_mod_mod]
+  rw [fields, Nat.mod_eq_of_lt (encodeNat_lt _)]
 
 theorem encode_toNat (i : Instr) : (encode i).toNat = encodeNat i := by
-  simp only [encode, UInt32.toNat_ofNat']
-  exact Nat.mod_eq_of_lt (encodeNat_lt i)
+  cases i
+  case addSubImm => exact encode_addSubImm_toNat _ _ _ _ _ _ _
+  case logicalImm => exact encode_logicalImm_toNat _ _ _ _ _ _ _
+  case moveWide => exact encode_moveWide_toNat _ _ _ _ _
+  all_goals
+    simp only [encode, UInt32.toNat_ofNat']
+    exact Nat.mod_eq_of_lt (encodeNat_lt _)
 
 /-! ## Decoder
 
@@ -476,8 +538,7 @@ theorem encodeNat_decodeNat (w : Nat) (hw : w < 2 ^ 32) (i : Instr) (h : decodeN
 theorem encode_decode (w : UInt32) (i : Instr) (h : decode w = some i) :
     encode i = w ∧ i.valid = true := by
   have ⟨he, hv⟩ := encodeNat_decodeNat w.toNat (UInt32.toNat_lt w) i h
-  refine ⟨?_, hv⟩
-  rw [encode, he, UInt32.ofNat_toNat]
+  exact ⟨UInt32.toNat_inj.mp (by simpa only [encode_toNat] using he), hv⟩
 
 /-- The decoder is the partial inverse of the encoder on valid instructions. -/
 theorem decode_eq_some_iff (w : UInt32) (i : Instr) :

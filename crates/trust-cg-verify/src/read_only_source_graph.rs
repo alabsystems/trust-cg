@@ -325,9 +325,9 @@ pub(super) fn observe_profile(
     }];
     let mut memory_observations = match profile {
         Profile::ReadOnly => None,
-        Profile::ScalarMemory(endpoint) | Profile::ScalarReturns(endpoint) => {
-            Some(scalar_memory::MemoryObservations::new(endpoint))
-        }
+        Profile::ScalarMemory(endpoint)
+        | Profile::ScalarReturns(endpoint)
+        | Profile::VoidMemory(endpoint) => Some(scalar_memory::MemoryObservations::new(endpoint)),
         Profile::ConditionalWrapper(endpoint) | Profile::NativeAggregates(endpoint) => {
             Some(scalar_memory::MemoryObservations::conditional(endpoint))
         }
@@ -598,7 +598,9 @@ pub(super) fn observe_profile(
                     continue;
                 }
                 Operation::VoidReturn => {
-                    if !(profile.conditional_calls() || profile.native_events())
+                    if !(profile.conditional_calls()
+                        || profile.native_events()
+                        || profile.void_memory())
                         || node.result.is_some()
                     {
                         return Err(
@@ -953,7 +955,8 @@ pub(super) fn observe_profile(
                     let value = read(&state, *value, boundary)?;
                     if !matches!(address.kind, Kind::Word | Kind::Pointer)
                         || !(matches!(value.kind, Kind::Word | Kind::Word32)
-                            || profile.conditional_calls() && value.kind == Kind::Pointer)
+                            || (profile.conditional_calls() || profile.void_memory())
+                                && value.kind == Kind::Pointer)
                         || value.kind.bits() != byte_width * 8
                     {
                         return Err(boundary.error("scalar-memory store address/value codec"));
@@ -1249,10 +1252,35 @@ pub(super) fn observe_profile(
     } else {
         None
     };
+    // The separate physical status observer needs genuine normal-return
+    // coverage as well as the full scalar value. Reuse these actual return
+    // guards; no status value can fabricate a normal return.
+    let normal_return = if profile.void_memory() || matches!(profile, Profile::ScalarMemory(_)) {
+        let observed = memory_observations
+            .as_ref()
+            .ok_or(boundary.error("missing void memory inventory"))?;
+        let mut normal = Term::leaf(E::BoolConst(false));
+        for (guard, _) in &observed.returns {
+            let nodes = normal
+                .nodes
+                .checked_add(guard.nodes)
+                .and_then(|n| n.checked_add(1))
+                .filter(|n| *n <= MAX_QUERY_NODES)
+                .ok_or(ReadOnlySourceError::Budget("void normal-return coverage"))?;
+            normal = Term {
+                expr: normal.expr.or_expr(guard.expr.clone()),
+                nodes,
+            };
+        }
+        Some(normal)
+    } else {
+        None
+    };
     Ok(Observations {
         target,
         native: native_events,
         result: has_scalar_result.then_some(result),
+        normal_return,
         vector,
         conditional,
         reads,

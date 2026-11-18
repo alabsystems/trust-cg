@@ -8,7 +8,7 @@
 //! This pass is intentionally scoped to the x86 pass-manager surface. The x86
 //! codegen pipeline runs it in its production O1 and O2/O3 pass orders.
 
-use std::collections::{HashMap, HashSet};
+use crate::fast_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 use trust_cg_ir::regs::RegClass;
 use trust_cg_ir::{VReg, X86Opcode};
@@ -54,7 +54,7 @@ fn run_impl(func: &mut X86ISelFunction, allow_alu: bool) -> bool {
             continue;
         };
 
-        let mut copies = HashMap::new();
+        let mut copies = HashMap::default();
 
         for inst in &mut block.insts {
             if is_copy_prop_barrier(inst) {
@@ -163,7 +163,7 @@ fn rewrite_operand(operand: &mut X86ISelOperand, copies: &HashMap<VReg, VReg>) -
 
 fn resolve_copy(vreg: VReg, copies: &HashMap<VReg, VReg>) -> Option<VReg> {
     let mut current = vreg;
-    let mut seen = HashSet::new();
+    let mut seen = HashSet::default();
 
     for _ in 0..MAX_COPY_CHAIN {
         if !seen.insert(current) {

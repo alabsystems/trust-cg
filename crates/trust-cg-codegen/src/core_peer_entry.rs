@@ -105,7 +105,11 @@ impl PolicyQualifiedCoreJitCompilationPlan {
                 )
                 .into());
             }
-            match compile_policy_qualified_core_machine_mode(&self, &mut rejection, Some(entry))? {
+            match compile_policy_qualified_core_machine_mode(
+                &self,
+                &mut rejection,
+                CoreMachineEntryMode::Peer(entry),
+            )? {
                 CoreMachineCompilationOutcome::Conditional(prepared) => Ok(prepared),
                 CoreMachineCompilationOutcome::Ordinary(_) => Err(
                     CompileError::CoreInstallationContract("conditional peer owner missing".into())

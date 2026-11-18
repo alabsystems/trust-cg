@@ -59,12 +59,13 @@ const TRUST_IR_VERSION_REFUSAL: &str = "failed to deserialize TRUST_IR module: u
 /// adds tensor types and contractions, v68 tensor maps, reductions and views,
 /// v69 tensor gathers and scatters, v70 content-addressed weight blobs, v71 a
 /// template-only thin-pointer contract, v72 direct uninhabited storage, v73
-/// nominal function items and v74 BoxDeref validity. V74 is the reader's
+/// nominal function items, v74 BoxDeref validity and v75 unestablished validity
+/// evidence. V75 is the reader's
 /// `wire_version`
 /// (trust-ir `binary::VERSION`). Checked against the pin by
 /// `the_newest_module_version_is_the_readers_and_above_the_template_floor`,
 /// so a pin that moves any of these numbers fails there first.
-const NEWEST_MODULE_VERSION: u32 = trust_ir::binary::BOX_DEREF_VALIDITY_FORMAT_VERSION;
+const NEWEST_MODULE_VERSION: u32 = trust_ir::binary::BOX_DEREF_UNESTABLISHED_FORMAT_VERSION;
 
 #[test]
 fn the_newest_module_version_is_the_readers_and_above_the_template_floor() {
@@ -94,6 +95,7 @@ fn the_newest_module_version_is_the_readers_and_above_the_template_floor() {
             TEMPLATE_FORMAT_VERSION + 15,
             TEMPLATE_FORMAT_VERSION + 16,
             TEMPLATE_FORMAT_VERSION + 17,
+            TEMPLATE_FORMAT_VERSION + 18,
         ],
         [
             NOMINAL_IDENTITY_FORMAT_VERSION,
@@ -111,6 +113,7 @@ fn the_newest_module_version_is_the_readers_and_above_the_template_floor() {
             trust_ir::binary::TENSOR_BLOB_FORMAT_VERSION,
             trust_ir::binary::UNINHABITED_DIRECT_STORAGE_FORMAT_VERSION,
             trust_ir::binary::FN_ITEM_IDENTITY_FORMAT_VERSION,
+            trust_ir::binary::BOX_DEREF_VALIDITY_FORMAT_VERSION,
             NEWEST_MODULE_VERSION,
         ]
     );
@@ -897,8 +900,9 @@ fn bound_synthetic_kernel_recheck_roundtrips_through_tmbc_at_v61() {
 /// own name, the first it meets.
 /// The blob keeps its own v49 header. Geometry-only `conformance/storage_only`
 /// retains v64; `conformance/single_inhabited_enums` carries v65 and
-/// `conformance/box_deref` carries the newest module version v74 (v71 is the
-/// template-only thin-pointer floor; see [`NEWEST_MODULE_VERSION`]).
+/// `conformance/box_deref` retains v74. The original
+/// `pinned_writer/box_deref_unestablished_v75` carries the newest module version
+/// v75 (v71 is the template-only thin-pointer floor; see [`NEWEST_MODULE_VERSION`]).
 /// The generated `pinned_writer/runtime_closure_v63` retains its v63 header. Previously v62 was carried by
 /// `conformance/param_pointee_place` (trust-ir 8d304e36, the
 /// `ParamPointeeEntry` clause place; v61 is `certificate_binding`'s, from the

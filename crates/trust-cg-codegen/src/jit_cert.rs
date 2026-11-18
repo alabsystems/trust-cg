@@ -173,8 +173,22 @@ pub struct JitCertificate {
 #[cfg(feature = "verify")]
 #[derive(Debug, Clone)]
 struct PeerEntryCertificateBinding {
-    owner: std::sync::Weak<crate::compiler::core_peer_entry::CoreBoundPeerProof>,
+    owner: PhysicalEntryOwner,
     digest: trust_ir::proof::ProofDigest,
+}
+
+#[cfg(feature = "verify")]
+#[derive(Debug, Clone)]
+enum PhysicalEntryOwner {
+    #[cfg(feature = "source-defined-call")]
+    FourPointerStatus(
+        std::sync::Weak<crate::compiler::core_four_pointer_status::CoreBoundFourPointerStatusProof>,
+    ),
+    Peer(std::sync::Weak<crate::compiler::core_peer_entry::CoreBoundPeerProof>),
+    #[cfg(feature = "source-defined-call")]
+    ContextOutput(
+        std::sync::Weak<crate::compiler::core_context_output::CoreBoundContextOutputProof>,
+    ),
 }
 
 /// Allocation-free canonical writer for the Core certificate semantic seal.
@@ -282,24 +296,71 @@ impl JitCertificate {
     ) -> Self {
         let mut certificate = Self::from_report_for_core_artifact(func, report, range, input, code);
         certificate.peer_entry_binding = Some(PeerEntryCertificateBinding {
-            owner: std::sync::Arc::downgrade(owner),
+            owner: PhysicalEntryOwner::Peer(std::sync::Arc::downgrade(owner)),
             digest: owner.binding_digest(),
         });
         certificate
     }
 
+    #[cfg(feature = "source-defined-call")]
+    pub(crate) fn with_physically_bound_context_output(
+        mut self,
+        owner: &std::sync::Arc<crate::compiler::core_context_output::CoreBoundContextOutputProof>,
+    ) -> Self {
+        self.peer_entry_binding = Some(PeerEntryCertificateBinding {
+            owner: PhysicalEntryOwner::ContextOutput(std::sync::Arc::downgrade(owner)),
+            digest: owner.binding_digest(),
+        });
+        self
+    }
+
+    #[cfg(feature = "source-defined-call")]
+    pub(crate) fn with_physically_bound_four_pointer_status(
+        mut self,
+        owner: &std::sync::Arc<
+            crate::compiler::core_four_pointer_status::CoreBoundFourPointerStatusProof,
+        >,
+    ) -> Self {
+        self.peer_entry_binding = Some(PeerEntryCertificateBinding {
+            owner: PhysicalEntryOwner::FourPointerStatus(std::sync::Arc::downgrade(owner)),
+            digest: owner.binding_digest(),
+        });
+        self
+    }
     #[cfg(feature = "verify")]
     fn peer_storage_is_live(&self) -> bool {
-        self.peer_entry_binding.as_ref().is_none_or(|binding| {
-            binding.owner.upgrade().is_some_and(|owner| {
-                owner.matches_certificate(
-                    &self.function,
-                    &self.verifier_input_sha256,
-                    &self.normalized_machine_code_sha256,
-                    binding.digest,
-                )
+        self.peer_entry_binding
+            .as_ref()
+            .is_none_or(|binding| match &binding.owner {
+                #[cfg(feature = "source-defined-call")]
+                PhysicalEntryOwner::FourPointerStatus(weak) => {
+                    weak.upgrade().is_some_and(|owner| {
+                        owner.matches_certificate(
+                            &self.function,
+                            &self.verifier_input_sha256,
+                            &self.normalized_machine_code_sha256,
+                            binding.digest,
+                        )
+                    })
+                }
+                PhysicalEntryOwner::Peer(weak) => weak.upgrade().is_some_and(|owner| {
+                    owner.matches_certificate(
+                        &self.function,
+                        &self.verifier_input_sha256,
+                        &self.normalized_machine_code_sha256,
+                        binding.digest,
+                    )
+                }),
+                #[cfg(feature = "source-defined-call")]
+                PhysicalEntryOwner::ContextOutput(weak) => weak.upgrade().is_some_and(|owner| {
+                    owner.matches_certificate(
+                        &self.function,
+                        &self.verifier_input_sha256,
+                        &self.normalized_machine_code_sha256,
+                        binding.digest,
+                    )
+                }),
             })
-        })
     }
 
     #[cfg(feature = "verify")]
@@ -511,7 +572,17 @@ impl JitCertificate {
             }
         }
         if let Some(binding) = peer_entry_binding {
-            seal.str("trust-cg.physically-owned-peer-entry.v1")?;
+            seal.str(match &binding.owner {
+                PhysicalEntryOwner::Peer(_) => "trust-cg.physically-owned-peer-entry.v1",
+                #[cfg(feature = "source-defined-call")]
+                PhysicalEntryOwner::FourPointerStatus(_) => {
+                    "trust-cg.physically-owned-four-pointer-status-entry.v1"
+                }
+                #[cfg(feature = "source-defined-call")]
+                PhysicalEntryOwner::ContextOutput(_) => {
+                    "trust-cg.physically-owned-context-output-entry.v1"
+                }
+            })?;
             seal.bytes(&binding.digest.bytes)?;
         }
         Some(seal.finish())

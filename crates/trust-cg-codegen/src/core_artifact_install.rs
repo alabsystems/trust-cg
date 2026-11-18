@@ -140,6 +140,38 @@ impl PolicyQualifiedCoreJitCompilationPlan {
 }
 
 impl CoreInstallationArtifact {
+    #[cfg(feature = "source-defined-call")]
+    pub(super) fn from_physically_bound_context_output(
+        artifact: CoreAddressFreeMachineArtifact,
+        source: CoreCompilationSource,
+        verified_proof_reports: usize,
+        storage: &std::sync::Arc<super::core_context_output::CoreBoundContextOutputProof>,
+    ) -> Result<Self, String> {
+        let owner = Self {
+            artifact,
+            source,
+            verified_proof_reports,
+        };
+        storage.check_artifact(&owner.artifact, &owner.source)?;
+        owner.validate()?;
+        Ok(owner)
+    }
+    #[cfg(feature = "source-defined-call")]
+    pub(super) fn from_physically_bound_four_pointer_status(
+        artifact: CoreAddressFreeMachineArtifact,
+        source: CoreCompilationSource,
+        verified_proof_reports: usize,
+        storage: &std::sync::Arc<super::core_four_pointer_status::CoreBoundFourPointerStatusProof>,
+    ) -> Result<Self, String> {
+        let owner = Self {
+            artifact,
+            source,
+            verified_proof_reports,
+        };
+        storage.check_artifact(&owner.artifact, &owner.source)?;
+        owner.validate()?;
+        Ok(owner)
+    }
     pub fn artifact(&self) -> &CoreAddressFreeMachineArtifact {
         &self.artifact
     }

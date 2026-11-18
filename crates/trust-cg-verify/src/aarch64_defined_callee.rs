@@ -236,7 +236,7 @@ fn source_definition(module: &trust_ir::Module, ordinal: usize) -> Result<&Sourc
     }
 }
 
-pub(super) fn scalar_abi(module: &trust_ir::Module, ordinal: usize, lir: &Function) -> Result<()> {
+pub(crate) fn scalar_abi(module: &trust_ir::Module, ordinal: usize, lir: &Function) -> Result<()> {
     let function = &module.functions[ordinal];
     let signature = module
         .func_types

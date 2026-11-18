@@ -15,6 +15,16 @@
 //! nothing about source results, other registers, outside memory, reachability,
 //! call return, faults, allocation validity/lifetime or private saved bytes.
 //! Geometry retains its own body-image/fixup/installed-image limitations.
+//!
+//! The separate exact-linear constructor also retains the complete normal-
+//! return memory/SP expressions and each actual BL's entry array. It consumes
+//! the existing complete leaf byte observers, never a supplied callee memory
+//! agreement. Caller and callee frame stores remain observable at every raw
+//! address. This is still a conditional Rust semantic check, not a kernel
+//! proof of the checker, source/callee-memory embedding or installation.
+//! The expressions inherit the stable untagged Normal-memory, GCS-disabled
+//! BL/RET model of the leaf observers. Neither construction nor replay
+//! establishes those machine/host conditions; enabled GCS has extra effects.
 
 use std::collections::BTreeMap;
 
@@ -30,6 +40,9 @@ use crate::smt::SmtExpr as E;
 
 #[path = "aarch64_frame_body.rs"]
 mod body;
+
+#[path = "aarch64_exact_callee_memory.rs"]
+mod exact_memory;
 pub use body::{
     CheckedFrameBody, FrameBodyCall, ReadonlyFrameBodyCall, check_frame_body,
     check_readonly_frame_body,
@@ -65,6 +78,8 @@ fn inconsistent(why: impl Into<String>) -> ConditionalFrameRefusal {
 pub struct ConditionalStaticFrameExit {
     return_instruction: InstId,
     resume_memory: E,
+    exact_post_memory: Option<E>,
+    exact_post_sp: Option<E>,
     premises: Vec<ConditionalFramePremise>,
     obligation: ProofObligation,
 }
@@ -75,6 +90,16 @@ impl ConditionalStaticFrameExit {
     }
     pub fn resume_memory(&self) -> &E {
         &self.resume_memory
+    }
+    /// Full post-return array, including caller AND callee stack stores, only
+    /// for the exact linear-body constructor. This remains a conditional
+    /// semantic expression, not a proof/permission/installed-code capability.
+    /// Its inherited Normal-memory/GCS-disabled model remains conditional.
+    pub fn exact_post_memory(&self) -> Option<&E> {
+        self.exact_post_memory.as_ref()
+    }
+    pub fn exact_post_sp(&self) -> Option<&E> {
+        self.exact_post_sp.as_ref()
     }
     pub fn premises(&self) -> &[ConditionalFramePremise] {
         &self.premises
@@ -90,6 +115,7 @@ impl ConditionalStaticFrameExit {
 pub struct ConditionalStaticFrame<'g, 'a> {
     geometry: &'g CheckedStaticFrameEnvelopes<'a>,
     post_save_memory: E,
+    exact_calls: Option<Vec<exact_memory::CallMemory>>,
     exits: Vec<ConditionalStaticFrameExit>,
 }
 
@@ -229,7 +255,7 @@ fn step(geometry: &CheckedStaticFrameEnvelopes<'_>, state: &mut State, id: InstI
 pub fn conditional_static_frame_envelopes<'g, 'a>(
     geometry: &'g CheckedStaticFrameEnvelopes<'a>,
 ) -> Result<ConditionalStaticFrame<'g, 'a>> {
-    conditional_frame(geometry, None)
+    conditional_frame(geometry, None, None)
 }
 
 /// Compose the checked body footprint into the existing frame semantics.
@@ -242,7 +268,34 @@ pub fn conditional_static_frame_with_body<'b, 'g, 'c, 'a>(
 ) -> Result<ComposedStaticFrame<'b, 'g, 'c, 'a>> {
     Ok(ComposedStaticFrame {
         body,
-        frame: conditional_frame(body.geometry, Some(body))?,
+        frame: conditional_frame(body.geometry, Some(body), None)?,
+    })
+}
+
+/// Derive exact normal-return memory/SP expressions in actual BL order for a
+/// contiguous, branch-free body. Reuses the SAME word-checked envelopes and
+/// complete byte-checked callees; it does not accept a supplied callee effect.
+/// Every frame store remains in the full array, including dead private bytes.
+/// Actual image placement, argument correspondence, access permissions,
+/// allocation/provenance, termination and proof/publication remain separate.
+/// The inherited untagged Normal-memory/GCS-disabled BL/RET model is not a
+/// checked host-mode fact; effects in other machine modes are not represented.
+pub fn conditional_static_frame_with_exact_body<'b, 'g, 'c, 'a>(
+    body: &'b CheckedFrameBody<'g, 'c, 'a>,
+) -> Result<ComposedStaticFrame<'b, 'g, 'c, 'a>> {
+    exact_body_with_image_symbol(body, "frame_image_base")
+}
+
+// The maintained source-peer owner already names its authentic image-base
+// input peer_image_base. Sharing that SAME symbolic input avoids introducing
+// an independent address variable for its actual callee LR stores.
+pub(crate) fn exact_body_with_image_symbol<'b, 'g, 'c, 'a>(
+    body: &'b CheckedFrameBody<'g, 'c, 'a>,
+    image_base: &'static str,
+) -> Result<ComposedStaticFrame<'b, 'g, 'c, 'a>> {
+    Ok(ComposedStaticFrame {
+        body,
+        frame: conditional_frame(body.geometry, Some(body), Some(image_base))?,
     })
 }
 
@@ -263,12 +316,54 @@ impl<'b, 'g, 'c, 'a> ComposedStaticFrame<'b, 'g, 'c, 'a> {
     pub fn post_save_memory(&self) -> &E {
         self.frame.post_save_memory()
     }
+    fn exact_call(&self, instruction: InstId) -> Result<&exact_memory::CallMemory> {
+        self.frame
+            .exact_calls
+            .as_ref()
+            .and_then(|calls| calls.iter().find(|call| call.instruction == instruction))
+            .ok_or_else(|| inconsistent("call lacks this exact linear memory composition"))
+    }
+    pub fn exact_call_entry_memory(&self, instruction: InstId) -> Result<&E> {
+        Ok(&self.exact_call(instruction)?.entry_memory)
+    }
+    pub fn exact_call_exit_memory(&self, instruction: InstId) -> Result<&E> {
+        Ok(&self.exact_call(instruction)?.exit_memory)
+    }
+    pub fn exact_call_sp(&self, instruction: InstId) -> Result<&E> {
+        Ok(&self.exact_call(instruction)?.entry_sp)
+    }
+    /// Actual BL's return coordinate relative to symbolic frame_image_base.
+    /// A later installed-image owner must supply its authentic absolute base.
+    pub fn exact_call_return_target(&self, instruction: InstId) -> Result<&E> {
+        Ok(&self.exact_call(instruction)?.return_target)
+    }
+    /// Consume the computed SAME callee-entry array, including all earlier
+    /// caller/callee stores. No alias query is excluded. Arguments remain
+    /// candidate expressions; this creates no pointer/provenance/ABI authority.
+    pub fn instantiate_readonly_call_result_in_frame(
+        &self,
+        instruction: InstId,
+        certificate: &crate::read_only_replay::ReadOnlyReplayCertificate<'_, '_>,
+        request: &crate::function_request::FunctionVerificationRequest,
+        arguments: &[std::sync::Arc<E>],
+    ) -> Result<std::sync::Arc<E>> {
+        let memory = std::sync::Arc::new(self.exact_call_entry_memory(instruction)?.clone());
+        self.body.instantiate_readonly_call_result(
+            instruction,
+            certificate,
+            request,
+            arguments,
+            &memory,
+        )
+    }
 }
 
 fn conditional_frame<'g, 'a>(
     geometry: &'g CheckedStaticFrameEnvelopes<'a>,
     body: Option<&CheckedFrameBody<'g, '_, 'a>>,
+    image_base: Option<&'static str>,
 ) -> Result<ConditionalStaticFrame<'g, 'a>> {
+    let exact = image_base.is_some();
     if geometry.saved_slots().is_empty()
         || geometry
             .saved_slots()
@@ -289,6 +384,13 @@ fn conditional_frame<'g, 'a>(
         inputs.push((name.clone(), 64));
         entry_registers.insert(field, E::var(name, 64));
     }
+    let preserved_registers = entry_registers.clone();
+    // A framed leaf stores the actual incoming X29 even when the caller has
+    // no frame-pointer save of its own. Retain that unknown value explicitly.
+    if exact && !entry_registers.contains_key(&29) {
+        inputs.push(("frame_entry_x29".into(), 64));
+        entry_registers.insert(29, E::var("frame_entry_x29", 64));
+    }
     let mut saved = State {
         sp: entry_sp.clone(),
         registers: entry_registers.clone(),
@@ -297,21 +399,28 @@ fn conditional_frame<'g, 'a>(
     for &id in &geometry.candidates().prologue {
         step(geometry, &mut saved, id)?;
     }
-    // Overapproximate each actual, checked leaf's private writes below the
-    // unchanged call SP. Each byte is fresh; no original byte is guessed. The
-    // callee checker establishes that there are no other memory effects.
-    let body_memory = body.map(|body| {
-        let mut memory = saved.memory.clone();
-        for (call_index, call) in body.calls.iter().enumerate() {
-            for byte in 0..call.callee.private_stack_bytes() {
-                let name = format!("frame_body_call_{call_index}_private_{byte}");
-                inputs.push((name.clone(), 8));
-                let address = relative(&saved.sp, -(byte as i64) - 1);
-                memory = encode_store_le(&memory, &address, &E::var(name, 8), 1);
+    let mut exact_calls = None;
+    let body_memory = if let Some(image_base) = image_base {
+        let body = body.ok_or_else(|| inconsistent("exact memory needs its checked body"))?;
+        let (memory, calls) = exact_memory::observe(body, &saved, image_base, &mut inputs)?;
+        exact_calls = Some(calls);
+        Some(memory)
+    } else {
+        // The original generic route retains its conservative private-write
+        // overapproximation. It makes no straight-line execution-order claim.
+        body.map(|body| {
+            let mut memory = saved.memory.clone();
+            for (call_index, call) in body.calls.iter().enumerate() {
+                for byte in 0..call.callee.private_stack_bytes() {
+                    let name = format!("frame_body_call_{call_index}_private_{byte}");
+                    inputs.push((name.clone(), 8));
+                    let address = relative(&saved.sp, -(byte as i64) - 1);
+                    memory = encode_store_le(&memory, &address, &E::var(name, 8), 1);
+                }
             }
-        }
-        memory
-    });
+            memory
+        })
+    };
     let mut exits = Vec::new();
     for (index, (exit, epilogue)) in geometry
         .conditional_exits()
@@ -397,12 +506,14 @@ fn conditional_frame<'g, 'a>(
             step(geometry, &mut state, id)?;
         }
         let mut complete = state.sp.clone().eq_expr(entry_sp.clone());
-        for (&field, entry) in &entry_registers {
+        for (&field, entry) in &preserved_registers {
             complete = complete.and_expr(state.register(field)?.eq_expr(entry.clone()));
         }
         exits.push(ConditionalStaticFrameExit {
             return_instruction: exit.return_instruction,
             resume_memory,
+            exact_post_memory: exact.then(|| state.memory.clone()),
+            exact_post_sp: exact.then(|| state.sp.clone()),
             premises,
             obligation: ProofObligation {
                 name: format!(
@@ -427,6 +538,7 @@ fn conditional_frame<'g, 'a>(
     Ok(ConditionalStaticFrame {
         geometry,
         post_save_memory: saved.memory,
+        exact_calls,
         exits,
     })
 }

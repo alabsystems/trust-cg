@@ -72,6 +72,7 @@ pub mod post_ra_opt;
 pub mod regalloc_validator;
 pub mod remat;
 mod scan_work;
+mod sorted_map;
 pub mod spill;
 pub mod spill_slot_reuse;
 pub mod split;

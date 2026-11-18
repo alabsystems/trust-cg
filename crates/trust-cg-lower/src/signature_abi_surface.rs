@@ -2,7 +2,7 @@
 
 //! Wire-v60 records source placement separately from the IR carrier census.
 //! Contextless and WASM entries cannot consume these claims. The explicit
-//! compiler-selected native scalar C entry validates its finite profile before
+//! compiler-selected native entry validates its finite source/foreign profile before
 //! projection; every entry using this floor still refuses all recorded rows.
 //! Structural IR validation and exact record custody do not establish that
 //! emitted calls implement hidden results, source modes, or extensions.

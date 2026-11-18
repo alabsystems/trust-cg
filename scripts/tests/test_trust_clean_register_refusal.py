@@ -22,7 +22,7 @@ class RegisterRefusalTests(unittest.TestCase):
     def accepted(self, text, code=101, artifact=False, theorem=THEOREM):
         return GATE.register_body_refused(text, code, artifact, theorem)
 
-    def test_exact_named_semantic_failures_for_all_three_original_theorems(self):
+    def test_exact_named_semantic_failures_for_all_body_theorems(self):
         for name in sorted(n for n in GATE.REGISTER_DECLARATIONS if n.endswith('_body')):
             for prefix in [
                 'error: `' + name + '` did not elaborate: ',
@@ -71,14 +71,14 @@ class RegisterRefusalTests(unittest.TestCase):
 
     def test_exact_complete_positive_census_and_artifact_are_required(self):
         names = sorted(GATE.REGISTER_DECLARATIONS)
-        def census(items, count=6):
+        def census(items, count=len(GATE.REGISTER_DECLARATIONS)):
             return ('Clean island kernel-checked: ' + str(count)
                     + ' declaration(s) registered (' + ', '.join(items) + ')\n')
         good = census(names)
         self.assertTrue(GATE.register_source_accepted(good, 0, True))
         for text, code, artifact in [
             (good, 1, True), (good, 0, False), (good + good, 0, True),
-            (census(names[:-1], 5), 0, True),
+            (census(names[:-1], len(names) - 1), 0, True),
             (census(names[:-1] + [names[0]]), 0, True),
             (census(names[:-1] + ['unrelated']), 0, True),
             (census(names, 2), 0, True),

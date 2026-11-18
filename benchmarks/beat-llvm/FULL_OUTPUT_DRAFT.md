@@ -99,9 +99,23 @@ Run the pure control suite with `python3 -B -m unittest -v test_full_output.py`
 from this directory; it mocks subprocess operations and launches no compiler or benchmark. Before
 the first build in the selected project, run `aterm help rust` as required by
 the user's AGENTS instructions. Then invoke the diagnostic runner with explicit
-Trust and Clang identities and a new capture directory. That execution will
-create three compilation lanes for each supported kernel. Refusal is a retained
-outcome. Success means finite agreement for those exact generated artifacts;
+Trust and Clang identities and a new capture directory. When the installed Trust
+compiler requires inherited GNU scheduling, launch the runner through GNU Make
+inside the admitted build slot. The recipe's `+` keeps the jobserver available
+to Python, which forwards the admitted descriptors to Trust compiler launches.
+Export `BRIDGE` as the fresh absolute backend path and `OUTPUT` as a new
+absolute capture directory. On Darwin, also export `SDKROOT` from
+`xcrun --sdk macosx --show-sdk-path`.
+
+```sh
+build-slot --cpus 4 --mem-gb 12 -- make -j4 -f - check <<'MAKE'
+check:
+	+python3 benchmarks/beat-llvm/run_full_output.py --clang /usr/bin/clang --dylib "$$BRIDGE" --output-dir "$$OUTPUT"
+MAKE
+```
+
+That execution creates three compilation lanes for each supported kernel.
+Refusal is a retained outcome. Success means finite agreement for those exact generated artifacts;
 it does not prove all inputs, all 18 programs, or a compiler theorem.
 
 ## Exact binary boundary for future timing

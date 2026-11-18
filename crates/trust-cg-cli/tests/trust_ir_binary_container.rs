@@ -323,6 +323,11 @@ const NAMED_REFUSALS: &[(&str, &str)] = &[
     // `composition` cites a proof-bearing import this lone module cannot
     // authenticate (the authority tier's import rule).
     ("conformance/composition", "UnauthenticatedImport"),
+    (
+        "pinned_writer/box_deref_unestablished_v75",
+        "licensed by gate authority \"trust-direct-lane-structural\" (trust-ir v41), \
+         which this backend does not recognize",
+    ),
     // A cross-convention indirect edge is an FFI boundary; no target is pinned.
     ("conformance/inst_control", "TargetInfoRequired"),
     // A proof-annotation round-trip corpus: conflicting memory roles first.

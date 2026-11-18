@@ -499,6 +499,19 @@ struct Cli {
     #[arg(long = "emit-proofs", value_name = "DIR")]
     emit_proofs: Option<PathBuf>,
 
+    /// Keep the historical x86-64 code generation in a compile without
+    /// `--emit-proofs`.
+    ///
+    /// By default an x86-64 object compile that emits no proof certificates
+    /// requests the certificate-free code-quality policy
+    /// (`CompilerConfig::x86_certificate_free_allocation`: the register
+    /// allocation changes, frameless leaves, the O2 fixpoint and the
+    /// certificate-free IMUL reductions), what the rustc bridge uses with
+    /// `no-proof-certs`. This flag withdraws that request. A compile with
+    /// `--emit-proofs` never gets it.
+    #[arg(long = "no-x86-certificate-free-allocation")]
+    no_x86_certificate_free_allocation: bool,
+
     /// Enable compilation trace output (per-phase timing).
     #[arg(long = "trace")]
     trace: bool,
@@ -1607,7 +1620,15 @@ fn run_profile_generate_jit(
         .map_err(|error| format!("--profile-generate: {error}"))?;
 
     let extern_symbols = std::collections::HashMap::new();
-    let jit = Compiler::new(config.clone())
+    // The capture is an in-process JIT compile, not an object compile: the
+    // certificate-free allocation request is an object-compile control and is
+    // refused at the closed-JIT proof-grade boundary, so it is never carried
+    // into the JIT.
+    let jit_config = CompilerConfig {
+        x86_certificate_free_allocation: false,
+        ..config.clone()
+    };
+    let jit = Compiler::new(jit_config)
         .with_codegen_license(codegen_license.clone())
         .compile_module_to_jit_with_profile_hooks(
             module,
@@ -1710,8 +1731,34 @@ fn build_config(cli: &Cli, target_spec: TargetSpec) -> CompilerConfig {
         eh_frames_cannot_unwind: false,
         eh_nounwind_callees: Default::default(),
         link_unit_definitions: Default::default(),
-        x86_certificate_free_allocation: false,
+        x86_certificate_free_allocation: cli_requests_x86_certificate_free_allocation(
+            cli,
+            target_spec,
+        ),
     }
+}
+
+/// Whether an object compile through the CLI requests the certificate-free
+/// x86-64 allocation (`CompilerConfig::x86_certificate_free_allocation`).
+///
+/// The CLI is trust-cg's production ahead-of-time front door (a TrustIR
+/// module to an object), and it installs no process policy. TY at
+/// `f76a29357f` does not invoke it: TY compiles in process through
+/// `CompilerConfig::for_host_jit()`, which installs nothing and so keeps
+/// every certificate-free change off (`X86AllocationQuality::Installed`).
+/// A compile without
+/// `--emit-proofs` keeps no proof certificates, so it requests the
+/// allocation the rustc bridge installs for `no-proof-certs`; a compile with
+/// `--emit-proofs` does not request it (and `Compiler::compile` would
+/// withhold it anyway, `X86AllocationQuality::Withheld`). Only x86-64 targets
+/// request it, so no other target's compile-policy digest changes.
+/// `--no-x86-certificate-free-allocation` opts out (the historical
+/// allocation). The in-process JIT capture of `--profile-generate` never
+/// carries the request ([`run_profile_generate_jit`]).
+fn cli_requests_x86_certificate_free_allocation(cli: &Cli, target_spec: TargetSpec) -> bool {
+    target_spec.architecture == Target::X86_64
+        && cli.emit_proofs.is_none()
+        && !cli.no_x86_certificate_free_allocation
 }
 
 /// The relocation model a native compile uses: the explicit
@@ -4137,6 +4184,39 @@ mod tests {
             assert!(
                 error.contains("x86_64") && error.contains("x86_64 triple"),
                 "{target} error should point to x86_64-only support: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_x86_64_compile_without_certificates_requests_the_certificate_free_allocation() {
+        let x86 = parse_target("x86_64-unknown-linux-gnu").unwrap();
+        let plain = Cli::parse_from(["trust-cg", "-c", "a.tmbc"]);
+        assert!(build_config(&plain, x86).x86_certificate_free_allocation);
+        assert!(!build_config(&plain, x86).emit_proofs);
+
+        // Certificates kept: no request (Compiler::compile would withhold it).
+        let proofs = Cli::parse_from(["trust-cg", "-c", "--emit-proofs=proofs", "a.tmbc"]);
+        let config = build_config(&proofs, x86);
+        assert!(config.emit_proofs);
+        assert!(!config.x86_certificate_free_allocation);
+
+        // The explicit opt-out keeps the historical allocation.
+        let opted_out = Cli::parse_from([
+            "trust-cg",
+            "-c",
+            "--no-x86-certificate-free-allocation",
+            "a.tmbc",
+        ]);
+        assert!(!build_config(&opted_out, x86).x86_certificate_free_allocation);
+
+        // Other targets never carry the request, so their policy digests
+        // are unchanged.
+        for target in ["aarch64", "aarch64-unknown-linux-gnu", "riscv64"] {
+            let spec = parse_target(target).unwrap();
+            assert!(
+                !build_config(&plain, spec).x86_certificate_free_allocation,
+                "{target}"
             );
         }
     }

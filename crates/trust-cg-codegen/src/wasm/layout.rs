@@ -749,6 +749,12 @@ fn descriptor_image(
     discriminants: Vec<i128>,
     visiting: &mut Vec<Visit>,
 ) -> Result<EnumImage, WasmLowerError> {
+    if matches!(desc.encoding, EnumTagEncoding::DirectWithUninhabited { .. }) {
+        return Err(unsupported(
+            ty,
+            "DirectWithUninhabited storage profiles are outside the wasm value-image model",
+        ));
+    }
     if desc.variant_field_offsets.len() != def.variants.len()
         || desc.align == 0
         || !desc.align.is_power_of_two()
@@ -1327,6 +1333,55 @@ fn write_tag(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn direct_storage_profiles_have_a_named_refusal_before_inactive_field_layout() {
+        use trust_ir::{EnumDef, EnumVariant, FieldStorageLayout, UninhabitedVariantLayout};
+        let mut m = module("");
+        let mut def = EnumDef::new(
+            EnumId::new(0),
+            "Profiled",
+            vec![
+                EnumVariant {
+                    name: "Dead".into(),
+                    fields: vec![Ty::Never],
+                    field_names: vec![],
+                },
+                EnumVariant {
+                    name: "Live".into(),
+                    fields: vec![Ty::U32],
+                    field_names: vec![],
+                },
+            ],
+        )
+        .with_repr(EnumTagRepr::U8);
+        def.layout = Some(EnumLayoutDescriptor {
+            encoding: EnumTagEncoding::DirectWithUninhabited {
+                tag_offset: 0,
+                variants: vec![UninhabitedVariantLayout {
+                    variant: 0,
+                    size: 1,
+                    align: 1,
+                    fields: vec![FieldStorageLayout { size: 0, align: 1 }],
+                }],
+            },
+            size: 8,
+            align: 4,
+            variant_field_offsets: vec![vec![1], vec![4]],
+        });
+        m.enums.push(def);
+        assert!(m.enum_layout_shape(EnumId::new(0)).is_ok());
+        let before = m.clone();
+        let error = enum_image(&m, &Ty::Enum(EnumId::new(0))).unwrap_err();
+        assert!(matches!(error, WasmLowerError::UnsupportedType(detail)
+            if detail.contains("DirectWithUninhabited")));
+        assert_eq!(m, before);
+        m.enums[0].variants[0].fields = vec![Ty::U32];
+        let desc = m.enums[0].layout.as_mut().unwrap();
+        desc.encoding = EnumTagEncoding::Direct { tag_offset: 0 };
+        desc.variant_field_offsets[0] = vec![4];
+        assert!(enum_image(&m, &Ty::Enum(EnumId::new(0))).is_ok());
+    }
 
     #[test]
     fn single_inhabited_enum_images_preserve_payload_and_reject_inactive_values() {

@@ -24,6 +24,10 @@ mod ty_tests;
 #[path = "scalar_memory_source_tests.rs"]
 pub(super) mod tests;
 
+#[cfg(test)]
+#[path = "void_memory_source_tests.rs"]
+mod void_tests;
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum Endpoint {
     Core,
@@ -178,6 +182,9 @@ impl MemoryObservations {
 /// Source and retained LIR share one privately assembled pending inventory.
 /// There is no completion certificate or Checked/native/publication capability.
 pub struct ScalarMemorySourceQueries<'a> {
+    // Private common storage. Public scalar binders always set false; the
+    // distinct void wrapper never exports this scalar query owner.
+    void: bool,
     module: &'a Module,
     ordinal: usize,
     lir: &'a Function,
@@ -186,6 +193,7 @@ pub struct ScalarMemorySourceQueries<'a> {
     lowering_reads: Vec<ScalarMemoryAccess>,
     lowering_writes: Vec<ScalarMemoryAccess>,
     status: ProofObligation,
+    normal: E,
     memory: ProofObligation,
     read_demands: Vec<ProofObligation>,
     write_demands: Vec<ProofObligation>,
@@ -195,6 +203,9 @@ pub struct ScalarMemorySourceQueries<'a> {
 }
 
 impl<'a> ScalarMemorySourceQueries<'a> {
+    pub(crate) fn is_void(&self) -> bool {
+        self.void
+    }
     pub fn module(&self) -> &'a Module {
         self.module
     }
@@ -215,6 +226,10 @@ impl<'a> ScalarMemorySourceQueries<'a> {
     }
     pub fn lowering_writes(&self) -> &[ScalarMemoryAccess] {
         &self.lowering_writes
+    }
+    /// Conditional original normal-return expression; it supplies no physical call fact.
+    pub fn original_normal_return(&self) -> &E {
+        &self.normal
     }
     pub fn status_obligation(&self) -> &ProofObligation {
         &self.status
@@ -338,6 +353,110 @@ pub fn bind_scalar_memory_source<'a>(
     ordinal: usize,
     lowering: &'a Function,
 ) -> Result<ScalarMemorySourceQueries<'a>, ReadOnlySourceError> {
+    bind_memory_source(module, ordinal, lowering, false)
+}
+
+/// Pending void normal-continuation/final-memory relations, with no scalar
+/// result interpretation. No source license, caller permission or native
+/// capability follows from constructing these queries.
+pub struct VoidMemorySourceQueries<'a> {
+    pub(crate) inner: ScalarMemorySourceQueries<'a>,
+}
+impl<'a> VoidMemorySourceQueries<'a> {
+    pub fn module(&self) -> &'a Module {
+        self.inner.module()
+    }
+    pub fn source(&self) -> &'a trust_ir::Function {
+        self.inner.source()
+    }
+    pub fn lir(&self) -> &'a Function {
+        self.inner.lir()
+    }
+    pub fn normal_return_obligation(&self) -> &ProofObligation {
+        &self.inner.status
+    }
+    pub fn memory_obligation(&self) -> &ProofObligation {
+        &self.inner.memory
+    }
+    pub fn source_reads(&self) -> &[ScalarMemoryAccess] {
+        &self.inner.source_reads
+    }
+    pub fn source_writes(&self) -> &[ScalarMemoryAccess] {
+        &self.inner.source_writes
+    }
+    pub fn read_obligations(&self) -> &[ProofObligation] {
+        &self.inner.read_demands
+    }
+    pub fn write_obligations(&self) -> &[ProofObligation] {
+        &self.inner.write_demands
+    }
+}
+
+pub fn bind_void_memory_source<'a>(
+    module: &'a Module,
+    ordinal: usize,
+    lowering: &'a Function,
+) -> Result<VoidMemorySourceQueries<'a>, ReadOnlySourceError> {
+    Ok(VoidMemorySourceQueries {
+        inner: bind_memory_source(module, ordinal, lowering, true)?,
+    })
+}
+
+fn bind_memory_source<'a>(
+    module: &'a Module,
+    ordinal: usize,
+    lowering: &'a Function,
+    void: bool,
+) -> Result<ScalarMemorySourceQueries<'a>, ReadOnlySourceError> {
+    let profile = if void {
+        Profile::VoidMemory(Endpoint::Core)
+    } else {
+        Profile::ScalarMemory(Endpoint::Core)
+    };
+    let source_graph = core::graph_profile(module, ordinal, profile)?;
+    bind_memory_source_graph(module, ordinal, lowering, void, source_graph)
+}
+
+/// The ordinary diagnostic binder above keeps refusing source-gate metadata.
+/// Only the genuine current source-family owner opens this distinct route.
+#[cfg(feature = "source-defined-call")]
+pub fn bind_licensed_void_memory_source<'a>(
+    family: &'a trust_ir_build::source_byte_entry::CheckedByteEntrySource<'_>,
+    lowering: &'a Function,
+) -> Result<VoidMemorySourceQueries<'a>, String> {
+    trust_cg_lower::CodegenLicensePolicy::default()
+        .enforce_module(family.module())
+        .map_err(|e| format!("byte entry default source license: {e}"))?;
+    let (ordinal, graph) = core::graph_licensed_byte_entry(family).map_err(|e| e.to_string())?;
+    Ok(VoidMemorySourceQueries {
+        inner: bind_memory_source_graph(family.module(), ordinal, lowering, true, graph)
+            .map_err(|e| e.to_string())?,
+    })
+}
+
+/// The new checked family supplies the exact original source licence. This
+/// adds no metadata acceptance to any diagnostic scalar-memory constructor.
+#[cfg(feature = "source-defined-call")]
+pub fn bind_licensed_word_status_source<'a>(
+    family: &'a trust_ir_build::source_word_status_entry::CheckedWordStatusEntrySource<'a>,
+    lowering: &'a Function,
+) -> Result<ScalarMemorySourceQueries<'a>, String> {
+    trust_cg_lower::CodegenLicensePolicy::default()
+        .enforce_module(family.module())
+        .map_err(|e| e.to_string())?;
+    let (ordinal, graph) =
+        core::graph_licensed_word_status_entry(family).map_err(|e| e.to_string())?;
+    bind_memory_source_graph(family.module(), ordinal, lowering, false, graph)
+        .map_err(|e| e.to_string())
+}
+
+fn bind_memory_source_graph<'a>(
+    module: &'a Module,
+    ordinal: usize,
+    lowering: &'a Function,
+    void: bool,
+    source_graph: Graph,
+) -> Result<ScalarMemorySourceQueries<'a>, ReadOnlySourceError> {
     let target = module
         .target_info
         .as_ref()
@@ -347,13 +466,14 @@ pub fn bind_scalar_memory_source<'a>(
             "requires 64-bit little-endian pointers",
         ));
     }
-    let source_graph = core::graph_profile(module, ordinal, Profile::ScalarMemory(Endpoint::Core))?;
-    let lower_graph = lir::graph_bound(
-        module,
-        ordinal,
-        lowering,
-        Profile::ScalarMemory(Endpoint::Lir),
-    )?;
+    let profile = |endpoint| {
+        if void {
+            Profile::VoidMemory(endpoint)
+        } else {
+            Profile::ScalarMemory(endpoint)
+        }
+    };
+    let lower_graph = lir::graph_bound(module, ordinal, lowering, profile(Endpoint::Lir))?;
     if source_graph.parameters.len() != lower_graph.parameters.len()
         || module.functions[ordinal].name != lowering.name
     {
@@ -371,14 +491,14 @@ pub fn bind_scalar_memory_source<'a>(
         &inputs,
         &entry,
         Boundary::Source,
-        Profile::ScalarMemory(Endpoint::Core),
+        profile(Endpoint::Core),
     )?;
     let mut lower = graph::observe_profile(
         &lower_graph,
         &inputs,
         &entry,
         Boundary::Lowering,
-        Profile::ScalarMemory(Endpoint::Lir),
+        profile(Endpoint::Lir),
     )?;
     let source_memory = source.memory.take().ok_or(ReadOnlySourceError::Source(
         "missing original memory observation",
@@ -398,21 +518,48 @@ pub fn bind_scalar_memory_source<'a>(
         + source.geometry.len()
         + definitions.len()
         + 1;
-    let source_result = source
-        .result
-        .take()
-        .ok_or(ReadOnlySourceError::Source("missing scalar status"))?;
-    let lower_result = lower
-        .result
-        .take()
-        .ok_or(ReadOnlySourceError::Lowering("missing scalar status"))?;
+    let normal = source
+        .normal_return
+        .as_ref()
+        .ok_or(ReadOnlySourceError::Source(
+            "missing original normal-return observation",
+        ))?
+        .expr
+        .clone();
+    let source_result = if void {
+        &mut source.normal_return
+    } else {
+        &mut source.result
+    }
+    .take()
+    .ok_or(ReadOnlySourceError::Source(
+        "missing exact terminal observation",
+    ))?;
+    let lower_result = if void {
+        &mut lower.normal_return
+    } else {
+        &mut lower.result
+    }
+    .take()
+    .ok_or(ReadOnlySourceError::Lowering(
+        "missing exact terminal observation",
+    ))?;
     let mut total = 0usize;
     let mut relations = Vec::new();
     reserve_query(
         &mut total,
         source_result.nodes + lower_result.nodes + premise_nodes + 1,
     )?;
-    relations.push(("full status".to_owned(), source_result, lower_result));
+    relations.push((
+        if void {
+            "normal void return"
+        } else {
+            "full status"
+        }
+        .to_owned(),
+        source_result,
+        lower_result,
+    ));
     reserve_query(
         &mut total,
         source_byte.nodes + lower_byte.nodes + premise_nodes + 1,
@@ -468,7 +615,10 @@ pub fn bind_scalar_memory_source<'a>(
     premises.extend(definitions.iter().cloned());
     let mut obligations = relations.into_iter().map(|(name, source, lower)| {
         pending(
-            format!("Original scalar-memory Core -> LIR {name}"),
+            format!(
+                "Original {} Core -> LIR {name}",
+                if void { "void-memory" } else { "scalar-memory" }
+            ),
             source.expr,
             lower.expr,
             &inputs,
@@ -480,6 +630,8 @@ pub fn bind_scalar_memory_source<'a>(
     let read_demands = obligations.by_ref().take(lower.reads.len()).collect();
     let write_demands = obligations.collect();
     Ok(ScalarMemorySourceQueries {
+        normal,
+        void,
         module,
         ordinal,
         lir: lowering,

@@ -1487,6 +1487,31 @@ pub fn is_module_local_data_definition(global: &trust_ir::Global) -> bool {
     global.linkage.is_module_local()
 }
 
+/// Recover only the target of the real stored/borrowed/loaded nominal value.
+/// The canonical IR query retains the actual source operations; it creates no
+/// physical memory, source-definedness or capture-value equality permission.
+/// Both bodies must be non-preemptible module definitions: a foreign runtime
+/// replacement cannot inherit a target from the body that happened to be here.
+/// Captures continue to come from the actual returned environment.
+pub(crate) fn borrowed_closure_code_identity(
+    module: &Module,
+    function: &Function,
+    value: ValueId,
+) -> Option<(FuncId, trust_ir::ClosureTyId)> {
+    if !std::ptr::eq(module.function_by_id(function.id)?, function) {
+        return None;
+    }
+    let path = module.borrowed_closure_readback(function.id, value).ok()?;
+    let borrower = module.function_by_id(path.load().function())?;
+    let target = module.function_by_id(path.binding().target)?;
+    if !is_module_local_function_definition(borrower)
+        || !is_module_local_function_definition(target)
+    {
+        return None;
+    }
+    Some((path.binding().target, path.nominal()))
+}
+
 /// Why a closure value's code identity is not statically visible at a use.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ClosureIdentityBlock {
@@ -1639,16 +1664,19 @@ fn resolve_closure_literal<'a>(
     incoming: impl Fn(ValueId) -> Option<(&'a Ty, &'a [ValueId])>,
     value: ValueId,
 ) -> Result<(FuncId, Ty), ClosureIdentityBlock> {
-    resolve_closure_identity(producer, incoming, |_| None, value)
+    resolve_closure_identity(producer, incoming, |_| None, |_| None, value)
 }
 
 /// The same bounded walk, with an optional checked target for a loaded
 /// capture-only frame. The caller must obtain that target from the exact
 /// immutable module's shared closure storage binding, never from its bytes.
+/// Call-result recovery additionally requires the canonical original stored-cell
+/// readback path and non-preemptible bodies; no declared result shape suffices.
 pub(crate) fn resolve_closure_identity<'a>(
     producer: impl Fn(ValueId) -> Option<&'a trust_ir::InstrNode>,
     incoming: impl Fn(ValueId) -> Option<(&'a Ty, &'a [ValueId])>,
     storage: impl Fn(trust_ir::ClosureTyId) -> Option<FuncId>,
+    borrowed: impl Fn(ValueId) -> Option<(FuncId, trust_ir::ClosureTyId)>,
     value: ValueId,
 ) -> Result<(FuncId, Ty), ClosureIdentityBlock> {
     enum Frame {
@@ -1705,6 +1733,14 @@ pub(crate) fn resolve_closure_identity<'a>(
                             inst: "Load",
                         })?;
                         identities.insert(current, Some((target, ty.clone())));
+                    }
+                    trust_ir::Inst::Call { .. } => {
+                        let (target, nominal) =
+                            borrowed(current).ok_or(ClosureIdentityBlock::Producer {
+                                at: current,
+                                inst: "Call",
+                            })?;
+                        identities.insert(current, Some((target, Ty::Closure(nominal))));
                     }
                     trust_ir::Inst::Copy { ty, operand }
                     | trust_ir::Inst::InsertField {
@@ -2025,6 +2061,7 @@ fn visit_source_function_references<'m>(
                                 .ok()
                                 .map(|binding| binding.target)
                         },
+                        |value| borrowed_closure_code_identity(module, function, value),
                         *callee,
                     ) {
                         visit(
@@ -2217,6 +2254,7 @@ mod tests {
                 |value| (value == result).then_some(&node),
                 |_| None,
                 |id| (id == closure).then_some(binding).flatten(),
+                |_| None,
                 result,
             )
         };

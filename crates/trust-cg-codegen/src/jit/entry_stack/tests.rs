@@ -7,6 +7,7 @@ use super::*;
 
 fn requirement(bytes: usize) -> SourceEntryStackRequirement {
     SourceEntryStackRequirement {
+        abi: EntryAbi::Scalar,
         private_bytes: bytes,
         module_digest: trust_ir::proof::ProofDigest::sha256([1; 32]),
         code_digest: trust_ir::proof::ProofDigest::sha256([2; 32]),

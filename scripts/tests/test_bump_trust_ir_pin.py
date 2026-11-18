@@ -26,9 +26,9 @@ OLD_IR, NEW_IR = "1" * 40, "2" * 40
 OLD_CLEAN, NEW_CLEAN, AY = "3" * 40, "4" * 40, "5" * 40
 NEW_AY = "6" * 40
 TRUST_IR_CURRENT, TRUST_IR_TARGET = bump.IR_VERSION_MIGRATION
-TRUST_IR_UNSUPPORTED = "0.16.0"
+TRUST_IR_UNSUPPORTED = "0.17.0"
 CLEAN_CURRENT, CLEAN_TARGET = bump.CLEAN_VERSION_MIGRATION
-CLEAN_UNSUPPORTED = "0.9.3"
+CLEAN_UNSUPPORTED = "0.9.5"
 # A synthetic vendored container fixture tree (relative to VENDORED_FIXTURES).
 VENDORED = ("SOURCE.txt", "conformance/b1_scalars.tmbc", "conformance/b1_scalars.json",
             "pinned_writer/crystal_lane_v49.tmbc")
@@ -366,11 +366,149 @@ class TransactionTests(unittest.TestCase):
         guards = [call for call in self.commands.calls if "--test" in call[0]]
         self.assertEqual(len(guards), len(bump.GUARD_TEST_NAMES))
 
-    def clean_version_migration(self):
+    def clean_version_migration(self, target=CLEAN_TARGET):
         self.commands.documents = {
-            key: text.replace(CLEAN_CURRENT, CLEAN_TARGET)
+            key: text.replace(CLEAN_CURRENT, target)
             for key, text in self.commands.documents.items()}
-        self.commands.clean_version_move = bump.CLEAN_VERSION_MIGRATION
+        self.commands.clean_version_move = (CLEAN_CURRENT, target)
+
+    def test_clean_093_requires_explicit_selection_and_runs_all_original_guards(self):
+        target = "0.9.3"
+        self.clean_version_migration(target)
+        with self.assertRaises(bump.Refusal):
+            self.invoke()
+        self.assert_restored()
+        self.assertEqual(self.commands.frontend_count, 0)
+        self.invoke(clean_version=target)
+        state = bump.current(self.root, bump.snapshot(self.root))
+        before = bump.current(self.root, self.original)
+        self.assertEqual(set(state.clean_packages), set(before.clean_packages))
+        self.assertEqual(set(state.clean_packages.values()), {target})
+        self.assertEqual(state.ay, before.ay)
+        self.assertEqual(self.commands.frontend_count, FRONTEND_STEPS)
+        guards = [call for call in self.commands.calls if "--test" in call[0]]
+        self.assertEqual(len(guards), len(bump.GUARD_TEST_NAMES))
+
+    def test_clean_093_move_from_092_preserves_cohort_and_refuses_downgrade(self):
+        target = "0.9.3"
+        for relative, data in self.original.items():
+            (self.root / relative).write_bytes(data.data.replace(
+                f'version = "{CLEAN_CURRENT}"'.encode(), f'version = "{CLEAN_TARGET}"'.encode()))
+        self.original = bump.snapshot(self.root)
+        self.clean_version_migration(target)
+        self.commands.clean_version_move = (CLEAN_TARGET, target)
+        self.invoke(clean_version=target)
+        state = bump.current(self.root, bump.snapshot(self.root))
+        self.assertEqual(set(state.clean_packages.values()), {target})
+        self.assertEqual(self.commands.frontend_count, FRONTEND_STEPS)
+        completed = bump.snapshot(self.root)
+        with self.assertRaisesRegex(bump.Refusal, "unsupported Clean package-version migration"):
+            self.invoke(clean_version=CLEAN_TARGET)
+        self.assertEqual(bump.snapshot(self.root), completed)
+        self.assertEqual(self.commands.frontend_count, FRONTEND_STEPS)
+
+    def test_clean_093_move_keeps_every_original_guard_rollback(self):
+        for step in GUARD_STEPS.values():
+            with self.subTest(step=step):
+                self.commands = SyntheticCommands(self.root)
+                self.clean_version_migration("0.9.3")
+                self.commands.fail_step = step
+                with self.assertRaises(bump.Refusal):
+                    self.invoke(clean_version="0.9.3")
+                self.assert_restored()
+
+    def test_clean_093_move_rejects_mismatched_immutable_package_version(self):
+        self.clean_version_migration("0.9.3")
+        self.commands.documents[bump.CLEAN_URL, "crates/clean-kernel/Cargo.toml"] = (
+            '[package]\nname = "clean-kernel"\nversion = "0.9.4"\n')
+        with self.assertRaises(bump.Refusal):
+            self.invoke(clean_version="0.9.3")
+        self.assert_restored()
+        self.assertEqual(self.commands.frontend_count, 0)
+
+    def test_clean_094_move_from_093_preserves_cohort_and_refuses_downgrade(self):
+        current = "0.9.3"
+        target = "0.9.4"
+        for relative, data in self.original.items():
+            (self.root / relative).write_bytes(data.data.replace(
+                f'version = "{CLEAN_CURRENT}"'.encode(), f'version = "{current}"'.encode()))
+        self.original = bump.snapshot(self.root)
+        self.commands.documents = {
+            key: text.replace(CLEAN_CURRENT, target)
+            for key, text in self.commands.documents.items()
+        }
+        self.commands.clean_version_move = (current, target)
+        self.invoke(clean_version=target)
+        state = bump.current(self.root, bump.snapshot(self.root))
+        before = bump.current(self.root, self.original)
+        self.assertEqual(set(state.clean_packages), set(before.clean_packages))
+        self.assertEqual(set(state.clean_packages.values()), {target})
+        self.assertEqual(state.ay, before.ay)
+        self.assertEqual(self.commands.frontend_count, FRONTEND_STEPS)
+        guards = [call for call in self.commands.calls if "--test" in call[0]]
+        self.assertEqual(len(guards), len(bump.GUARD_TEST_NAMES))
+        completed = bump.snapshot(self.root)
+        with self.assertRaisesRegex(bump.Refusal, "unsupported Clean package-version migration"):
+            self.invoke(clean_version=current)
+        self.assertEqual(bump.snapshot(self.root), completed)
+        self.assertEqual(self.commands.frontend_count, FRONTEND_STEPS)
+
+    def test_clean_094_move_keeps_every_original_guard_rollback(self):
+        current = "0.9.3"
+        target = "0.9.4"
+        for step in GUARD_STEPS.values():
+            with self.subTest(step=step):
+                self.commands = SyntheticCommands(self.root)
+                for relative, data in self.original.items():
+                    (self.root / relative).write_bytes(data.data.replace(
+                        f'version = "{CLEAN_CURRENT}"'.encode(),
+                        f'version = "{current}"'.encode()))
+                self.original = bump.snapshot(self.root)
+                self.commands.documents = {
+                    key: text.replace(CLEAN_CURRENT, target)
+                    for key, text in self.commands.documents.items()
+                }
+                self.commands.clean_version_move = (current, target)
+                self.commands.fail_step = step
+                with self.assertRaises(bump.Refusal):
+                    self.invoke(clean_version=target)
+                self.assert_restored()
+
+    def test_clean_094_move_rejects_mismatched_immutable_package_version(self):
+        current = "0.9.3"
+        target = "0.9.4"
+        for relative, data in self.original.items():
+            (self.root / relative).write_bytes(data.data.replace(
+                f'version = "{CLEAN_CURRENT}"'.encode(), f'version = "{current}"'.encode()))
+        self.original = bump.snapshot(self.root)
+        self.commands.documents = {
+            key: text.replace(CLEAN_CURRENT, target)
+            for key, text in self.commands.documents.items()
+        }
+        self.commands.clean_version_move = (current, target)
+        self.commands.documents[bump.CLEAN_URL, "crates/clean-kernel/Cargo.toml"] = (
+            '[package]\nname = "clean-kernel"\nversion = "0.9.5"\n')
+        with self.assertRaises(bump.Refusal):
+            self.invoke(clean_version=target)
+        self.assert_restored()
+        self.assertEqual(self.commands.frontend_count, 0)
+
+    def test_clean_094_refuses_direct_moves_from_older_cohorts(self):
+        state = bump.current(self.root, self.original)
+        for current in ("0.9.1", "0.9.2"):
+            with self.subTest(current=current):
+                older = bump.Current(
+                    state.ir,
+                    state.clean,
+                    state.ay,
+                    state.ay_version,
+                    state.ir_packages,
+                    {name: current for name in state.clean_packages},
+                    state.ay_packages,
+                )
+                with self.assertRaisesRegex(
+                        bump.Refusal, "unsupported Clean package-version migration"):
+                    bump.selected_clean_version(older, "0.9.4")
 
     def test_explicit_clean_patch_move_runs_all_original_named_guards(self):
         self.clean_version_migration()
@@ -2540,6 +2678,32 @@ class IrVersionMigrationTests(unittest.TestCase):
         self.assertEqual([(argv[argv.index("-p") + 1], argv[argv.index("--test") + 1])
                           for argv in guards], list(GUARD_STEPS))
 
+    def test_explicit_016_move_requires_matching_flag_and_runs_every_guard(self):
+        for relative in bump.LOCKS:
+            text = (self.root / relative).read_text()
+            self.write(relative, text.replace("0.14.0", "0.15.0"))
+        self.original = bump.snapshot(self.root)
+        self.commands.documents[bump.IR_URL, "Cargo.toml"] = '[workspace.package]\nversion = "0.16.0"\n'
+        self.commands.ir_version_move = ("0.15.0", "0.16.0")
+        for wrong_selection in (None, "0.15.0"):
+            with self.subTest(ir_version=wrong_selection):
+                with self.assertRaisesRegex(bump.Refusal, "matching explicit selection"):
+                    bump.transaction(self.root, NEW_IR, self.commands, ir_version=wrong_selection)
+                self.assert_restored()
+                self.assertEqual(self.commands.frontend_count, 0)
+        with redirect_stdout(self.output), redirect_stderr(self.output):
+            bump.transaction(self.root, NEW_IR, self.commands, ir_version="0.16.0")
+        before = bump.current(self.root, self.original)
+        after = bump.current(self.root, bump.snapshot(self.root))
+        self.assertEqual(set(after.ir_packages), set(before.ir_packages))
+        self.assertEqual(set(after.ir_packages.values()), {"0.16.0"})
+        self.assertEqual(self.commands.frontend_count, FRONTEND_STEPS)
+        updates = [argv for argv, *_ in self.commands.calls if "--precise" in argv]
+        self.assertEqual([argv[argv.index("-p") + 1] for argv in updates], ["trust-ir@0.16.0"] * 3)
+        guards = [argv for argv, *_ in self.commands.calls if argv[1:3] == ["--unverified", "test"]]
+        self.assertEqual([(argv[argv.index("-p") + 1], argv[argv.index("--test") + 1])
+                          for argv in guards], list(GUARD_STEPS))
+
     def test_wrong_workspace_or_member_version_refuses_before_install(self):
         self.select_minor_release()
         for path, text in (("Cargo.toml", '[workspace.package]\nversion = "0.16.0"\n'),
@@ -2728,16 +2892,30 @@ class HostileGitAuthorityTests(unittest.TestCase):
 
 
 class CliRegistryAdmissionTests(unittest.TestCase):
+    def test_reviewed_clean_versions_reach_transaction_without_implicit_ir_move(self):
+        for clean_version in ("0.9.3", "0.9.4"):
+            with self.subTest(clean_version=clean_version), \
+                    patch.object(bump, "selected_targo", return_value=Path("/selected/targo")), \
+                    patch.object(bump, "Commands", return_value=object()), \
+                    patch.object(bump, "transaction") as transaction:
+                result = bump.main([NEW_IR, "--targo", "/selected/targo",
+                                    "--clean-version", clean_version])
+            self.assertEqual(result, 0)
+            self.assertEqual(transaction.call_args.kwargs["clean_version"], clean_version)
+            self.assertIsNone(transaction.call_args.kwargs["ir_version"])
+
     def test_reviewed_trust_ir_and_clean_versions_reach_transaction_unchanged(self):
-        with patch.object(bump, "selected_targo", return_value=Path("/selected/targo")), \
-                patch.object(bump, "Commands", return_value=object()), \
-                patch.object(bump, "transaction") as transaction:
-            result = bump.main([NEW_IR, "--targo", "/selected/targo",
-                                "--ir-version", TRUST_IR_TARGET,
-                                "--clean-version", CLEAN_TARGET])
-        self.assertEqual(result, 0)
-        self.assertEqual(transaction.call_args.kwargs["ir_version"], TRUST_IR_TARGET)
-        self.assertEqual(transaction.call_args.kwargs["clean_version"], CLEAN_TARGET)
+        for ir_version, clean_version in ((TRUST_IR_TARGET, CLEAN_TARGET), ("0.16.0", "0.9.4")):
+            with self.subTest(ir_version=ir_version, clean_version=clean_version), \
+                    patch.object(bump, "selected_targo", return_value=Path("/selected/targo")), \
+                    patch.object(bump, "Commands", return_value=object()), \
+                    patch.object(bump, "transaction") as transaction:
+                result = bump.main([NEW_IR, "--targo", "/selected/targo",
+                                    "--ir-version", ir_version,
+                                    "--clean-version", clean_version])
+                self.assertEqual(result, 0)
+                self.assertEqual(transaction.call_args.kwargs["ir_version"], ir_version)
+                self.assertEqual(transaction.call_args.kwargs["clean_version"], clean_version)
 
     def test_unreviewed_trust_ir_and_clean_versions_refuse_at_cli_boundary(self):
         for option, version in (("--ir-version", TRUST_IR_UNSUPPORTED),

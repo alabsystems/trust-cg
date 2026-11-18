@@ -80,13 +80,25 @@
 //! mint are inert while verdict-DB recording is active and whenever no
 //! capable Carcara checker resolves. `TCG_PROOF_CERT_STORE_DEBUG=1` traces
 //! consume/mint decisions.
+//!
+//! # Last use and eviction
+//!
+//! A certificate's modification time is its last use: a publish writes it,
+//! and a credited hit sets it once per process ([`mark_used`]), so aterm's
+//! disk pass reads it without running trust-cg. After a publish, a sweep on a
+//! thread of its own ([`note_store_grew`]) removes the least recently used
+//! certificates while the store holds more than [`CERT_STORE_CAP_BYTES`],
+//! and the replay hints by the same rule. Eviction changes no verdict: a
+//! removed certificate is a miss at its next read, the query is solved live
+//! and the verified proof is published again; a hit still re-checks the
+//! stored proof with Clean.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Mutex, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::subprocess::{self, RunError};
 use sha2::{Digest, Sha256};
@@ -1785,6 +1797,7 @@ pub(crate) fn alethe_cert_skip_verified_with_authority(
         timeout_ms,
     );
     if hit {
+        mark_used(&path);
         crate::cert_replay_prefetch::note_used(verdict_key);
     }
     hit
@@ -2446,6 +2459,10 @@ fn mint_into_with_env(request: &MintRequest<'_>, child_env: &SanitizedChildEnv) 
 /// predictable staging path. This is not a durability guarantee: some platforms
 /// may leave a second hard link after publication/crash; replay always rechecks
 /// the certificate. The store directory must not be attacker-controlled.
+///
+/// The new file's modification time, the write just made, is its first use.
+/// A publish is how the store grows, so it is where a sweep may start
+/// ([`note_store_grew`]).
 fn publish_cert(dir: &Path, path: &Path, cert: &AletheCert) -> bool {
     // Under the user cache this is `<cache>/trust-cg/alethe-certs`: every
     // directory created is `0700` whatever the umask, so the shared
@@ -2459,7 +2476,363 @@ fn publish_cert(dir: &Path, path: &Path, cert: &AletheCert) -> bool {
     if tmp.write_all(cert.serialize().as_bytes()).is_err() {
         return false;
     }
-    tmp.persist_noclobber(path).is_ok()
+    if tmp.persist_noclobber(path).is_err() {
+        return false;
+    }
+    note_store_grew(dir);
+    true
+}
+
+/// The most bytes of certificates the store keeps: 8 GiB. On m18 on
+/// 2026-11-12 the store held 30.6 GiB of certificates, 50,106 of them at
+/// 0.63 MiB on average, none modified or read in 30 days. 8 GiB keeps about
+/// 13,000 of that size, over three times the 4,096 one compile's replay hint
+/// can name ([`crate::cert_replay_prefetch::MAX_HINTED_REPLAYS`]), so the
+/// working sets of the scopes in use stay. A certificate evicted past it
+/// costs one live solve, after which it is published again. A rustc-bridge
+/// compile refuses `TCG_*` variables, so every build gets this value;
+/// [`STORE_CAP_ENV`] serves tests and benchmarks.
+pub(crate) const CERT_STORE_CAP_BYTES: u64 = 8 << 30;
+
+/// Overrides [`CERT_STORE_CAP_BYTES`] with a positive number of bytes.
+pub(crate) const STORE_CAP_ENV: &str = "TCG_PROOF_CERT_STORE_CAP_BYTES";
+
+/// Overrides [`crate::cert_replay_prefetch::REPLAY_HINT_CAP_BYTES`] with a
+/// positive number of bytes, for tests and benchmarks as [`STORE_CAP_ENV`].
+pub(crate) const HINT_CAP_ENV: &str = "TCG_PROOF_REPLAY_HINT_CAP_BYTES";
+
+/// The file in a swept folder whose modification time says when the folder's
+/// next sweep is due: [`SWEEP_INTERVAL`] after it ([`SweepClaim`]).
+const SWEEP_STAMP: &str = ".lru-sweep";
+
+/// A sweep lists its whole folder, so once one finishes the next starts no
+/// sooner than this, in any process. The store can pass its cap by what is
+/// published in one interval.
+const SWEEP_INTERVAL: Duration = Duration::from_secs(600);
+
+/// How long a claimed sweep holds its folder unless it renews the claim. A
+/// running sweep renews it every quarter of this. The sweep thread is never
+/// joined (no compile waits for it), so a process that exits cuts its sweep
+/// short; that sweep stops renewing, and the first publish or hint write
+/// after its claim lapses starts the folder's sweep again. Removal goes least
+/// recently used first, so the new sweep carries on where the old one
+/// stopped. A sweep cut short therefore holds the folder for this long, not
+/// for a whole [`SWEEP_INTERVAL`].
+const SWEEP_LEASE: Duration = Duration::from_secs(60);
+
+/// Paths this process has marked used, so a use costs one metadata write per
+/// file per process. Cleared when full: that costs repeated writes only.
+const MARKED_CAPACITY: usize = 65_536;
+
+/// A folder of the store that a sweep holds to a cap. Each has its own stamp
+/// and its own sweep, so a long listing of one never holds up the other.
+#[derive(Clone, Copy, Debug)]
+enum Pool {
+    /// The `*.alethecert` files directly in the store.
+    Certs,
+    /// The `*.hint` files in its
+    /// [`crate::cert_replay_prefetch::HINT_NAMESPACE`] folder.
+    Hints,
+}
+
+impl Pool {
+    const ALL: [Self; 2] = [Self::Certs, Self::Hints];
+
+    fn dir(self, store: &Path) -> PathBuf {
+        match self {
+            Self::Certs => store.to_path_buf(),
+            Self::Hints => store.join(crate::cert_replay_prefetch::HINT_NAMESPACE),
+        }
+    }
+
+    fn suffix(self) -> &'static str {
+        match self {
+            Self::Certs => ".alethecert",
+            Self::Hints => ".hint",
+        }
+    }
+
+    /// The cap in force on this thread: the pool's constant
+    /// ([`CERT_STORE_CAP_BYTES`],
+    /// [`crate::cert_replay_prefetch::REPLAY_HINT_CAP_BYTES`]) or its
+    /// override ([`STORE_CAP_ENV`], [`HINT_CAP_ENV`]).
+    fn cap(self) -> u64 {
+        let (env, default) = match self {
+            Self::Certs => (STORE_CAP_ENV, CERT_STORE_CAP_BYTES),
+            Self::Hints => (
+                HINT_CAP_ENV,
+                crate::cert_replay_prefetch::REPLAY_HINT_CAP_BYTES,
+            ),
+        };
+        trust_cg_process_env::var(env)
+            .ok()
+            .and_then(|value| value.trim().parse::<u64>().ok())
+            .filter(|bytes| *bytes > 0)
+            .unwrap_or(default)
+    }
+}
+
+/// Record a use of the store file at `path` (a certificate, a replay hint)
+/// as its modification time, the last-use clock the sweep evicts by. Once per
+/// file per process. A file removed since it was read (evicted beside this
+/// reader) is not recreated: the next reader misses, which is all an
+/// eviction costs.
+pub(crate) fn mark_used(path: &Path) {
+    {
+        let mut marked = marked_paths().lock().unwrap_or_else(|p| p.into_inner());
+        if marked.contains(path) {
+            return;
+        }
+        if marked.len() >= MARKED_CAPACITY {
+            marked.clear();
+        }
+        marked.insert(path.to_path_buf());
+    }
+    // Setting the time needs ownership, not write access, on Unix; Windows
+    // needs a handle that may write attributes.
+    #[cfg(unix)]
+    let file = std::fs::File::open(path);
+    #[cfg(not(unix))]
+    let file = std::fs::File::options().write(true).open(path);
+    if let Ok(file) = file {
+        let _ = file.set_modified(SystemTime::now());
+    }
+}
+
+fn marked_paths() -> &'static Mutex<HashSet<PathBuf>> {
+    static MARKED: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
+    MARKED.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+/// Folders this process is sweeping now, and the signal that one finished.
+fn sweeps() -> &'static (Mutex<HashSet<PathBuf>>, std::sync::Condvar) {
+    static SWEEPS: OnceLock<(Mutex<HashSet<PathBuf>>, std::sync::Condvar)> = OnceLock::new();
+    SWEEPS.get_or_init(|| (Mutex::new(HashSet::new()), std::sync::Condvar::new()))
+}
+
+/// The store at `store` grew (a certificate published, a replay hint
+/// written): for each of its [`Pool`]s whose sweep is due, run one on a
+/// thread of its own, under the cap in force on this thread, so no compile
+/// waits while a folder is listed. Nothing here lists a folder.
+pub(crate) fn note_store_grew(store: &Path) {
+    for pool in Pool::ALL {
+        start_sweep(pool.dir(store), pool.suffix(), pool.cap());
+    }
+}
+
+/// Sweep `dir` on a thread of its own when this process sweeps it nowhere
+/// else and [`SweepClaim::claim`] finds it due.
+fn start_sweep(dir: PathBuf, suffix: &'static str, cap: u64) {
+    let (in_flight, _) = sweeps();
+    let mut in_flight = in_flight.lock().unwrap_or_else(|p| p.into_inner());
+    if in_flight.contains(&dir) {
+        return;
+    }
+    let Some(mut claim) = SweepClaim::claim(&dir) else {
+        return;
+    };
+    in_flight.insert(dir.clone());
+    drop(in_flight);
+    let swept = dir.clone();
+    let spawned = std::thread::Builder::new()
+        .name("tcg-cert-lru".to_owned())
+        .spawn(move || {
+            let _done = SweepDone(swept.clone());
+            let removed =
+                evict_least_recently_used(&swept, suffix, cap, &mut || claim.renew_if_due());
+            claim.finish();
+            trace!(
+                "sweep of {}: evicted {removed} {suffix} file(s)",
+                swept.display()
+            );
+        });
+    if spawned.is_err() {
+        // The claim went with the closure unfinished: it lapses after
+        // `SWEEP_LEASE`, and a later publish tries again.
+        drop(SweepDone(dir));
+    }
+}
+
+/// Ends a sweep's entry in [`sweeps`], also on unwind.
+struct SweepDone(PathBuf);
+
+impl Drop for SweepDone {
+    fn drop(&mut self) {
+        let (in_flight, settled) = sweeps();
+        in_flight
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&self.0);
+        settled.notify_all();
+    }
+}
+
+/// Wait (a one-minute hang detector) until this process runs no sweep of
+/// `store` or a folder in it.
+#[cfg(test)]
+pub(crate) fn wait_for_sweep_for_test(store: &Path) {
+    let (in_flight, settled) = sweeps();
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    let mut in_flight = in_flight.lock().unwrap_or_else(|p| p.into_inner());
+    while in_flight.iter().any(|dir| dir.starts_with(store)) {
+        let left = deadline
+            .checked_duration_since(std::time::Instant::now())
+            .expect("a store sweep made no progress for a minute");
+        in_flight = settled
+            .wait_timeout(in_flight, left)
+            .unwrap_or_else(|p| p.into_inner())
+            .0;
+    }
+}
+
+/// One process's claim on a folder's sweep, held in the folder's
+/// [`SWEEP_STAMP`]. The folder's next sweep is due [`SWEEP_INTERVAL`] after
+/// the stamp's modification time. A claim sets that time [`SWEEP_LEASE`]
+/// short of the interval, so the claim lapses a lease after its last renewal;
+/// a finished sweep sets it to now, so the folder rests a whole interval.
+struct SweepClaim {
+    stamp: std::fs::File,
+    renewed: std::time::Instant,
+}
+
+impl SweepClaim {
+    /// Claim the sweep of `dir` when it is due by its stamp. A stamp from the
+    /// future (a clock set back) is due; a stamp that is no regular file
+    /// never is. Two processes that both find it due both sweep, which costs
+    /// a second listing only.
+    fn claim(dir: &Path) -> Option<Self> {
+        let stamp = dir.join(SWEEP_STAMP);
+        match std::fs::symlink_metadata(&stamp) {
+            Ok(meta) if !meta.is_file() => return None,
+            Ok(meta) => {
+                let age = meta
+                    .modified()
+                    .ok()
+                    .and_then(|modified| SystemTime::now().duration_since(modified).ok());
+                if age.is_some_and(|age| age < SWEEP_INTERVAL) {
+                    return None;
+                }
+            }
+            Err(_) => {}
+        }
+        let stamp = std::fs::File::options()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(&stamp)
+            .ok()?;
+        let mut claim = Self {
+            stamp,
+            renewed: std::time::Instant::now(),
+        };
+        claim.renew().then_some(claim)
+    }
+
+    /// Hold the claim for another [`SWEEP_LEASE`] from now.
+    fn renew(&mut self) -> bool {
+        self.renewed = std::time::Instant::now();
+        let held_until = SystemTime::now()
+            .checked_sub(SWEEP_INTERVAL - SWEEP_LEASE)
+            .unwrap_or(UNIX_EPOCH);
+        self.stamp.set_modified(held_until).is_ok()
+    }
+
+    /// Renew the claim once a quarter of its lease has passed since the last
+    /// renewal. Called for each entry a sweep lists or removes.
+    fn renew_if_due(&mut self) {
+        if self.renewed.elapsed() >= SWEEP_LEASE / 4 {
+            let _ = self.renew();
+        }
+    }
+
+    /// The sweep finished: the folder's next one is due a whole
+    /// [`SWEEP_INTERVAL`] from now.
+    fn finish(self) {
+        let _ = self.stamp.set_modified(SystemTime::now());
+    }
+}
+
+/// A sweep that finds more than `cap` bytes removes down to this, so the
+/// publishes after it do not each find the store over its cap again.
+fn low_water(cap: u64) -> u64 {
+    cap - cap / 10
+}
+
+/// When the regular `*{suffix}` files directly in `dir` hold more than `cap`
+/// bytes, remove the least recently used of them (oldest modification time
+/// first, a tie by name) until they hold at most [`low_water`]. Nothing else
+/// is counted or removed: a publish's staging file (its name starts with a
+/// dot), the sweep stamp, folders and links stay. A file whose modification
+/// time changed since the listing was used meanwhile and stays. A file is
+/// removed by unlinking it, so a reader that has it open still reads every
+/// byte, and a reader after that misses. `progress` runs for each entry
+/// listed and each file considered for removal (the sweep's claim renews
+/// there). Returns how many were removed.
+fn evict_least_recently_used(
+    dir: &Path,
+    suffix: &str,
+    cap: u64,
+    progress: &mut dyn FnMut(),
+) -> usize {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    let mut files = Vec::new();
+    let mut total: u64 = 0;
+    for entry in entries.flatten() {
+        progress();
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if name.starts_with('.') || !name.ends_with(suffix) {
+            continue;
+        }
+        // `DirEntry::metadata` does not follow a link.
+        let Ok(meta) = entry.metadata() else {
+            continue;
+        };
+        if !meta.is_file() {
+            continue;
+        }
+        total = total.saturating_add(meta.len());
+        files.push((
+            meta.modified().unwrap_or(UNIX_EPOCH),
+            entry.path(),
+            meta.len(),
+        ));
+    }
+    if total <= cap {
+        return 0;
+    }
+    files.sort();
+    let floor = low_water(cap);
+    let mut removed = 0;
+    for (modified, path, len) in files {
+        if total <= floor {
+            break;
+        }
+        progress();
+        match std::fs::symlink_metadata(&path) {
+            Ok(meta) if meta.modified().unwrap_or(UNIX_EPOCH) == modified => {}
+            Ok(_) => continue,
+            Err(_) => {
+                total = total.saturating_sub(len);
+                continue;
+            }
+        }
+        match std::fs::remove_file(&path) {
+            Ok(()) => {
+                total = total.saturating_sub(len);
+                removed += 1;
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                total = total.saturating_sub(len);
+            }
+            Err(_) => {}
+        }
+    }
+    removed
 }
 
 #[cfg(all(test, unix))]
@@ -2575,18 +2948,21 @@ mod tests {
             "publication is no-clobber even for racing threads"
         );
         assert_eq!(std::fs::read_to_string(&path).unwrap(), winners[0]);
-        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+        // Beside the entry, only the stamp of the sweep its publish started.
+        let entries = || {
+            std::fs::read_dir(dir.path())
+                .unwrap()
+                .filter(|entry| entry.as_ref().unwrap().file_name() != SWEEP_STAMP)
+                .count()
+        };
+        assert_eq!(entries(), 1);
         let cert = sample("(assert false)", "later entry", &"44".repeat(32));
         assert!(!publish_cert(dir.path(), &path, &cert));
         assert_eq!(std::fs::read_to_string(&path).unwrap(), winners[0]);
         let occupied = dir.path().join("occupied");
         std::fs::create_dir(&occupied).unwrap();
         assert!(!publish_cert(dir.path(), &occupied, &cert));
-        assert_eq!(
-            std::fs::read_dir(dir.path()).unwrap().count(),
-            2,
-            "failed publisher cleans its own staging file"
-        );
+        assert_eq!(entries(), 2, "failed publisher cleans its own staging file");
     }
 
     #[test]
@@ -4842,6 +5218,309 @@ mod tests {
              Type: Alethe SMT proof\n\
              Proof status: fully verified\n\
              External certificate verification: FAILED\n"
+        ));
+    }
+
+    /// The query of eviction fixture `index`: every one is the same length,
+    /// so every certificate below is the same size.
+    pub(super) fn eviction_query(index: usize) -> String {
+        format!("(assert (= x {index:02}))\n(check-sat)")
+    }
+
+    pub(super) const EVICTION_PROOF: &str = "(step t1 (cl) :rule false)";
+
+    /// The obligation name `persist_verified_alethe_into` publishes the
+    /// fixtures under, so a published one is the size of a written one.
+    pub(super) const EVICTION_OBLIGATION: &str = "eviction fixture";
+
+    /// Write the certificate `persist_verified_alethe_into` publishes for
+    /// `smt2` straight into `store`, last used `hours` ago, without a publish
+    /// (which could start a sweep). Returns its key.
+    pub(super) fn stored_for_eviction(
+        store: &Path,
+        solver_identity: &str,
+        checker_identity: &str,
+        smt2: &str,
+        hours: u64,
+    ) -> String {
+        std::fs::create_dir_all(store).unwrap();
+        let key = crate::ay_bridge::verdict_cache_key_v2(solver_identity, smt2);
+        let cert = AletheCert {
+            producer_ay_identity: solver_identity.to_owned(),
+            external_clean_checker_identity: checker_identity.to_owned(),
+            smt2_sha256: sha256_hex(smt2.as_bytes()),
+            obligation_name: EVICTION_OBLIGATION.to_owned(),
+            smt2: smt2.to_owned(),
+            alethe_proof: EVICTION_PROOF.to_owned(),
+        };
+        write_cert(store, &key, &cert);
+        std::fs::File::options()
+            .write(true)
+            .open(cert_path(store, &key))
+            .unwrap()
+            .set_modified(SystemTime::now() - Duration::from_secs(3600 * hours))
+            .unwrap();
+        key
+    }
+
+    /// Bytes of the certificates in `store`.
+    pub(super) fn certificate_bytes(store: &Path) -> u64 {
+        std::fs::read_dir(store)
+            .unwrap()
+            .map(|entry| entry.unwrap())
+            .filter(|entry| entry.file_name().to_string_lossy().ends_with(".alethecert"))
+            .map(|entry| entry.metadata().unwrap().len())
+            .sum()
+    }
+
+    #[test]
+    fn cert_store_eviction_removes_the_least_recently_used_over_the_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = dir.path().join("store");
+        let solver = dir.path().join("solver");
+        std::fs::write(&solver, b"eviction-fixture-solver").unwrap();
+        let solver = solver.to_str().unwrap();
+        let identity = crate::ay_bridge::solver_identity_hash(solver).unwrap();
+        let checker_identity = "ab".repeat(32);
+        // Five certificates, the first used longest ago.
+        let keys: Vec<String> = (0..5)
+            .map(|index| {
+                stored_for_eviction(
+                    &store,
+                    &identity,
+                    &checker_identity,
+                    &eviction_query(index),
+                    10 - index as u64,
+                )
+            })
+            .collect();
+        let size = std::fs::metadata(cert_path(&store, &keys[0]))
+            .unwrap()
+            .len();
+        // A sixth published over a cap of four: the sweep removes the least
+        // recently used down to nine tenths of the cap, leaving three.
+        let cap = (4 * size).to_string();
+        assert!(trust_cg_process_env::with_env_overrides(
+            &[(STORE_CAP_ENV, &cap)],
+            || persist_verified_alethe_into(
+                &store,
+                solver,
+                &eviction_query(5),
+                EVICTION_OBLIGATION,
+                EVICTION_PROOF,
+                &checker_identity,
+            )
+        ));
+        wait_for_sweep_for_test(&store);
+        for (index, key) in keys.iter().enumerate() {
+            assert_eq!(
+                cert_path(&store, key).exists(),
+                index >= 3,
+                "certificate {index} (the lower, the longer ago it was used)"
+            );
+        }
+        let published = crate::ay_bridge::verdict_cache_key_v2(&identity, &eviction_query(5));
+        assert!(cert_path(&store, &published).exists());
+        assert_eq!(certificate_bytes(&store), 3 * size);
+        // Nothing but certificates was removed: the stamp of the sweep stays.
+        assert!(store.join(SWEEP_STAMP).is_file());
+    }
+
+    /// Move the modification time of the sweep stamp in `dir` back by `by`,
+    /// as if that much time had passed.
+    fn age_sweep_stamp(dir: &Path, by: Duration) {
+        let stamp = std::fs::File::options()
+            .write(true)
+            .open(dir.join(SWEEP_STAMP))
+            .unwrap();
+        let modified = stamp.metadata().unwrap().modified().unwrap();
+        stamp.set_modified(modified - by).unwrap();
+    }
+
+    #[test]
+    fn cert_store_sweep_cut_short_holds_the_store_for_its_lease_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = dir.path();
+        // Four 100-byte certificates, the first used longest ago.
+        let paths: Vec<_> = (0..4u64)
+            .map(|index| {
+                let path = store.join(format!("{index:064x}.alethecert"));
+                std::fs::write(&path, [b'c'; 100]).unwrap();
+                std::fs::File::options()
+                    .write(true)
+                    .open(&path)
+                    .unwrap()
+                    .set_modified(SystemTime::now() - Duration::from_secs(3600 * (10 - index)))
+                    .unwrap();
+                path
+            })
+            .collect();
+        let grew = || {
+            trust_cg_process_env::with_env_overrides(&[(STORE_CAP_ENV, "300")], || {
+                note_store_grew(store)
+            });
+            wait_for_sweep_for_test(store);
+        };
+        let present = || paths.iter().map(|path| path.exists()).collect::<Vec<_>>();
+        // A sweep is claimed and its process exits before it removes
+        // anything: the claim is never renewed or finished.
+        drop(SweepClaim::claim(store).expect("the first sweep is due"));
+        // While the claim holds, no other sweep starts.
+        grew();
+        assert_eq!(present(), [true; 4], "a held claim starts no second sweep");
+        // Once its lease lapses (long before a whole interval), the next
+        // growth sweeps: 400 bytes over a cap of 300 go down to 270.
+        age_sweep_stamp(store, SWEEP_LEASE + Duration::from_secs(1));
+        grew();
+        assert_eq!(present(), [false, false, true, true]);
+        // A sweep that finished rests the store a whole interval, past its
+        // lease.
+        let fifth = store.join(format!("{:064x}.alethecert", 4));
+        std::fs::write(&fifth, [b'c'; 200]).unwrap();
+        age_sweep_stamp(store, SWEEP_LEASE + Duration::from_secs(1));
+        grew();
+        assert!(fifth.exists());
+        assert_eq!(present(), [false, false, true, true]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cert_store_eviction_counts_a_credited_hit_as_a_use() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = dir.path().join("store");
+        let checker = fake_checker(dir.path(), TRANSCRIPT_CAPABLE_STDOUT, "", 0);
+        let checker_identity = crate::lrat_cert::checker_binary_sha256(&checker).unwrap();
+        let solver = crate::ay_identity::test_fixtures::inert();
+        let identity = solver.sha256().to_owned();
+        // Four certificates, the first used longest ago.
+        let keys: Vec<String> = (0..4)
+            .map(|index| {
+                stored_for_eviction(
+                    &store,
+                    &identity,
+                    &checker_identity,
+                    &eviction_query(index),
+                    10 - index as u64,
+                )
+            })
+            .collect();
+        let size = std::fs::metadata(cert_path(&store, &keys[0]))
+            .unwrap()
+            .len();
+        let cap = (4 * size).to_string();
+        trust_cg_process_env::with_env_overrides_removed(
+            &["TCG_NO_CERT_STORE", "TCG_NO_PROOF_CACHE"],
+            || {
+                trust_cg_process_env::with_env_overrides(
+                    &[
+                        ("TCG_EXTERNAL_CLEAN_CHECKER", checker.to_str().unwrap()),
+                        ("TCG_PROOF_CERT_STORE", store.to_str().unwrap()),
+                        (STORE_CAP_ENV, &cap),
+                    ],
+                    || {
+                        let authority =
+                            crate::verification_authority::VerificationAuthority::capture(&solver);
+                        // The certificate used longest ago is credited now.
+                        assert!(alethe_cert_skip_verified_with_authority(
+                            &keys[0],
+                            authority.solver_path_text(),
+                            &eviction_query(0),
+                            &authority,
+                            0,
+                        ));
+                        // A fifth published over a cap of four: the sweep
+                        // removes down to nine tenths of it, the two least
+                        // recently used.
+                        assert!(persist_verified_alethe_into(
+                            &store,
+                            authority.solver_path_text(),
+                            &eviction_query(4),
+                            EVICTION_OBLIGATION,
+                            EVICTION_PROOF,
+                            &checker_identity,
+                        ));
+                    },
+                )
+            },
+        );
+        wait_for_sweep_for_test(&store);
+        for (index, kept) in [(0, true), (1, false), (2, false), (3, true)] {
+            assert_eq!(
+                cert_path(&store, &keys[index]).exists(),
+                kept,
+                "certificate {index}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cert_store_eviction_leaves_a_miss_that_is_solved_and_published_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = dir.path().join("store");
+        let solver = dir.path().join("solver");
+        std::fs::write(&solver, b"eviction-fixture-solver").unwrap();
+        let solver = solver.to_str().unwrap();
+        let identity = crate::ay_bridge::solver_identity_hash(solver).unwrap();
+        let checker = fake_checker(dir.path(), TRANSCRIPT_CAPABLE_STDOUT, "", 0);
+        let checker_identity = crate::lrat_cert::checker_binary_sha256(&checker).unwrap();
+        let binding = Some((checker, checker_identity.clone()));
+        let keys: Vec<String> = (0..3)
+            .map(|index| {
+                stored_for_eviction(
+                    &store,
+                    &identity,
+                    &checker_identity,
+                    &eviction_query(index),
+                    10 - index as u64,
+                )
+            })
+            .collect();
+        assert!(consume_verified_in(
+            &store,
+            &keys[0],
+            solver,
+            &eviction_query(0),
+            binding.clone()
+        ));
+        let size = std::fs::metadata(cert_path(&store, &keys[0]))
+            .unwrap()
+            .len();
+        let cap = (3 * size).to_string();
+        let publish = |index: usize| {
+            persist_verified_alethe_into(
+                &store,
+                solver,
+                &eviction_query(index),
+                EVICTION_OBLIGATION,
+                EVICTION_PROOF,
+                &checker_identity,
+            )
+        };
+        assert!(trust_cg_process_env::with_env_overrides(
+            &[(STORE_CAP_ENV, &cap)],
+            || publish(3)
+        ));
+        wait_for_sweep_for_test(&store);
+        assert!(!cert_path(&store, &keys[0]).exists());
+        // The evicted certificate is a miss: the consume path declines and
+        // the query is solved live, never credited from nothing.
+        assert!(!consume_verified_in(
+            &store,
+            &keys[0],
+            solver,
+            &eviction_query(0),
+            binding.clone()
+        ));
+        // The live solve's verified proof is published again under the same
+        // key, and its next read is credited after the same re-check.
+        assert!(publish(0));
+        assert!(consume_verified_in(
+            &store,
+            &keys[0],
+            solver,
+            &eviction_query(0),
+            binding
         ));
     }
 }

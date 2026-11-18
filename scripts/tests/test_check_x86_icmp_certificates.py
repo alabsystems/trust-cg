@@ -55,6 +55,23 @@ class WorkspaceToolResolution(unittest.TestCase):
         self.assertEqual(run.call_args.args[0][-4:],
                          ["--purpose", "workspace", "--print", "targo"])
 
+    def test_query_generation_is_admitted_before_its_compiling_command(self):
+        with mock.patch.object(GATE.shutil, "which", return_value="/machine/build-slot"), \
+                mock.patch.object(GATE, "run_admitted_build", return_value=0) as run:
+            GATE.dump_queries(Path("queries"))
+        command = run.call_args.args[0]
+        self.assertEqual(command[:6], ["/machine/build-slot", "--cpus", "2", "--mem-gb", "40", "--"])
+        self.assertEqual(command[6:], [str(ROOT / "scripts/trust_cargo.sh"), "run", "--locked", "-p",
+                                      "trust-cg-verify", "--example", GATE.EXAMPLE, "--", "queries"])
+
+    def test_missing_query_admission_starts_no_compiler(self):
+        with mock.patch.object(GATE.shutil, "which", return_value=None), \
+                mock.patch.object(GATE, "run_admitted_build") as run:
+            with self.assertRaises(GATE.MissingInput) as raised:
+                GATE.dump_queries(Path("queries"))
+        self.assertEqual(raised.exception.code, "build-slot-missing")
+        run.assert_not_called()
+
 
 class ResourceDescriptorTransport(unittest.TestCase):
     def test_invalid_resource_locator_refuses_before_starting_a_child(self):
@@ -447,6 +464,18 @@ if [ -n "${FIXTURE_HEAVY_GATE_REFUSE:-}" ]; then echo "heavy_gate: refused (fixt
 exec "$@"
 '''
 
+# A stand-in CPU boundary, not native machine admission. It checks the exact
+# production prefix and then executes the real fixture memory gate/payload.
+FAKE_BUILD_SLOT = r'''#!/bin/sh
+mode=ordinary
+if [ "$1" = --exclusive ]; then mode=exclusive; shift; fi
+[ "$1" = --cpus ] && [ "$2" = 2 ] && [ "$3" = --mem-gb ] && [ "$4" = 40 ] && [ "$5" = -- ] || exit 64
+shift 5
+echo "cpu $mode 2 40" >> "${CARGO_TARGET_DIR%/*}/cpu-admissions.log"
+if [ -n "${FIXTURE_CPU_GATE_REFUSE:-}" ]; then echo "CPU admission refused (fixture)" >&2; exit 75; fi
+exec "$@"
+'''
+
 
 class ToolBuildTests(unittest.TestCase):
     """`obtain_build` for both tools: the warm hit, tampering, the banner rule,
@@ -456,6 +485,12 @@ class ToolBuildTests(unittest.TestCase):
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
         self.base = Path(self.temporary.name)
+        self.cpu_gate = self.base / "build-slot"
+        self.cpu_gate.write_text(FAKE_BUILD_SLOT)
+        self.cpu_gate.chmod(0o700)
+        lookup = mock.patch.object(GATE.shutil, "which", return_value=str(self.cpu_gate))
+        lookup.start()
+        self.addCleanup(lookup.stop)
         self.clean = GATE.Tool("clean", CLEAN_REV, "0.9.0", ("-p", "clean", "--features", "clean/carcara-verify"),
                                (hashlib.sha256(b"clean bytes").hexdigest(),))
 
@@ -540,7 +575,8 @@ class ToolBuildTests(unittest.TestCase):
         self.assertEqual(raised.exception.code, "ay-cache-tampered")
 
     def cold_clean(self, targo_script: str = FAKE_TARGO,
-                   manifest: str = '[package]\nname = "clean"\nversion = "0.9.0"\n', **environment: str):
+                   manifest: str = '[package]\nname = "clean"\nversion = "0.9.0"\n',
+                   cpu_mode: str = "ordinary", **environment: str):
         repo, rev = git_repository(self.base, {
             "Cargo.toml": (manifest, False),
             "src/main.rs": ('fn main() {}\n', False),
@@ -555,7 +591,7 @@ class ToolBuildTests(unittest.TestCase):
         targo.write_text(targo_script)
         os.chmod(targo, 0o755)
         cache = self.base / "xdg" / "clean-cli"
-        admission = GATE.heavy_gate_admission(tool, repo)
+        admission = GATE.heavy_gate_admission(tool, repo, cpu_mode)
         with mock.patch.object(GATE, "resolve_targo", return_value=targo), \
                 mock.patch.dict(os.environ, environment), contextlib.redirect_stdout(io.StringIO()):
             return GATE.obtain_build(tool, cache, repo, True, admission), cache, rev
@@ -565,11 +601,48 @@ class ToolBuildTests(unittest.TestCase):
         self.assertEqual((identity["cache"], identity["banner"], identity["rev"]), ("cold", "clean 0.9.0", rev))
         self.assertEqual(identity["schema"], "trust-cg.clean-cli-build.v2")
         weight = f'auto:x86-icmp-clean-build-cold:{GATE.TOOL_BUILD_FALLBACK_GB["clean"]}'
-        self.assertEqual(identity["admission"], ["run", weight, f"x86-icmp-clean-{rev[:12]}"])
+        self.assertEqual(identity["admission"][:6],
+                         [str(self.cpu_gate), "--cpus", "2", "--mem-gb", "40", "--"])
+        self.assertEqual(identity["admission"][7:], ["run", weight, f"x86-icmp-clean-{rev[:12]}", "--"])
         self.assertEqual(identity["recipe"]["cargo_config"], "export's own .cargo/config.toml")
         admissions = list(cache.glob("build-*/admissions.log"))
         self.assertEqual(len(admissions), 1, admissions)
         self.assertEqual(admissions[0].read_text(), f"admitted {weight} x86-icmp-clean-{rev[:12]}\n")
+        cpu = next(cache.glob("build-*/cpu-admissions.log"))
+        self.assertEqual(cpu.read_text(), "cpu ordinary 2 40\n")
+
+    def test_exclusive_tool_build_is_explicit_and_retains_the_memory_gate(self):
+        identity, cache, _ = self.cold_clean(cpu_mode="exclusive")
+        self.assertEqual(identity["admission"][-7:],
+                         [str(self.cpu_gate), "--exclusive", "--cpus", "2", "--mem-gb", "40", "--"])
+        self.assertEqual(identity["admission"][1], "run")
+        self.assertEqual(identity["admission"][4], "--")
+        self.assertEqual(next(cache.glob("build-*/cpu-admissions.log")).read_text(), "cpu exclusive 2 40\n")
+        self.assertEqual(len(list(cache.glob("build-*/admissions.log"))), 1)
+
+    def test_missing_tool_cpu_admission_refuses_before_export_or_compilation(self):
+        with mock.patch.object(GATE.shutil, "which", return_value=None), \
+                mock.patch.object(GATE, "source_with") as source, \
+                mock.patch.object(GATE, "run_admitted_build") as launch:
+            with self.assertRaises(GATE.MissingInput) as raised:
+                GATE.heavy_gate_admission(self.clean, None)(self.clean, "cold", self.base)
+        self.assertEqual(raised.exception.code, "build-slot-missing")
+        source.assert_not_called()
+        launch.assert_not_called()
+
+    def test_unknown_tool_cpu_admission_never_selects_another_mode(self):
+        with self.assertRaises(GATE.Finding) as raised:
+            GATE.heavy_gate_admission(self.clean, None, "unsupported")(self.clean, "cold", self.base)
+        self.assertEqual(raised.exception.code, "tool-build-admission-invalid")
+
+    def test_tool_cpu_refusal_does_not_launch_memory_gate_or_fall_back(self):
+        with self.assertRaises(GATE.Finding) as raised:
+            self.cold_clean(FIXTURE_CPU_GATE_REFUSE="1")
+        self.assertEqual(raised.exception.code, "clean-build-failed")
+        self.assertIn("CPU admission refused (fixture)", raised.exception.message)
+        cache = self.base / "xdg/clean-cli"
+        self.assertEqual(list(cache.glob("build-*/admissions.log")), [])
+        self.assertEqual(next(cache.glob("build-*/cpu-admissions.log")).read_text(), "cpu ordinary 2 40\n")
 
     def test_resume_revalidates_source_and_runs_the_normal_command_preserving_failed_outputs(self):
         identity, cache, rev = self.cold_clean()
@@ -754,7 +827,21 @@ class QueryDumpTests(unittest.TestCase):
         self.script.chmod(0o755)
 
     def run_dump(self, **environment: str) -> None:
+        # These payloads are stand-ins, not compiler jobs. Preserve the real
+        # descendant supervisor while isolating the separately tested machine
+        # admission prefix from host capacity and unrelated live work.
+        original_run, original_which = GATE.run_admitted_build, shutil.which
+
+        def fixture_run(command, *arguments):
+            self.assertEqual(command[:6], ["/fixture/build-slot", "--cpus", "2", "--mem-gb", "40", "--"])
+            return original_run(command[6:], *arguments)
+
+        def which(name, *arguments, **keywords):
+            return "/fixture/build-slot" if name == "build-slot" else original_which(name, *arguments, **keywords)
+
         with mock.patch.object(GATE, "ROOT", self.base), \
+                mock.patch.object(GATE.shutil, "which", side_effect=which), \
+                mock.patch.object(GATE, "run_admitted_build", side_effect=fixture_run), \
                 mock.patch.dict(os.environ, environment), contextlib.redirect_stdout(io.StringIO()):
             GATE.dump_queries(self.out)
 
@@ -1022,6 +1109,8 @@ args = sys.argv[1:]
 assert "--strict-proofs" in args, args
 proof = Path(args[args.index("--proof") + 1])
 query = Path(args[args.index("-smt2") + 1]).read_text()
+if mode == "mutate-query":
+    Path(args[args.index("-smt2") + 1]).write_text("changed by candidate\\n")
 if mode == "sat" or "SAT-ME" in query:
     print("sat"); sys.exit(0)
 hole = mode == "hole"
@@ -1038,6 +1127,8 @@ import json, sys
 from pathlib import Path
 mode = Path({mode!r}).read_text().strip()
 certificate = json.loads(Path(sys.argv[3]).read_text())
+if mode == "mutate-query":
+    assert "changed by candidate" not in certificate["problem"], "checker received mutated problem"
 assert sys.argv[1:3] == ["cert", "verify-external"] and sys.argv[4] == "--verbose", sys.argv
 if mode == "reject" or ":rule hole" in certificate["proof"]:
     print("External certificate verification: FAILED")
@@ -1123,6 +1214,102 @@ class GateRunTests(unittest.TestCase):
         self.assertEqual((report["ay"]["cache"], report["clean"]["cache"]), ("warm", "warm"))
         self.assertEqual(report["rule"]["clean"]["rev"], CLEAN_REV)
         self.assertEqual({row["clean_exit"] for row in report["cells"]}, {0})
+
+    def candidate_flags(self) -> tuple[str, ...]:
+        candidate = self.rule["ay"]._replace(rev=OTHER, certifying_sha256=())
+        seed_slot(self.ay_cache, candidate, self.payload["ay"], f"ay 0.27.0+build.0.{OTHER}@fixture")
+        return ("recertify-ay", "--candidate-ay-rev", OTHER, "--candidate-ay-version", "0.27.0")
+
+    def test_candidate_recertification_keeps_compiled_authority_and_never_passes_the_gate(self):
+        original = copy.deepcopy(self.manifest)
+        code, report = self.run_gate(*self.candidate_flags())
+        self.assertEqual(code, GATE.EXIT_RECERTIFIED, report["findings"])
+        self.assertNotEqual(code, GATE.EXIT_PASS)
+        self.assertEqual(report["schema"], GATE.RECERTIFICATION_SCHEMA)
+        self.assertFalse(report["gate_passed"])
+        self.assertEqual(report["queries"], {"source": "regenerated"})
+        self.assertEqual(report["rule"]["ay"]["rev"], AY)
+        self.assertEqual(report["ay_rev"], AY)
+        self.assertEqual(report["candidate_rule"]["ay"]["rev"], OTHER)
+        self.assertEqual(report["candidate_rule"]["ay"]["certifying_sha256"], [])
+        self.assertFalse(report["ay"]["certifying_bytes"])
+        self.assertEqual(report["recertified_ay"]["certifying_sha256"], [self.digest["ay"]])
+        self.assertEqual(len(report["cells"]), 4)
+        self.assertEqual(self.manifest, original)
+        for key in original["certificate_rule"]:
+            if key != "ay":
+                self.assertEqual(report["candidate_rule"][key], report["rule"][key])
+
+    def test_candidate_recertification_cannot_borrow_a_matching_candidate_pin(self):
+        code, report = self.run_gate(*self.candidate_flags(), lock_ay=OTHER)
+        self.assertEqual(code, GATE.EXIT_FAIL)
+        self.assertIn("ay-pin-differs-from-rule", self.codes(report))
+        self.assertNotIn("candidate_rule", report)
+        self.assertNotIn("recertified_ay", report)
+
+    def test_candidate_retains_strict_proof_and_checker_refusals(self):
+        flags = self.candidate_flags()
+        for mode, expected in [("sat", "ay-not-unsat"), ("hole", "proof-hole"),
+                               ("lia", "proof-unchecked-rule"), ("reject", "clean-not-fully-verified")]:
+            with self.subTest(mode=mode):
+                self.mode(mode)
+                code, report = self.run_gate(*flags)
+                self.assertEqual(code, GATE.EXIT_FAIL)
+                self.assertIn(expected, self.codes(report))
+                self.assertNotIn("recertified_ay", report)
+
+    def test_missing_candidate_tools_cannot_fall_back_to_the_compiled_solver(self):
+        code, report = self.run_gate("recertify-ay", "--candidate-ay-rev", OTHER,
+                                     "--candidate-ay-version", "0.27.0")
+        self.assertEqual(code, GATE.EXIT_FAIL)
+        self.assertTrue(report["missing"])
+        self.assertNotIn("recertified_ay", report)
+        self.assertEqual(report["cells"], [])
+
+    def test_candidate_refuses_a_changed_canonical_query_digest(self):
+        flags = self.candidate_flags()
+        target = next(c for c in self.manifest["cells"] if c["ground"] == "certificate")
+        path = self.queries / target["query_file"]
+        path.write_text(path.read_text() + "; changed\n")
+        code, report = self.run_gate(*flags)
+        self.assertEqual(code, GATE.EXIT_FAIL)
+        self.assertIn("query-digest-mismatch", self.codes(report))
+        self.assertNotIn("recertified_ay", report)
+
+    def test_candidate_cannot_substitute_a_query_while_minting_its_proof(self):
+        flags = self.candidate_flags()
+        self.mode("mutate-query")
+        code, report = self.run_gate(*flags)
+        self.assertEqual(code, GATE.EXIT_FAIL)
+        self.assertIn("query-changed-during-run", self.codes(report))
+        self.assertNotIn("recertified_ay", report)
+        self.assertTrue(report["cells"])
+        # The checker still received the original pinned problem. The source
+        # input mutation, independently, must prevent a candidate receipt.
+        self.assertEqual({row["clean_exit"] for row in report["cells"]}, {0})
+
+    def test_candidate_options_are_not_available_to_check_or_tools_path(self):
+        for command in ("check", "tools-path"):
+            with self.subTest(command=command), contextlib.redirect_stderr(io.StringIO()), \
+                    mock.patch.object(GATE, "run_gate") as run:
+                with self.assertRaises(SystemExit) as raised:
+                    GATE.main([command, "--candidate-ay-rev", OTHER, "--candidate-ay-version", "0.27.0"])
+                self.assertEqual(raised.exception.code, GATE.EXIT_USAGE)
+                run.assert_not_called()
+
+    def test_candidate_requires_exact_identity_and_regenerated_inputs(self):
+        cases = [[], ["--candidate-ay-rev", OTHER],
+                 ["--candidate-ay-rev", "main", "--candidate-ay-version", "0.27.0"],
+                 ["--candidate-ay-rev", OTHER, "--candidate-ay-version", "^0.27"],
+                 ["--candidate-ay-rev", OTHER, "--candidate-ay-version", "0.27.0",
+                  "--queries", str(self.queries)]]
+        for flags in cases:
+            with self.subTest(flags=flags), contextlib.redirect_stderr(io.StringIO()), \
+                    mock.patch.object(GATE, "run_gate") as run:
+                with self.assertRaises(SystemExit) as raised:
+                    GATE.main(["recertify-ay", *flags])
+                self.assertEqual(raised.exception.code, GATE.EXIT_USAGE)
+                run.assert_not_called()
 
     def test_other_bytes_of_the_rules_revisions_pass_and_say_so(self):
         self.manifest["certificate_rule"]["clean"]["certifying_sha256"] = ["0" * 64]

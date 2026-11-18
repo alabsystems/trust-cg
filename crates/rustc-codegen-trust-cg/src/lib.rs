@@ -578,6 +578,9 @@ struct X86CertificateFreeSwitches {
     select_flag_fusion_disabled: bool,
     sumq_register_seed_disabled: bool,
     loop_align_relocate_contained: bool,
+    leaf_frame_elision_disabled: bool,
+    o2_fixpoint_disabled: bool,
+    imul_certificate_free_reductions_disabled: bool,
 }
 
 /// Decide [`X86CertificateFreeSwitches`] from the knob reader `enabled`
@@ -612,7 +615,42 @@ fn x86_certificate_free_switches(
                 enabled(knobs::NO_X86_LOOP_ALIGN_RELOCATE_CONTAINED),
                 proof_certificates,
             ),
+        leaf_frame_elision_disabled: trust_cg_codegen::x86_leaf_frame_elision_withheld(
+            enabled(knobs::NO_X86_LEAF_FRAME_ELISION),
+            proof_certificates,
+        ),
+        o2_fixpoint_disabled: trust_cg_codegen::x86_o2_fixpoint_withheld(
+            enabled(knobs::NO_X86_O2_FIXPOINT),
+            proof_certificates,
+        ),
+        imul_certificate_free_reductions_disabled:
+            trust_cg_codegen::x86_imul_certificate_free_reductions_withheld(
+                enabled(knobs::NO_X86_IMUL_CERTIFICATE_FREE_REDUCTIONS),
+                proof_certificates,
+            ),
     })
+}
+
+/// The O2 machine-pass iteration bound the bridge installs: 1 (the single
+/// pass) when the fixpoint is withheld or opted out, else the value of
+/// `x86-o2-fixpoint-iterations`, or the O3 bound when it is absent. A value
+/// that is not an integer from 1 to the O3 bound is refused, never clamped.
+fn x86_o2_fixpoint_iterations(disabled: bool, raw: Option<&str>) -> Result<u32, String> {
+    if disabled {
+        return Ok(1);
+    }
+    let max = trust_cg_codegen::X86_O2_FIXPOINT_MAX_ITERATIONS;
+    match raw {
+        None => Ok(max),
+        Some(value) => match value.trim().parse::<u32>() {
+            Ok(n) if (1..=max).contains(&n) => Ok(n),
+            _ => Err(format!(
+                "`-Ztrust-ir-cg-args` knob `{}` was given `{value}`, which is not an integer \
+                 from 1 to {max}",
+                knobs::X86_O2_FIXPOINT_ITERATIONS
+            )),
+        },
+    }
 }
 
 /// The value of `x86-rowreg-gpr-accumulators`, or the bridge default when it
@@ -1126,6 +1164,23 @@ fn install_knob_backed_library_settings(jcc_align_disabled_by_target: bool) -> R
         trust_cg_codegen::set_x86_loop_align_relocate_contained(
             switches.loop_align_relocate_contained,
         ),
+    )?;
+    knobs::require_compatible_policy(
+        knobs::NO_X86_LEAF_FRAME_ELISION,
+        trust_cg_codegen::set_x86_leaf_frame_elision_disabled(switches.leaf_frame_elision_disabled),
+    )?;
+    knobs::require_compatible_policy(
+        knobs::NO_X86_IMUL_CERTIFICATE_FREE_REDUCTIONS,
+        trust_cg_codegen::set_x86_imul_certificate_free_reductions_disabled(
+            switches.imul_certificate_free_reductions_disabled,
+        ),
+    )?;
+    knobs::require_compatible_policy(
+        knobs::X86_O2_FIXPOINT_ITERATIONS,
+        trust_cg_codegen::set_x86_o2_fixpoint_iterations(x86_o2_fixpoint_iterations(
+            switches.o2_fixpoint_disabled,
+            knobs::raw(knobs::X86_O2_FIXPOINT_ITERATIONS),
+        )?),
     )?;
     knobs::require_compatible_policy(
         knobs::X86_ROWREG_PACKED_MUL,
@@ -10484,14 +10539,84 @@ fn backend_opt_level(rustc_opt_level: OptLevel) -> OptLevel {
 /// `-Ztrust-ir-cg-args=box-deref-named-premise` selects trust-ir's
 /// named-premise floor, and with it the report every admission is recorded in
 /// (`box_deref_disclosure`), which the lane prints.
+/// `-Ztrust-ir-cg-args=box-deref-locally-rederived` selects trust-cg's
+/// `LocallyRederived` floor, which admits only a BoxDeref whose every conjunct
+/// trust-cg re-derives itself; the named-premise floor, a superset, wins when
+/// both are set (`CodegenLicensePolicy::box_validity_floor`).
 fn in_process_mir_lane_license() -> trust_cg_codegen::CodegenLicensePolicy {
-    let license = trust_cg_codegen::CodegenLicensePolicy::default()
+    in_process_mir_lane_license_with(
+        crate::knobs::is_enabled(crate::knobs::BOX_DEREF_LOCALLY_REDERIVED),
+        box_deref_disclosure::report(),
+    )
+}
+
+/// [`in_process_mir_lane_license`] with the two Box deref opt-ins as
+/// arguments, so the floor each selects is pinned by a test.
+fn in_process_mir_lane_license_with(
+    box_locally_rederived: bool,
+    box_named_premise: Option<&trust_cg_lower::BoxDerefDisclosure>,
+) -> trust_cg_codegen::CodegenLicensePolicy {
+    let mut license = trust_cg_codegen::CodegenLicensePolicy::default()
         .with_unlicensed_permit_exception(
             trust_cg_codegen::UnlicensedPermitException::InProcessMirLane,
         );
-    match box_deref_disclosure::report() {
+    if box_locally_rederived {
+        license = license.with_locally_rederived_box_floor();
+    }
+    match box_named_premise {
         Some(report) => license.with_named_premise_box_floor(report),
         None => license,
+    }
+}
+
+#[cfg(test)]
+mod in_process_box_floor_tests {
+    use super::in_process_mir_lane_license_with;
+    use trust_cg_lower::{BoxDerefDisclosure, BoxValidityFloor};
+
+    /// Each Box deref opt-in selects exactly its floor and the default selects
+    /// `Refuse`; the named-premise floor (a superset) wins over the
+    /// locally-rederived one.
+    #[test]
+    fn each_box_deref_opt_in_selects_its_floor_and_absent_refuses() {
+        let report = BoxDerefDisclosure::new();
+        assert_eq!(
+            in_process_mir_lane_license_with(false, None).box_validity_floor(),
+            BoxValidityFloor::Refuse
+        );
+        assert_eq!(
+            in_process_mir_lane_license_with(true, None).box_validity_floor(),
+            BoxValidityFloor::LocallyRederived
+        );
+        assert_eq!(
+            in_process_mir_lane_license_with(false, Some(&report)).box_validity_floor(),
+            BoxValidityFloor::NamedPremise
+        );
+        assert_eq!(
+            in_process_mir_lane_license_with(true, Some(&report)).box_validity_floor(),
+            BoxValidityFloor::NamedPremise
+        );
+    }
+
+    /// The PRODUCTION entry with no Box knob given selects `Refuse` and keeps
+    /// the license identity without a floor token. This unit-test process
+    /// installs no knob table, so the knob reader answers the default lane; a
+    /// wiring change that passed `true` or read the wrong knob would lower the
+    /// default floor and fail here, where the `_with` test above cannot see it.
+    #[test]
+    fn the_production_entry_refuses_box_derefs_when_no_knob_is_given() {
+        assert_eq!(
+            crate::knobs::raw(crate::knobs::BOX_DEREF_LOCALLY_REDERIVED),
+            None
+        );
+        assert_eq!(
+            crate::knobs::raw(crate::knobs::BOX_DEREF_NAMED_PREMISE),
+            None
+        );
+        let license = super::in_process_mir_lane_license();
+        assert_eq!(license.box_validity_floor(), BoxValidityFloor::Refuse);
+        let identity = license.canonical_identity();
+        assert!(!identity.contains("box_validity_floor"), "{identity}");
     }
 }
 
@@ -38675,6 +38800,29 @@ fn store_operand_into_memory_at<'tcx>(
     // channel is closed BY CONSTRUCTION rather than by Drop-elaboration accident.
     {
         let stored_ty = ctx.monomorphize_ty(field_ty);
+        // The admitted inline header (`collection_field_header_ty`): the stored
+        // VALUE is the source header's 24 BYTES, copied from a place — a
+        // real-header local's own slot, or another inline field — never the
+        // source's slot address. `Copy` and `Move` are both MIR's bitwise copy
+        // of the place (optimized MIR spells a last use of a non-`Copy` Vec as
+        // `copy _v`); which of the two places is dropped afterwards is the
+        // MIR's ownership, unchanged here. A constant or any other source keeps
+        // the refusal below.
+        if let Some(header) = collection_field_header_ty(ctx.tcx, stored_ty)? {
+            if let Operand::Copy(src) | Operand::Move(src) = operand {
+                let src_addr = if src.projection.is_empty() {
+                    let src_ty = ctx.monomorphize_ty(local_rust_ty(ctx, body, src.local));
+                    (src_ty == stored_ty && local_is_real_collection_header(ctx, src.local))
+                        .then(|| memory_slot_ptr(ctx, src.local))
+                        .transpose()?
+                } else {
+                    collection_field_place_address(ctx, body, block, src)?
+                };
+                if let Some(src_addr) = src_addr {
+                    return copy_slot_bytes(ctx, block, src_addr, 0, dst_ptr, offset, header.size);
+                }
+            }
+        }
         if vec_element_ty(ctx.tcx, stored_ty).is_some()
             || is_string_ty(ctx.tcx, stored_ty)
             || btreemap_kv_ty(ctx.tcx, stored_ty).is_some()
@@ -42312,6 +42460,18 @@ fn lower_scalar_ref<'tcx>(
         mir::BorrowKind::Mut { .. } => true,
     };
 
+    // `&(…).v` / `&mut (*r).v` of a Vec/String field held inline by its
+    // memory-backed container: a `&Vec`/`&String` is the header's address, and
+    // the header is the 24 bytes at the field's rustc-layout offset. The
+    // destination must be a THIN reference.
+    if is_thin_pointer_ref_ty(
+        ctx.tcx,
+        ctx.monomorphize_ty(local_rust_ty(ctx, body, place.local)),
+    ) {
+        if let Some(addr) = collection_field_place_address(ctx, body, block, source)? {
+            return bind_reference_address(ctx, body, block, place.local, addr);
+        }
+    }
     if let Some(leaf_ty) = scalar_wrapper_closure_projection(ctx, body, source)? {
         let cell = exclusive_scalar_cell(&ctx.scalar_cells, &ctx.memory_slots, source.local)
             .ok_or_else(|| "closure wrapper borrow has no exclusive scalar cell".to_owned())?
@@ -62951,6 +63111,11 @@ fn lower_vec_drop<'tcx>(
         // This is the actual pointer into the caller's inline header, not a
         // forwarding cell or a scalar synthesized from the MIR local number.
         memory_aggregate_ref_base(ctx, body, block, place)?
+    } else if let Some(addr) = collection_field_place_address(ctx, body, block, place)? {
+        // A Vec/String FIELD held inline by its memory-backed container
+        // (`collection_field_header_ty`): its header is the 24 bytes at the
+        // field's rustc-layout address, so the free reads `{ptr, cap}` there.
+        addr
     } else {
         return Err("TerminatorKind::Drop of a projected Vec place".to_owned());
     };
@@ -90924,6 +91089,14 @@ fn lower_slice_contains_call<'tcx>(
     // use IEEE equality, and bool/char/aggregate `PartialEq` remains unmodeled.
     let is_float = element_ty.is_floating_point();
     if !is_integer(element_ty) && !is_float {
+        // Where a capturing terminal closure is admitted, core's own body
+        // (`SliceContains::slice_contains`, `self.iter().any(|y| *y == *x)`,
+        // calling the element's real `PartialEq`) lowers instead: step aside
+        // to it. Elsewhere that body would refuse anyway; keep the named
+        // refusal.
+        if terminal_capturing_closure_target(ctx.tcx) {
+            return Ok(false);
+        }
         return Err(format!(
             "<[{element_ty:?}]>::contains over a non-integer/non-float element is not modeled \
              (its PartialEq is not a raw integer or IEEE compare) — fail closed"
@@ -95841,11 +96014,8 @@ fn parse_fmt_template(template: &[u8]) -> Option<Vec<FmtPiece>> {
 }
 
 /// Whether the `_print`/`_eprint` call whose `fmt::Arguments` is `args_local`
-/// is lowered as the REAL std call instead of being synthesized: on x86-64
-/// Linux (the target this fallback was measured on against LLVM) when
-/// `print_interception_synthesizes` does not hold. Every other target keeps
-/// the interception's previous behaviour, where such a call refuses
-/// (`[TCG-FMT-DECLINED]`, `[TCG-FMT-ARGPLACE]` or the template refusal).
+/// is lowered as the ordinary std call on a supported target when the
+/// interception cannot synthesize its formatter.
 fn print_falls_back_to_std<'tcx>(
     ctx: &MirLoweringCtx<'tcx>,
     body: &Body<'tcx>,
@@ -95872,9 +96042,9 @@ fn print_falls_back_to_std<'tcx>(
 //   byte counts typed `u32` against `usize`), and 11 of the 13
 //   `tests/wasm32_differential.rs` tests fail the same way before this lane,
 //   so nothing could be executed. An unexercised admission is not taken.
-// * AArch64 Darwin is NOT admitted: its bridge gate
-//   (`scripts/check_darwin_aarch64_bridge.py`) pins per-suite refusal counts
-//   that could change, and no Darwin run measured them.
+// * AArch64 Darwin admission is per predicate. The Darwin bridge gate
+//   (`scripts/check_darwin_aarch64_bridge.py`) tracks the associated
+//   native execution and refusal census.
 // * RISC-V: the bridge has no RISC-V session target at all
 //   (`trust_cg_target_for_session` refuses it), so none applies.
 //
@@ -95887,11 +96057,10 @@ fn linux_x86_64_or_aarch64(tcx: TyCtxt<'_>) -> bool {
         && tcx.sess.target.os == rustc_target::spec::Os::Linux
 }
 
-/// The `print!` std fallback (`print_falls_back_to_std`): x86-64 Linux
-/// (executed) and AArch64 Linux (compiled). Not AArch64 Darwin: the Darwin
-/// gate pins a `TCG-FMT-DECLINED` count in its `strings_format` suite.
+/// Targets of the real standard-library print fallback.
 fn print_std_fallback_target(tcx: TyCtxt<'_>) -> bool {
     linux_x86_64_or_aarch64(tcx)
+        || (tcx.sess.target.arch.desc() == "aarch64" && tcx.sess.target.os == rustc_target::spec::Os::MacOs)
 }
 
 /// An aggregate-to-aggregate `Transmute` whose endpoint is a non-scalar union
@@ -95927,6 +96096,177 @@ fn slice_element_newtype_borrow_target(tcx: TyCtxt<'_>) -> bool {
 /// (`compute_scalar_cell_locals`' aggregate-stored pass): x86-64 Linux and
 /// AArch64 Linux.
 fn aggregate_stored_reference_cell_target(tcx: TyCtxt<'_>) -> bool {
+    linux_x86_64_or_aarch64(tcx)
+}
+
+/// An owned Global `Vec<T>` (no-drop `T`) or `String` FIELD of a memory-backed
+/// aggregate, held as its checked 24-byte rustc header image
+/// (`collection_field_header_ty`): x86-64 Linux (executed) and AArch64 Linux
+/// (compiled). Every other target keeps `[TCG-COLLECTION-IMAGE]`.
+fn collection_field_image_target(tcx: TyCtxt<'_>) -> bool {
+    linux_x86_64_or_aarch64(tcx)
+}
+
+/// The checked header layout of `ty` when it is a collection the containing
+/// aggregate lane holds INLINE as a byte image: `collection_field_image_target`
+/// holds, `ty` is a modeled Global `Vec<T>` whose element needs no drop, or a
+/// `String`, and its rustc header is the bridge's checked 24-byte image
+/// (`real_vec_string_header_layout`, which reads every field offset from
+/// rustc's layout; on the admitted targets that is `cap`, then `ptr`, then
+/// `len`, matching `VEC_FIELD_CAP`/`VEC_FIELD_PTR`/`VEC_FIELD_LEN`). `None`
+/// for every other type (maps, custom allocators, droppable elements, other
+/// targets), which keep their refusals.
+fn collection_field_header_ty<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    ty: Ty<'tcx>,
+) -> Result<Option<MemoryAggregateLayout>, String> {
+    if !collection_field_image_target(tcx) {
+        return Ok(None);
+    }
+    let element_needs_drop = match vec_element_ty(tcx, ty) {
+        Some(element) => element.needs_drop(tcx, ty::TypingEnv::fully_monomorphized()),
+        None if is_string_ty(tcx, ty) => false,
+        None => return Ok(None),
+    };
+    if element_needs_drop {
+        return Ok(None);
+    }
+    real_vec_string_header_layout(tcx, ty)
+}
+
+/// Whether the memory-backed aggregate `ty` holds, at any nesting depth of its
+/// struct / enum / tuple / array fields, a Vec/String header INLINE
+/// (`collection_field_header_ty`), with `memory_aggregate_layout(ty)` `Some`.
+/// Such a type has exactly one representation: its rustc-layout byte image.
+/// The declaration-order scalarized flattening (`Vec`-as-`Ptr` lane, the
+/// header's frame-slot ADDRESS) is a different value of the same type, so every
+/// local of it is memory-backed (`compute_memory_backed_locals`) and every
+/// field access through a reference to it takes the rustc-layout walker
+/// (`memory_aggregate_ref_pointee`, `memory_aggregate_address_taken_needs_slot`).
+fn aggregate_holds_inline_collection_header<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    ty: Ty<'tcx>,
+) -> Result<bool, String> {
+    fn walk<'tcx>(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>, depth: u32) -> Result<bool, String> {
+        if depth > 16 {
+            return Err(format!(
+                "[TCG-COLLECTION-IMAGE] field nesting of {ty:?} is deeper than 16"
+            ));
+        }
+        if collection_field_header_ty(tcx, ty)?.is_some() {
+            return Ok(true);
+        }
+        let env = ty::TypingEnv::fully_monomorphized();
+        match ty.kind() {
+            ty::Adt(adt, args) if !adt.is_union() => {
+                for field in adt.all_fields() {
+                    let field_ty = tcx.normalize_erasing_regions(env, field.ty(tcx, *args));
+                    if walk(tcx, field_ty, depth + 1)? {
+                        return Ok(true);
+                    }
+                }
+                Ok(false)
+            }
+            ty::Tuple(elems) => {
+                for elem in elems.iter() {
+                    if walk(tcx, elem, depth + 1)? {
+                        return Ok(true);
+                    }
+                }
+                Ok(false)
+            }
+            ty::Array(elem, _) => walk(tcx, *elem, depth + 1),
+            _ => Ok(false),
+        }
+    }
+    if !collection_field_image_target(tcx) || collection_field_header_ty(tcx, ty)?.is_some() {
+        return Ok(false);
+    }
+    if !matches!(memory_aggregate_layout_shared(tcx, ty), Ok(Some(_))) {
+        return Ok(false);
+    }
+    walk(tcx, ty, 0)
+}
+
+/// The byte ADDRESS of a `[Deref,] Field/Downcast…` place whose leaf is a Vec /
+/// String header held inline by its memory-backed container
+/// (`collection_field_header_ty`), or `None` when the place is not that shape.
+///
+/// The container must be memory-backed AS A WHOLE TYPE
+/// (`memory_aggregate_layout` is `Some`, so every value of it, wherever it
+/// lives, is the rustc-layout byte image — never a declaration-order
+/// scalarized materialization whose collection lane is a frame-slot `Ptr`):
+/// a memory-slot local walked from its slot, or the pointee of a bound thin
+/// `&`/`&mut`/raw pointer. Every step is a `Field` or `Downcast` resolved by
+/// `walk_memory_projection_offset_raw` through rustc's `layout_of`; an index,
+/// subslice or mid-chain `Deref` is not this shape. The walked leaf type must
+/// be the place's own type.
+fn collection_field_place_address<'tcx>(
+    ctx: &mut MirLoweringCtx<'tcx>,
+    body: &Body<'tcx>,
+    block: &mut Block,
+    place: &Place<'tcx>,
+) -> Result<Option<ValueId>, String> {
+    let projection = place.projection.as_ref();
+    let (lead_deref, steps) = match projection {
+        [ProjectionElem::Deref, rest @ ..] => (true, rest),
+        rest => (false, rest),
+    };
+    if steps.is_empty()
+        || !steps
+            .iter()
+            .all(|p| matches!(p, ProjectionElem::Field(..) | ProjectionElem::Downcast(..)))
+        || !steps.iter().any(|p| matches!(p, ProjectionElem::Field(..)))
+    {
+        return Ok(None);
+    }
+    let leaf_ty = ctx.monomorphize_ty(place_rust_ty(ctx, body, place));
+    if collection_field_header_ty(ctx.tcx, leaf_ty)?.is_none() {
+        return Ok(None);
+    }
+    let local_ty = ctx.monomorphize_ty(local_rust_ty(ctx, body, place.local));
+    let container_ty = if lead_deref {
+        let Some(pointee) = local_ty.builtin_deref(true) else {
+            return Ok(None);
+        };
+        if !is_thin_pointer_ref_ty(ctx.tcx, local_ty) && !matches!(local_ty.kind(), ty::RawPtr(..))
+        {
+            return Ok(None);
+        }
+        ctx.monomorphize_ty(pointee)
+    } else {
+        if !ctx.memory_slots.contains_key(&place.local) {
+            return Ok(None);
+        }
+        local_ty
+    };
+    if memory_aggregate_layout(ctx.tcx, container_ty)?.is_none() {
+        return Ok(None);
+    }
+    let (offset, walked) = walk_memory_projection_offset_raw(ctx, container_ty, projection)?;
+    if ctx.monomorphize_ty(walked) != leaf_ty {
+        return Err(format!(
+            "[TCG-COLLECTION-IMAGE] collection field walk reached {walked:?}, not the place's \
+             {leaf_ty:?}"
+        ));
+    }
+    let base = if lead_deref {
+        memory_aggregate_ref_base(ctx, body, block, place)?
+    } else {
+        memory_slot_ptr(ctx, place.local)?
+    };
+    if offset == 0 {
+        return Ok(Some(coerce_to_plain_ptr(ctx, block, base)));
+    }
+    Ok(Some(iter_field_addr(ctx, block, base, offset)))
+}
+
+/// A CAPTURING closure handed to an intercepted iterator terminal
+/// (`find`/`position`/`any`/`all`/`min_by`/`max_by`/`min_by_key`/`max_by_key`
+/// in `lower_iter_terminal`), called through a private copy of its
+/// environment (`terminal_closure_env`): x86-64 Linux (executed) and AArch64
+/// Linux (compiled). Every other target keeps the ZST-only refusal.
+fn terminal_capturing_closure_target(tcx: TyCtxt<'_>) -> bool {
     linux_x86_64_or_aarch64(tcx)
 }
 
@@ -109345,6 +109685,98 @@ fn emit_closure_call_1<'tcx>(
     emit_closure_call_n(ctx, block, closure_ty, env_ptr, vec![arg], output_ir)
 }
 
+/// The environment a synthesized iterator terminal (`lower_iter_terminal`)
+/// passes to a CAPTURING closure: a private copy of the closure operand's
+/// bytes, taken once before the drive.
+///
+/// std's terminal owns `f` (it is moved in) and calls it by `&mut f` /
+/// `&f` for every item, so an `FnMut` body's writes to its by-value upvars
+/// must persist from one item to the next — they do, in this one copy — and
+/// must never reach the caller's closure local, which a `Copy` operand
+/// leaves live (they cannot: the caller's slot is only read here).
+///
+/// Refused (the terminal fails closed) unless: the closure is not `FnOnce`
+/// (an `FnOnce` body takes its environment by value; std's `find`/`any`/...
+/// bounds exclude it, so this is a net), the closure has a flat-slot layout
+/// (`closure_memory_layout`, which refuses an upvar it cannot place), and the
+/// operand is an unprojected place whose local has a memory slot (rule (6) of
+/// `compute_memory_backed_locals` gives every such closure local one). A
+/// closure environment that needs drop never reaches this point:
+/// `closure_body_instance` refuses it at every call this drive emits
+/// (`[TCG-CLOSURE-DROP]`).
+fn terminal_closure_env<'tcx>(
+    ctx: &mut MirLoweringCtx<'tcx>,
+    block: &mut Block,
+    operand: &Operand<'tcx>,
+    closure_ty: Ty<'tcx>,
+    name: &str,
+) -> Result<ValueId, String> {
+    let ty::Closure(_, closure_args) = closure_ty.kind() else {
+        return Err(format!("iterator {name} payload is not a closure"));
+    };
+    if closure_args.as_closure().kind() == ty::ClosureKind::FnOnce {
+        return Err(format!(
+            "iterator {name} with an FnOnce capturing closure is not modeled (its body \
+             takes the environment by value)"
+        ));
+    }
+    let Some(layout) = closure_memory_layout(ctx.tcx, closure_ty)? else {
+        return Err(format!(
+            "iterator {name} capturing closure has no flat-slot environment layout"
+        ));
+    };
+    // 8-byte lanes, as every iterator state slot (`copy_iter_state_to_private_slot`),
+    // aligned to the environment's own alignment when that is larger.
+    let new_env_slot = |ctx: &mut MirLoweringCtx<'tcx>, block: &mut Block| {
+        let lanes = layout.size.div_ceil(8).max(1);
+        let count = emit_i64_const(ctx, block, i128::from(lanes));
+        let copy = ctx.fresh_value();
+        block.body.push(
+            InstrNode::new(Inst::Alloca {
+                ty: TrustIrTy::I64,
+                count: Some(count),
+                align: Some(layout.align.max(8)),
+            })
+            .with_result(copy),
+        );
+        copy
+    };
+    match operand {
+        // A closure whose upvars rustc folded to a constant (`move |x| { n += x;
+        // .. }` with `n = 0`): its environment is the constant's byte image,
+        // written by the shared const-aggregate writer, which declines a
+        // provenance-carrying or mistyped constant (refused here).
+        Operand::Constant(_) => {
+            let copy = new_env_slot(ctx, block);
+            if !store_const_aggregate_bytes_into_memory_at(
+                ctx, block, copy, 0, closure_ty, operand,
+            )? {
+                return Err(format!(
+                    "iterator {name} constant capturing closure has no plain byte image"
+                ));
+            }
+            Ok(copy)
+        }
+        Operand::Copy(src) | Operand::Move(src) => {
+            if !src.projection.is_empty() {
+                return Err(format!("iterator {name} closure argument is projected"));
+            }
+            let src_slot = ctx
+                .memory_slots
+                .get(&src.local)
+                .cloned()
+                .ok_or_else(|| format!("iterator {name} capturing closure is not memory-backed"))?
+                .ptr;
+            let copy = new_env_slot(ctx, block);
+            copy_slot_bytes(ctx, block, src_slot, 0, copy, 0, layout.size)?;
+            Ok(copy)
+        }
+        _ => Err(format!(
+            "iterator {name} closure argument is not a place or a constant"
+        )),
+    }
+}
+
 /// Emit `result = closure(env_ptr, args…)` for a closure whose `Self::Item` was
 /// untupled into `args` (one value for a scalar item, two for a `(A, B)` tuple
 /// from `.enumerate()` / `.zip()`). The closure body ABI is `(&env,
@@ -114931,14 +115363,17 @@ fn lower_iter_terminal<'tcx>(
         .clone()
         .unwrap_or_else(|| item_repr_ir.clone());
 
-    // Resolve the terminal kind + validate its closure (if any) is a callable ZST.
+    // Resolve the terminal kind + validate its closure (if any). A ZST closure
+    // is always admitted; a CAPTURING one only where
+    // `terminal_capturing_closure_target` holds (its environment is then copied
+    // to a private slot by `terminal_closure_env` before the drive).
     let validate_zst_closure =
         |ctx: &MirLoweringCtx<'tcx>, idx: usize| -> Result<Ty<'tcx>, String> {
             let cty = ctx.monomorphize_ty(operand_rust_ty(ctx, body, &call.args[idx].node)?);
             if !matches!(cty.kind(), ty::Closure(..)) {
                 return Err(format!("iterator {name} payload is not a closure"));
             }
-            if !is_zero_sized_ty(ctx.tcx, cty) {
+            if !is_zero_sized_ty(ctx.tcx, cty) && !terminal_capturing_closure_target(ctx.tcx) {
                 return Err(format!(
                     "iterator {name} with a capturing (non-ZST) closure is not modeled"
                 ));
@@ -115055,6 +115490,22 @@ fn lower_iter_terminal<'tcx>(
             TerminalKind::Nth { k }
         }
         _ => return Ok(false),
+    };
+    // The environment pointer every closure call of this drive passes. A ZST
+    // closure reads nothing through it, so it keeps the chain slot it always
+    // had; a capturing closure gets a private copy of its own bytes.
+    let closure_env = match &kind {
+        TerminalKind::Find { closure_ty }
+        | TerminalKind::Position { closure_ty }
+        | TerminalKind::Any { closure_ty }
+        | TerminalKind::All { closure_ty }
+        | TerminalKind::MinMaxByCmp { closure_ty, .. }
+        | TerminalKind::MinMaxByKey { closure_ty, .. }
+            if !is_zero_sized_ty(ctx.tcx, *closure_ty) =>
+        {
+            terminal_closure_env(ctx, block, &call.args[1].node, *closure_ty, name)?
+        }
+        _ => chain_slot,
     };
     // `last` holds the result it keeps while the chain's adapter closures run.
     if matches!(kind, TerminalKind::Last) {
@@ -115266,7 +115717,7 @@ fn lower_iter_terminal<'tcx>(
                 ctx,
                 &mut body_block,
                 *closure_ty,
-                chain_slot,
+                closure_env,
                 item_repr,
                 TrustIrTy::Bool,
             )?;
@@ -115309,7 +115760,7 @@ fn lower_iter_terminal<'tcx>(
                 ctx,
                 &mut body_block,
                 *closure_ty,
-                chain_slot,
+                closure_env,
                 vec![item_ref_slot],
                 TrustIrTy::Bool,
                 held,
@@ -115350,7 +115801,7 @@ fn lower_iter_terminal<'tcx>(
                 ctx,
                 &mut body_block,
                 *closure_ty,
-                chain_slot,
+                closure_env,
                 item_repr,
                 TrustIrTy::Bool,
             )?;
@@ -115724,7 +116175,7 @@ fn lower_iter_terminal<'tcx>(
                 ctx,
                 &mut compare_block,
                 *closure_ty,
-                chain_slot,
+                closure_env,
                 vec![cmp_lhs_slot, item_ref_slot],
                 TrustIrTy::I8,
             )?;
@@ -115794,7 +116245,7 @@ fn lower_iter_terminal<'tcx>(
                 ctx,
                 &mut body_block,
                 *closure_ty,
-                chain_slot,
+                closure_env,
                 item_ref_slot,
                 key_ir.clone(),
             )?;
@@ -131470,6 +131921,18 @@ fn memory_scalar_leaf_ty<'tcx>(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>) -> Result<TrustI
             site()
         ));
     }
+    // A Vec/String header admitted as a field image
+    // (`collection_field_header_ty`) is 24 bytes; its one-word trust-ir type
+    // (`Ptr`, the header ADDRESS) is not its bytes. Refused by name so no
+    // one-lane path loads or stores it; the header-aware arms never ask here.
+    if collection_field_header_ty(tcx, ty)?.is_some() {
+        return Err(format!(
+            "[TCG-COLLECTION-IMAGE] memory leaf type {ty:?} is a 24-byte collection header \
+             image, not a single scalar: only the header-aware field arms read, write or \
+             drop it{}",
+            site()
+        ));
+    }
     // The transparent wide-slice NEWTYPE chain (`NonNull<[T]>` / `NonNull<str>` /
     // `Unique<[T]>`) is the same two-lane `{data,len}` image once it is
     // slot-backed (`wide_slice_carrier_layout`), but the type
@@ -131679,6 +132142,26 @@ fn validate_memory_aggregate_field_leaves<'tcx>(
     cx: &LayoutCx<'tcx>,
     field_layout: &rustc_middle::ty::layout::TyAndLayout<'tcx>,
 ) -> Result<MemoryAggregateFieldLeafInfo, String> {
+    validate_memory_aggregate_field_leaves_with(tcx, cx, field_layout, false)
+}
+
+/// `validate_memory_aggregate_field_leaves` with the [TCG-COLLECTION-IMAGE]
+/// inline-header admission chosen by the caller. `admit_inline_collection_header`
+/// is `true` ONLY from `memory_aggregate_layout_uncached` (a memory-backed
+/// struct / enum / tuple / array, the route whose five operations the admission
+/// below lists) and is carried unchanged through this function's own descent.
+/// Every other caller (closure and coroutine environments, unions, Vec-element
+/// admissibility, `Box::new`, the tagless single-variant and over-aligned
+/// pointee checks) gets `false` through `validate_memory_aggregate_field_leaves`,
+/// so an owned Vec/String leaf there keeps `[TCG-COLLECTION-IMAGE]`: those
+/// routes were not shown to share the inline image (record
+/// SLICE-CAP3-GATE-SCOPE).
+fn validate_memory_aggregate_field_leaves_with<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    cx: &LayoutCx<'tcx>,
+    field_layout: &rustc_middle::ty::layout::TyAndLayout<'tcx>,
+    admit_inline_collection_header: bool,
+) -> Result<MemoryAggregateFieldLeafInfo, String> {
     // A FAT leaf: a 2-lane `{data, metadata}` `ScalarPair` the memory model can
     // load/store as TWO typed accesses (see `store_fat_ptr_slot_field` /
     // `load_fat_ptr_data_at` / `load_fat_ptr_meta_at`). Checked BEFORE
@@ -131738,15 +132221,43 @@ fn validate_memory_aggregate_field_leaves<'tcx>(
     // a two-field `ScalarPair` (data + metadata) that a single load would
     // truncate — so reject those here (this is what keeps `core::panic::PanicInfo`,
     // whose fields are wide references, fail-closed).
-    // The containing-aggregate lane still refuses owned collection fields.
-    // Default-Global Vec/String have a checked standalone rustc header, but a
-    // nested owner also needs coordinated field storage, projection, constant
-    // images, call/return transport and drop. Validating a leaf alone does not
-    // establish those operations. Synthetic maps and custom allocators need
-    // their own representations. Dedicated standalone-header paths must check
-    // their root authority separately; do not relax this nested-field gate.
+    // The containing-aggregate lane refuses owned collection fields except the
+    // one admission below. Default-Global Vec/String have a checked standalone
+    // rustc header, but a nested owner also needs coordinated field storage,
+    // projection, constant images, call/return transport and drop. Validating a
+    // leaf alone does not establish those operations. Synthetic maps and custom
+    // allocators need their own representations. Dedicated standalone-header
+    // paths must check their root authority separately; do not relax this
+    // nested-field gate beyond the admission, whose five operations are:
+    //   * storage: every local of a holding type is memory-backed at rustc's
+    //     layout (`compute_memory_backed_locals` rule 0c',
+    //     `aggregate_holds_inline_collection_header`), never scalarized;
+    //   * projection: `memory_scalar_leaf_ty` refuses the header, so no
+    //     one-lane path reads or writes it; field accesses through a reference
+    //     take the rustc-layout walker (`memory_aggregate_ref_pointee`), and
+    //     the header itself is reached only by `collection_field_place_address`
+    //     (a borrow binds its address; a store copies 24 source bytes);
+    //   * constant image: a constant holding one is copied byte for byte from
+    //     its rustc allocation (the header bytes rustc evaluated);
+    //   * call/return: the aggregate crosses by rustc's memory-aggregate ABI;
+    //   * drop: a projected `Drop` frees the buffer at the field's address
+    //     (`lower_vec_drop`).
     {
         let leaf_ty = field_layout.ty;
+        // [TCG-COLLECTION-IMAGE] admission (`collection_field_image_target`),
+        // reached only with `admit_inline_collection_header` (the
+        // `memory_aggregate_layout_uncached` route): a Global `Vec<T>` (no-drop
+        // `T`) or `String` field whose rustc header is the checked 24-byte image
+        // (`real_vec_string_header_layout`, offsets read from rustc) is a byte
+        // range of the containing aggregate. Every other caller falls through to
+        // the refusal below.
+        if admit_inline_collection_header && collection_field_header_ty(tcx, leaf_ty)?.is_some() {
+            return Ok(MemoryAggregateFieldLeafInfo {
+                has_fat_pointer_leaf: false,
+                has_nested_enum_leaf: false,
+                has_nested_niche_enum_leaf: false,
+            });
+        }
         if vec_element_ty(tcx, leaf_ty).is_some()
             || is_string_ty(tcx, leaf_ty)
             || btreemap_kv_ty(tcx, leaf_ty).is_some()
@@ -131844,11 +132355,21 @@ fn validate_memory_aggregate_field_leaves<'tcx>(
                     return Ok(info);
                 }
                 let element = field_layout.field(cx, 0);
-                return validate_memory_aggregate_field_leaves(tcx, cx, &element);
+                return validate_memory_aggregate_field_leaves_with(
+                    tcx,
+                    cx,
+                    &element,
+                    admit_inline_collection_header,
+                );
             }
             for field in 0..field_layout.fields.count() {
                 let inner = field_layout.field(cx, field);
-                let inner_info = validate_memory_aggregate_field_leaves(tcx, cx, &inner)?;
+                let inner_info = validate_memory_aggregate_field_leaves_with(
+                    tcx,
+                    cx,
+                    &inner,
+                    admit_inline_collection_header,
+                )?;
                 info.has_fat_pointer_leaf |= inner_info.has_fat_pointer_leaf;
                 info.has_nested_enum_leaf |= inner_info.has_nested_enum_leaf;
                 info.has_nested_niche_enum_leaf |= inner_info.has_nested_niche_enum_leaf;
@@ -131890,7 +132411,12 @@ fn validate_memory_aggregate_field_leaves<'tcx>(
                 let vl = field_layout.for_variant(cx, variant_index);
                 for field in 0..vl.fields.count() {
                     let inner = vl.field(cx, field);
-                    let inner_info = validate_memory_aggregate_field_leaves(tcx, cx, &inner)?;
+                    let inner_info = validate_memory_aggregate_field_leaves_with(
+                        tcx,
+                        cx,
+                        &inner,
+                        admit_inline_collection_header,
+                    )?;
                     info.has_fat_pointer_leaf |= inner_info.has_fat_pointer_leaf;
                     info.has_nested_enum_leaf |= inner_info.has_nested_enum_leaf;
                     info.has_nested_niche_enum_leaf |= inner_info.has_nested_niche_enum_leaf;
@@ -132378,7 +132904,8 @@ fn memory_aggregate_layout_uncached<'tcx>(
                 Some(0) => {}
                 Some(_) => {
                     let element = variant.field(&cx, 0);
-                    let info = validate_memory_aggregate_field_leaves(tcx, &cx, &element)?;
+                    let info =
+                        validate_memory_aggregate_field_leaves_with(tcx, &cx, &element, true)?;
                     has_fat_pointer_leaf |= info.has_fat_pointer_leaf;
                     has_nested_enum_leaf |= info.has_nested_enum_leaf;
                     has_nested_niche_enum_leaf |= info.has_nested_niche_enum_leaf;
@@ -132386,7 +132913,12 @@ fn memory_aggregate_layout_uncached<'tcx>(
                 None => {
                     for field in 0..variant.fields.count() {
                         let field_layout = variant.field(&cx, field);
-                        let info = validate_memory_aggregate_field_leaves(tcx, &cx, &field_layout)?;
+                        let info = validate_memory_aggregate_field_leaves_with(
+                            tcx,
+                            &cx,
+                            &field_layout,
+                            true,
+                        )?;
                         has_fat_pointer_leaf |= info.has_fat_pointer_leaf;
                         has_nested_enum_leaf |= info.has_nested_enum_leaf;
                         has_nested_niche_enum_leaf |= info.has_nested_niche_enum_leaf;
@@ -132460,7 +132992,8 @@ fn memory_aggregate_layout_uncached<'tcx>(
                 let vl = ty_and_layout.for_variant(&cx, variant_index);
                 for field in 0..vl.fields.count() {
                     let field_layout = vl.field(&cx, field);
-                    let info = validate_memory_aggregate_field_leaves(tcx, &cx, &field_layout)?;
+                    let info =
+                        validate_memory_aggregate_field_leaves_with(tcx, &cx, &field_layout, true)?;
                     has_fat_pointer_leaf |= info.has_fat_pointer_leaf;
                     has_nested_enum_leaf |= info.has_nested_enum_leaf;
                     has_nested_niche_enum_leaf |= info.has_nested_niche_enum_leaf;
@@ -133134,6 +133667,11 @@ fn memory_aggregate_address_taken_needs_slot<'tcx>(
     // an `Err`/`None` layout means "not memory-backable".
     if !matches!(memory_aggregate_layout_shared(tcx, ty), Ok(Some(_))) {
         return Ok(false);
+    }
+    // An inline Vec/String header has no scalarized image (its flattening is a
+    // `Ptr` lane, a different value): always the slot.
+    if aggregate_holds_inline_collection_header(tcx, ty)? {
+        return Ok(true);
     }
     // The scalarized reference path can flatten this pointee (a flat scalar-leaf
     // struct / single-variant enum) -> defer to it. A `None`/`Err` flattening
@@ -136481,6 +137019,19 @@ fn compute_memory_backed_locals<'tcx>(
             memory_aggregate_layout_shared(ctx.tcx, ty),
             Ok(Some(layout)) if layout.has_fat_pointer_leaf
         ) {
+            locals.insert(local);
+        }
+    }
+
+    // (0c') Every local whose memory-backed aggregate type holds a Vec/String
+    // header INLINE (`aggregate_holds_inline_collection_header`): its only
+    // representation is the rustc-layout byte image, so it is never scalarized.
+    for local in body.local_decls.indices() {
+        if fmt_internal_locals.contains(&local) {
+            continue;
+        }
+        let ty = ctx.monomorphize_ty(local_rust_ty(ctx, body, local));
+        if aggregate_holds_inline_collection_header(ctx.tcx, ty)? {
             locals.insert(local);
         }
     }
@@ -142924,6 +143475,21 @@ fn memory_aggregate_ref_pointee<'tcx>(
         && raw_ptr_aggregate_pointee_addressable(ctx.tcx, inner)?
     {
         return Ok(Some(inner));
+    }
+    // A pointee holding a Vec/String header inline is only its rustc-layout
+    // byte image (`aggregate_holds_inline_collection_header`); the
+    // declaration-order lane path must never address it.
+    if aggregate_holds_inline_collection_header(ctx.tcx, inner)? {
+        if ctx.scalar_values.contains_key(&place.local)
+            || ctx.scalar_cells.contains_key(&place.local)
+            || is_entry_arg(body, place.local)
+        {
+            return Ok(Some(inner));
+        }
+        return Err(format!(
+            "[TCG-COLLECTION-IMAGE] field access through an unbound reference to `{inner:?}`, \
+             which holds a collection header inline"
+        ));
     }
 
     // An already-bound reference to an over-aligned Rust image needs no stack
@@ -151417,11 +151983,12 @@ const X86_ROWREG_GPR_ACCUMULATORS_DEFAULT: usize = 4;
 #[cfg(test)]
 mod x86_certificate_free_switch_tests {
     use super::{
-        X86CertificateFreeSwitches, x86_certificate_free_switches, x86_rowreg_gpr_accumulators,
+        X86CertificateFreeSwitches, x86_certificate_free_switches, x86_o2_fixpoint_iterations,
+        x86_rowreg_gpr_accumulators,
     };
     use crate::knobs;
 
-    const OPT_OUTS: [&str; 8] = [
+    const OPT_OUTS: [&str; 11] = [
         knobs::NO_X86_RA_ABI_COPY_HINTS,
         knobs::NO_X86_RA_CALLER_SAVED_FIRST,
         knobs::NO_X86_RA_COLD_CALL_WEIGHT,
@@ -151430,6 +151997,9 @@ mod x86_certificate_free_switch_tests {
         knobs::NO_X86_SELECT_FLAG_FUSION,
         knobs::NO_X86_SUMQ_REGISTER_SEED,
         knobs::NO_X86_LOOP_ALIGN_RELOCATE_CONTAINED,
+        knobs::NO_X86_LEAF_FRAME_ELISION,
+        knobs::NO_X86_O2_FIXPOINT,
+        knobs::NO_X86_IMUL_CERTIFICATE_FREE_REDUCTIONS,
     ];
 
     const ALL_WITHHELD: X86CertificateFreeSwitches = X86CertificateFreeSwitches {
@@ -151441,6 +152011,9 @@ mod x86_certificate_free_switch_tests {
         select_flag_fusion_disabled: true,
         sumq_register_seed_disabled: true,
         loop_align_relocate_contained: false,
+        leaf_frame_elision_disabled: true,
+        o2_fixpoint_disabled: true,
+        imul_certificate_free_reductions_disabled: true,
     };
 
     fn switches(on: &[&str]) -> X86CertificateFreeSwitches {
@@ -151468,6 +152041,9 @@ mod x86_certificate_free_switch_tests {
             select_flag_fusion_disabled: false,
             sumq_register_seed_disabled: false,
             loop_align_relocate_contained: true,
+            leaf_frame_elision_disabled: false,
+            o2_fixpoint_disabled: false,
+            imul_certificate_free_reductions_disabled: false,
         };
         assert_eq!(switches(&[knobs::NO_PROOF_CERTS]), all_on);
         // Each opt-out turns off exactly its own switch.
@@ -151484,6 +152060,26 @@ mod x86_certificate_free_switch_tests {
             switches(&[&[knobs::NO_PROOF_CERTS][..], &OPT_OUTS[..]].concat()),
             ALL_WITHHELD
         );
+    }
+
+    #[test]
+    fn the_o2_fixpoint_bound_is_one_when_withheld_and_refuses_out_of_range_values() {
+        let max = trust_cg_codegen::X86_O2_FIXPOINT_MAX_ITERATIONS;
+        // Withheld (certificates kept) or opted out: the single pass,
+        // whatever the iteration knob says.
+        assert_eq!(x86_o2_fixpoint_iterations(true, None), Ok(1));
+        assert_eq!(x86_o2_fixpoint_iterations(true, Some("4")), Ok(1));
+        assert_eq!(x86_o2_fixpoint_iterations(false, None), Ok(max));
+        assert_eq!(x86_o2_fixpoint_iterations(false, Some("2")), Ok(2));
+        assert_eq!(x86_o2_fixpoint_iterations(false, Some("1")), Ok(1));
+        for bad in ["0", "5", "two", "-1"] {
+            assert!(
+                x86_o2_fixpoint_iterations(false, Some(bad)).is_err(),
+                "{bad}"
+            );
+        }
+        assert!(switches(&[]).o2_fixpoint_disabled);
+        assert!(!switches(&[knobs::NO_PROOF_CERTS]).o2_fixpoint_disabled);
     }
 
     #[test]

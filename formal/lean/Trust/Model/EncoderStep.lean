@@ -109,7 +109,8 @@ def filledMachState (fill : BitVec 8) : MachState :=
 
 /-- Every encoding is at least one byte long. -/
 theorem encode_ne_nil (i : Instr) : encode i ≠ [] := by
-  cases i <;> simp [encode, encInstr, le32, le8]
+  cases i <;> simp [encode, encInstr, movabsPrefix_bytes, le32, le8]
+  case shrRI sz dst amt => cases sz <;> simp
 
 /-- No instruction is resident in every machine state (a state whose memory is all `0x00` and one
     whose memory is all `0x01` disagree on the first byte), so `ResidentEverywhere` is never

@@ -29,6 +29,10 @@
 //!   `trust-cg-lower/src/adapter.rs`). The merged function carries the most
 //!   constraining v45 visibility any input states for its name, which is the
 //!   visibility the static linker would give the symbol (gABI).
+//!   `Ty::FnItem` uses this SAME reserved namespace before type interning,
+//!   including inside aggregate, closure and callable tables. It remains a
+//!   nominal item, distinct from `Ty::Func` and `Constant::FnDef`; carrying
+//!   its identity as data grants no missing native value lowering.
 //! * **`FuncTyId`** — the per-module `func_types` tables are concatenated
 //!   and every reference (`Function.ty`, `Inst::CallIndirect.sig`, an embedded
 //!   `Ty::Func`, a `ClosureTy::func`) is shifted by that module's base offset.
@@ -239,6 +243,9 @@ use trust_ir::{ClosureTyId, EnumId, EnumVariant, RecordId, StructId, TyId};
 
 use crate::global_stub::{decode_global_addr_stub, encode_global_addr_stub};
 
+#[cfg(test)]
+#[path = "module_merge_current_ir_tests.rs"]
+mod current_ir_tests;
 #[path = "module_merge_signature_abi.rs"]
 mod signature_abi_custody;
 #[cfg(test)]
@@ -1109,6 +1116,23 @@ fn reject_unmergeable_linkage(
 /// Sound by construction: refusing what it cannot remap means it can never
 /// silently mis-remap.
 fn precheck_module(m: &Module, idx: usize) -> Result<(), String> {
+    let mut function_ids = HashSet::new();
+    let mut function_names = HashSet::new();
+    for function in &m.functions {
+        if !function_ids.insert(function.id) {
+            return Err(format!(
+                "merge_modules: module {idx} (`{}`) has duplicate function id {}; the original function namespace is ambiguous",
+                m.name,
+                function.id.index()
+            ));
+        }
+        if !function_names.insert(function.name.as_str()) {
+            return Err(format!(
+                "merge_modules: module {idx} (`{}`) has duplicate function symbol `{}`; distinct original nominal identities cannot collapse by name",
+                m.name, function.name
+            ));
+        }
+    }
     // Check original source rows BEFORE name-keyed interning can collapse
     // identical claims and hide a producer's duplicate nominal identity.
     if let Some((first, second)) = m.duplicate_type_origins().into_iter().next() {
@@ -1492,9 +1516,9 @@ fn constant_batch_deferred_impl(c: &Constant, typed_bytes: bool) -> Option<&'sta
             }
         }
         Constant::FnDef(_) => None,
-        Constant::FnItem(_) => Some(
-            "Constant::FnItem has no native lowering; an explicit function-pointer coercion is required",
-        ),
+        Constant::FnItem(_) => {
+            Some("Constant::FnItem has no native nominal singleton carrier in the adapter")
+        }
         // U128 retains its body-only support. Bytes requires the separate
         // typed walk, never merely the absence of identity-bearing children.
         Constant::U128(_) => None,
@@ -1850,8 +1874,11 @@ fn unsupported_initializer_constant_reason_impl(
 ) -> Option<&'static str> {
     match c {
         Constant::Ext(e) => e.unreachable(),
-        Constant::FnDef(_) | Constant::FnItem(_) | Constant::Closure { .. } => Some(
-            "a module-scoped function constant (FnDef/FnItem/Closure); initializers must use \
+        Constant::FnItem(_) => Some(
+            "a nominal Constant::FnItem; native singleton initializer emission is not implemented",
+        ),
+        Constant::FnDef(_) | Constant::Closure { .. } => Some(
+            "a module-scoped function constant (FnDef/Closure); initializers must use \
              name-relative SymbolAddr",
         ),
         Constant::Aggregate(v)
@@ -3998,7 +4025,7 @@ fn check_ty_resolvable(ty: &Ty, c: &TableCounts, loc: &str) -> Result<(), String
         }
         Ty::FnItem(id) => {
             if id.index() >= c.functions {
-                return Err(oob("function", id.index(), c.functions as usize));
+                return Err(oob("nominal function", id.index(), c.functions as usize));
             }
         }
         Ty::Struct(id) => {
@@ -4408,27 +4435,46 @@ fn verify_function_identity_preservation(
                         return Err(ierr("indirect call value operand changed", &mf.name));
                     }
                 }
-                // trust-ir v67: a merge carries a Box deref's operand and its
-                // whole validity fact unchanged. A fact that changed is a
-                // different assumption about a different cast.
                 if let (
                     Inst::BoxDeref {
+                        ptr_ty: source_ptr,
+                        pointee: source_pointee,
                         operand: source_operand,
                         fact: source_fact,
-                        ..
                     },
                     Inst::BoxDeref {
+                        ptr_ty: actual_ptr,
+                        pointee: actual_pointee,
                         operand: actual_operand,
                         fact: actual_fact,
-                        ..
                     },
                 ) = (&sn.inst, &mn.inst)
-                    && (source_operand != actual_operand || source_fact != actual_fact)
                 {
-                    return Err(ierr(
-                        "BoxDeref operand or validity fact changed across the merge",
-                        &mf.name,
-                    ));
+                    if source_operand != actual_operand
+                        || source_fact != actual_fact
+                        || std::mem::discriminant(source_pointee)
+                            != std::mem::discriminant(actual_pointee)
+                    {
+                        return Err(ierr(
+                            "BoxDeref operand, pointee class or validity fact changed",
+                            &mf.name,
+                        ));
+                    }
+                    for (source, actual) in [
+                        (source_ptr, actual_ptr),
+                        (source_pointee.ty(), actual_pointee.ty()),
+                    ] {
+                        tys_equal_name_resolved(
+                            src_mod,
+                            source,
+                            merged,
+                            actual,
+                            TY_CMP_DEPTH_LIMIT,
+                        )
+                        .map_err(|error| {
+                            ierr(&format!("BoxDeref type diverged: {error}"), &mf.name)
+                        })?;
+                    }
                 }
                 if let (
                     Inst::MakeClosure {
@@ -4572,6 +4618,16 @@ fn constants_identity_preserved(
     merged: &Module,
 ) -> Result<(), String> {
     match (sc, mc) {
+        (Constant::FnItem(sf), Constant::FnItem(mf)) => {
+            let source = func_name_by_id(src_mod, *sf)?;
+            let actual = func_name_by_id(merged, *mf)?;
+            if source != actual {
+                return Err(format!(
+                    "FnItem constant resolves to a different nominal function: `{source}` versus `{actual}`"
+                ));
+            }
+            Ok(())
+        }
         (Constant::FnDef(sf), Constant::FnDef(mf)) => {
             let sname = func_name_by_id(src_mod, *sf).map_err(|e| format!("source FnDef: {e}"))?;
             let mname = func_name_by_id(merged, *mf).map_err(|e| format!("merged FnDef: {e}"))?;
@@ -4628,6 +4684,12 @@ fn constants_identity_preserved(
                 constants_identity_preserved(s, src_mod, m, merged)?;
             }
             Ok(())
+        }
+        (Constant::Splat { elem: se, len: sl }, Constant::Splat { elem: me, len: ml }) => {
+            if sl != ml {
+                return Err("splat constant element count changed".to_string());
+            }
+            constants_identity_preserved(se, src_mod, me, merged)
         }
         (Constant::Record(sfs), Constant::Record(mfs)) => {
             if sfs.len() != mfs.len() {
@@ -4800,6 +4862,12 @@ fn tys_equal_name_resolved(
         format!("type diverged across the merge ({what}: {s:?} vs {m:?})")
     };
     match (s, m) {
+        (Ty::FnItem(source), Ty::FnItem(actual)) => {
+            if func_name_by_id(sm, *source)? != func_name_by_id(mm, *actual)? {
+                return Err(mismatch("nominal function target"));
+            }
+            Ok(())
+        }
         (Ty::Func(sid), Ty::Func(mid)) => func_tys_equal_name_resolved(sm, *sid, mm, *mid, depth),
         (Ty::Closure(sid), Ty::Closure(mid)) => {
             let sct = sm

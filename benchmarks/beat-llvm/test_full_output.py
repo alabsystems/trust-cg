@@ -7,6 +7,7 @@ actual tool qualification are separate requirements.
 
 import argparse
 import json
+import re
 import subprocess
 import sys
 import tempfile
@@ -64,6 +65,26 @@ class FullOutputControls(unittest.TestCase):
             (here / "progs" / "manifest.json").write_bytes(original)
             with self.assertRaises(output.OutputError):
                 output.load_manifest(here)
+
+    def test_rust_renderer_assigns_every_digit_of_the_same_wire_record(self):
+        assignment = re.compile(
+            r"    record\[(\d+)\] = oracle_hex_digit\((0x[0-9a-f]{16}u64|values\[(\d+)\]) >> (\d+)\);")
+        digits = b"0123456789abcdef"
+        candidates = (0x0123456789ABCDEF, 0xFEDCBA9876543210, 0x8000000000000001)
+        for stem, spec in output.SUPPORTED.items():
+            with self.subTest(stem=stem):
+                rendered = output.rust_emitter(stem, spec["fields"])
+                self.assertNotIn("println!", rendered)
+                template = re.search(r'let mut record = \*b(".*");', rendered).group(1)
+                record = bytearray(json.loads(template), "ascii")
+                state = candidates[:len(spec["fields"])]
+                matches = assignment.findall(rendered)
+                self.assertEqual(len(matches), 16 * (len(output.TRANSPORT) + len(state)))
+                self.assertEqual(len({offset for offset, _, _, _ in matches}), len(matches))
+                for offset, operand, field, shift in matches:
+                    value = state[int(field)] if field else int(operand[:-3], 16)
+                    record[int(offset)] = digits[(value >> int(shift)) & 15]
+                self.assertEqual(bytes(record), output.output_bytes(stem, state))
 
     def test_high_bits_and_every_unsigned_transport_field_are_exact(self):
         for stem in output.SUPPORTED:
@@ -137,6 +158,29 @@ class FullOutputControls(unittest.TestCase):
         with mock.patch.object(runner.subprocess, "run", side_effect=OSError("unavailable")):
             self.assertEqual(runner.capture(["unused"], 1)["status"], "EXECUTION_UNAVAILABLE")
 
+    def test_capture_preserves_custody_only_for_the_trust_compiler(self):
+        env = {"MAKEFLAGS": "--jobserver-auth=7,8"}
+        process = subprocess.CompletedProcess(["tool"], 0, b"", b"")
+        with mock.patch.object(runner, "resource_fds", return_value=(7, 8)) as custody, \
+             mock.patch.object(runner.subprocess, "run", return_value=process) as launch:
+            self.assertEqual(runner.capture(["tool"], 1, env, trust_compiler=True)["returncode"], 0)
+            custody.assert_called_once_with(env)
+            launch.assert_called_once_with(["tool"], capture_output=True, env=env, timeout=1,
+                                           pass_fds=(7, 8))
+            launch.reset_mock()
+            runner.capture(["benchmark"], 1, env)
+            launch.assert_called_once_with(["benchmark"], capture_output=True, env=env, timeout=1,
+                                           pass_fds=())
+            custody.assert_called_once_with(env)
+
+    def test_capture_refuses_a_closed_custody_descriptor_before_launch(self):
+        with mock.patch.object(runner, "resource_fds", side_effect=runner.ToolchainError("closed GNU pipe")), \
+             mock.patch.object(runner.subprocess, "run") as launch:
+            result = runner.capture(["trustc"], 1, trust_compiler=True)
+        self.assertEqual(result["status"], "EXECUTION_UNAVAILABLE")
+        self.assertIn(b"closed GNU pipe", result["stderr"])
+        launch.assert_not_called()
+
     def test_real_lane_commands_keep_default_backend_proof_policy(self):
         tools = {"target": "aarch64-apple-darwin", "clang": "/clang",
                  "dylib": "/backend", "driver": {"compiler": "/trustc",
@@ -162,7 +206,7 @@ class FullOutputControls(unittest.TestCase):
             rows = output.empty_accounting(output.load_manifest(HERE))
             commands = []
 
-            def stand_in(command, timeout, env=None):
+            def stand_in(command, timeout, env=None, *, trust_compiler=False):
                 commands.append(command)
                 if "-o" in command:
                     if any(arg.startswith("-Zcodegen-backend=") for arg in command):
@@ -195,7 +239,7 @@ class FullOutputControls(unittest.TestCase):
                 rows = output.empty_accounting(output.load_manifest(HERE))
                 repeats = {"llvm": 0, "clang": 0}
 
-                def observe(command, timeout, env=None):
+                def observe(command, timeout, env=None, *, trust_compiler=False):
                     if "-o" in command:
                         if any(arg.startswith("-Zcodegen-backend=") for arg in command):
                             return {"status": "EXITED", "returncode": 1,
@@ -228,7 +272,7 @@ class FullOutputControls(unittest.TestCase):
             row = output.empty_accounting(output.load_manifest(HERE))["p1_xorshift"]
             executions = 0
 
-            def observe(command, timeout, env=None):
+            def observe(command, timeout, env=None, *, trust_compiler=False):
                 nonlocal executions
                 if "-o" in command:
                     Path(command[command.index("-o") + 1]).write_bytes(b"test identity")
@@ -276,7 +320,7 @@ class FullOutputControls(unittest.TestCase):
                          "driver": {"compiler": "/trustc", "compiler_flags": ["-Ztrust-verify=off"]}}
                 rows = output.empty_accounting(output.load_manifest(HERE))
 
-                def mutate_identity(command, timeout, env=None):
+                def mutate_identity(command, timeout, env=None, *, trust_compiler=False):
                     source = directory / "p1_xorshift_validation.rs"
                     if "-o" in command:
                         Path(command[command.index("-o") + 1]).write_bytes(b"original test-only identity")

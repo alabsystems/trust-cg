@@ -101,14 +101,14 @@ proofs-off m100_str_memcpy_x86/t9_f64_parse_via_if_let_Ok__the_P0_repro_ O3 TCG-
 proofs-off m100_str_memcpy_x86/t9_f64_parse_via_unwrap_or O0 TCG-MIR-UNSUPPORTED/TCG-PARSE-F64
 proofs-off m100_str_memcpy_x86/t9_f64_parse_via_unwrap_or O3 TCG-MIR-UNSUPPORTED/TCG-PARSE-F64
 proofs-off m101_o3_gaps_x86/t1_or_insert_with_const O3 TCG-MIR-UNSUPPORTED/TCG-MAP-ENTRY-USE
+proofs-off m100_str_memcpy_x86/t8__u8__contains____33 O3 TCG-MIR-UNSUPPORTED
 proofs-off m103_nested_collect_x86/t0_vec_i128 O0 TCG-MIR-UNSUPPORTED
 proofs-off m103_nested_collect_x86/t0_vec_i128 O3 TCG-MIR-UNSUPPORTED
 proofs-off m103_nested_collect_x86/t0_vec_string O0 TCG-MIR-UNSUPPORTED
 proofs-off m103_nested_collect_x86/t0_vec_string O3 TCG-MIR-UNSUPPORTED
 proofs-off m122_to_vec_string_from_x86/t0_float_slice_contains_partial_eq O3 TCG-MIR-UNSUPPORTED
-proofs-off m127_to_vec_o3_x86/t0_i64_sum_cap O3 TCG-MIR-UNSUPPORTED/TCG-IR-LOWER
-proofs-off m127_to_vec_o3_x86/t1_box_element O0 TCG-MIR-UNSUPPORTED
-proofs-off m127_to_vec_o3_x86/t1_box_element O3 TCG-MIR-UNSUPPORTED
+proofs-off m127_to_vec_o3_x86/t1_box_element O0 TCG-MIR-UNSUPPORTED/TCG-BOX-DEREF
+proofs-off m127_to_vec_o3_x86/t1_box_element O3 TCG-MIR-UNSUPPORTED/TCG-BOX-DEREF
 proofs-off m127_to_vec_o3_x86/t1_string_element O0 TCG-MIR-UNSUPPORTED/TCG-COLLECTION-IMAGE
 proofs-off m127_to_vec_o3_x86/t1_string_element O3 TCG-MIR-UNSUPPORTED/TCG-COLLECTION-IMAGE
 proofs-off m127_to_vec_o3_x86/t1_tuple_element O0 TCG-MIR-UNSUPPORTED
@@ -122,12 +122,6 @@ proofs-off m139_flatmap_bounded_x86/t0_sum_empty_outer O0 TCG-MIR-UNSUPPORTED/TC
 proofs-off m139_flatmap_bounded_x86/t0_sum_empty_outer O3 TCG-MIR-UNSUPPORTED
 proofs-off m139_flatmap_bounded_x86/t0_sum_single_outer_multi_inner O0 TCG-MIR-UNSUPPORTED/TCG-RET-ABI
 proofs-off m139_flatmap_bounded_x86/t0_sum_single_outer_multi_inner O3 TCG-MIR-UNSUPPORTED
-proofs-off m140_println_x86/t1_dbg O0 TCG-MIR-UNSUPPORTED/TCG-FMT-DECLINED
-proofs-off m140_println_x86/t1_dbg O3 TCG-MIR-UNSUPPORTED/TCG-FMT-DECLINED
-proofs-off m140_println_x86/t1_hexfmt O0 TCG-MIR-UNSUPPORTED/TCG-FMT-DECLINED
-proofs-off m140_println_x86/t1_hexfmt O3 TCG-MIR-UNSUPPORTED/TCG-FMT-DECLINED
-proofs-off m140_println_x86/t1_pad O0 TCG-MIR-UNSUPPORTED
-proofs-off m140_println_x86/t1_pad O3 TCG-MIR-UNSUPPORTED
 proofs-off m90_format_x86/t1_branch_varying_str O0 TCG-MIR-UNSUPPORTED/TCG-FMT-RTSTR
 proofs-off m90_format_x86/t1_branch_varying_str O3 TCG-MIR-UNSUPPORTED/TCG-FMT-RTSTR
 proofs-off m90_format_x86/t1_debug_tuple O0 TCG-MIR-UNSUPPORTED/TCG-FMT-DECLINED
@@ -170,3 +164,5 @@ proofs-off vec_x86/t0_vec_extend_from_within O3 TCG-MIR-UNSUPPORTED
 proofs-off vec_x86/t0_vec_extend_from_within_realloc O3 TCG-MIR-UNSUPPORTED
 proofs-off vec_x86/t0_vec_extend_iter_filter O3 TCG-MIR-UNSUPPORTED
 proofs-off vec_x86/t0_vec_extend_iter_map O3 TCG-MIR-UNSUPPORTED
+proofs-off slice_capabilities_x86/t0_debug_derive O0 TCG-MIR-UNSUPPORTED
+proofs-off slice_capabilities_x86/t0_debug_derive O3 TCG-MIR-UNSUPPORTED

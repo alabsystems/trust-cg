@@ -1,7 +1,8 @@
 // Author: Andrew Yates | Copyright 2026 Andrew Yates | Apache-2.0
 
-//! Checked use of recorded scalar C prototypes by the native byte path.
-//! This is a finite ABI consumer, not proof authority or a general FnAbi.
+//! Driver-selected native ABI context and the foreign scalar C consumer.
+//! The Rust/defined-source carrier consumer is in native_source_abi. Neither
+//! profile grants source/proof authority or implements a general FnAbi.
 
 use crate::abi::{AArch64AbiVariant, AppleAArch64ABI, ArgLocation};
 use crate::adapter::{AdapterError, GuardCarrierArch, ObjectAccessModel};
@@ -14,7 +15,7 @@ use trust_ir::signature_abi::{
 use trust_ir::{CallingConv, Constant, FuncTy, Function, Inst, Module, Ty};
 
 #[derive(Clone, Copy, Debug)]
-enum NativeAbi {
+pub(super) enum NativeAbi {
     Aarch64(AArch64AbiVariant),
     X86SystemV,
 }
@@ -23,12 +24,12 @@ enum NativeAbi {
 /// Module metadata cannot construct an implicit native context. Existing
 /// contextless, wasm and template entries keep refusing recorded signatures.
 #[derive(Clone, Debug)]
-pub struct NativeScalarCAbi {
-    triple: String,
-    abi: NativeAbi,
+pub struct NativeAbiContext {
+    pub(super) triple: String,
+    pub(super) abi: NativeAbi,
 }
 
-impl NativeScalarCAbi {
+impl NativeAbiContext {
     pub fn aarch64(triple: String) -> Result<Self, AdapterError> {
         let variant = AArch64AbiVariant::from_target_triple(&triple)
             .map_err(|error| refusal(error.to_string()))?;
@@ -125,37 +126,51 @@ impl NativeScalarCAbi {
                 .filter(|function| function.ty.as_usize() == index);
             let mut found = false;
             for function in owners {
-                self.prototype(module, function, signature)?;
+                if function.calling_conv == CallingConv::Rust || !function.is_declaration() {
+                    self.source_prototype(module, signature, function.calling_conv)?;
+                    function.fn_abi(module).map_err(refusal)?;
+                } else {
+                    self.prototype(module, function, signature)?;
+                }
                 found = true;
             }
             if !found {
-                return Err(refusal("recorded signature has no foreign declaration"));
+                if signature
+                    .abi
+                    .as_ref()
+                    .is_none_or(|abi| abi.lowered_convention != CallingConv::Rust)
+                {
+                    return Err(refusal("recorded signature has no foreign declaration"));
+                }
+                self.source_prototype(
+                    module,
+                    signature,
+                    signature
+                        .abi
+                        .as_ref()
+                        .ok_or_else(|| refusal("missing recorded ABI"))?
+                        .lowered_convention,
+                )?;
             }
         }
         let mut pointer_signature = false;
         module.visit_types(|ty| {
             if let Ty::Func(id) = ty {
-                pointer_signature |= module
-                    .func_type(*id)
-                    .is_some_and(|signature| signature.abi.is_some());
+                pointer_signature |= module.func_type(*id).is_some_and(recorded_foreign);
             }
         });
         if pointer_signature
-            || module.closure_types.iter().any(|closure| {
-                module
-                    .func_type(closure.func)
-                    .is_some_and(|signature| signature.abi.is_some())
-            })
+            || module
+                .closure_types
+                .iter()
+                .any(|closure| module.func_type(closure.func).is_some_and(recorded_foreign))
         {
             return Err(refusal(
                 "recorded function-pointer or closure ABI is outside the scalar direct-call profile",
             ));
         }
-        let recorded = |function: &Function| {
-            module
-                .func_type(function.ty)
-                .is_some_and(|sig| sig.abi.is_some())
-        };
+        let recorded =
+            |function: &Function| module.func_type(function.ty).is_some_and(recorded_foreign);
         let escaped = |constant: &Constant| {
             constant
                 .try_visit_constants(|nested| {
@@ -209,16 +224,31 @@ impl NativeScalarCAbi {
                         "recorded scalar C ABI is supported only by an ordinary direct Call",
                     ));
                 }
-                Inst::CallIndirect { sig, .. }
-                | Inst::InvokeIndirect { sig, .. }
-                | Inst::CallIndirectCannotUnwind { sig, .. }
-                    if module
-                        .func_type(*sig)
-                        .is_some_and(|signature| signature.abi.is_some()) =>
-                {
-                    return Err(refusal(
-                        "recorded indirect ABI is outside the scalar direct-call profile",
-                    ));
+                Inst::CallIndirect {
+                    sig, calling_conv, ..
+                }
+                | Inst::InvokeIndirect {
+                    sig, calling_conv, ..
+                }
+                | Inst::CallIndirectCannotUnwind {
+                    sig, calling_conv, ..
+                } => {
+                    if let Some(signature) = module.func_type(*sig) {
+                        if signature
+                            .abi
+                            .as_ref()
+                            .is_some_and(|abi| abi.lowered_convention != *calling_conv)
+                        {
+                            return Err(refusal(
+                                "recorded indirect signature and call edge disagree on convention",
+                            ));
+                        }
+                        if recorded_foreign(signature) {
+                            return Err(refusal(
+                                "recorded indirect ABI is outside the scalar direct-call profile",
+                            ));
+                        }
+                    }
                 }
                 _ => {}
             }
@@ -380,7 +410,7 @@ impl NativeScalarCAbi {
         Ok(())
     }
 
-    fn extension(&self, ty: &Ty, result: bool) -> AbiExtension {
+    pub(super) fn extension(&self, ty: &Ty, result: bool) -> AbiExtension {
         let extends_narrow = match self.abi {
             NativeAbi::Aarch64(AArch64AbiVariant::Darwin) => true,
             NativeAbi::Aarch64(AArch64AbiVariant::Aapcs64) => false,
@@ -398,6 +428,7 @@ impl NativeScalarCAbi {
 
     pub(crate) fn call(
         &self,
+        module: &Module,
         params: &[Ty],
         returns: &[Ty],
         variadic: bool,
@@ -413,7 +444,17 @@ impl NativeScalarCAbi {
                 ));
             }
         }
-        self.classify(params, returns, variadic, fixed)
+        if params
+            .iter()
+            .chain(returns)
+            .all(|ty| scalar_type(ty).is_ok())
+        {
+            self.classify(params, returns, variadic, fixed)
+        } else if !variadic && fixed == params.len() {
+            self.classify_source(module, params, returns).map(|_| ())
+        } else {
+            Err(refusal("aggregate variadic carrier is not implemented"))
+        }
     }
 
     fn classify(
@@ -468,7 +509,7 @@ impl NativeScalarCAbi {
     }
 }
 
-fn scalar_type(ty: &Ty) -> Result<(Type, AbiRegisterClass, u64, u16), AdapterError> {
+pub(super) fn scalar_type(ty: &Ty) -> Result<(Type, AbiRegisterClass, u64, u16), AdapterError> {
     let (machine, class, bytes, bits) = match ty {
         Ty::Bool => (Type::B1, AbiRegisterClass::Integer, 1, 1),
         Ty::I8 | Ty::U8 => (Type::I8, AbiRegisterClass::Integer, 1, 8),
@@ -489,7 +530,7 @@ fn scalar_type(ty: &Ty) -> Result<(Type, AbiRegisterClass, u64, u16), AdapterErr
 /// A macOS deployment version remains part of each recorded identity and the
 /// emitted object's minimum OS, but changes none of this profile's scalar
 /// register/stack rules. Other OS/environment/vendor components remain exact.
-fn same_scalar_target(source: &str, compiler: &str) -> bool {
+pub(super) fn same_scalar_target(source: &str, compiler: &str) -> bool {
     fn key(triple: &str) -> Option<(String, String, String, String)> {
         let parts: Vec<_> = triple.split('-').collect();
         if !matches!(parts.len(), 3 | 4) {
@@ -519,7 +560,7 @@ fn same_scalar_target(source: &str, compiler: &str) -> bool {
     matches!((key(source), key(compiler)), (Some(source), Some(compiler)) if source == compiler)
 }
 
-fn classify_attributes(attributes: &AbiAttributes) {
+pub(super) fn classify_attributes(attributes: &AbiAttributes) {
     let AbiAttributes {
         extension: _,
         in_reg: _,
@@ -537,13 +578,20 @@ fn classify_attributes(attributes: &AbiAttributes) {
     } = attributes;
 }
 
+fn recorded_foreign(signature: &FuncTy) -> bool {
+    signature
+        .abi
+        .as_ref()
+        .is_some_and(|abi| abi.lowered_convention != CallingConv::Rust)
+}
+
 fn refusal(detail: impl Into<String>) -> AdapterError {
     AdapterError::UnsupportedInstruction(format!("[TCG-SCALAR-C-ABI] {}", detail.into()))
 }
 
 #[cfg(test)]
 #[path = "../tests/common/native_scalar_c_abi.rs"]
-mod test_fixture;
+pub(crate) mod test_fixture;
 
 #[cfg(test)]
 mod tests {
@@ -553,7 +601,7 @@ mod tests {
     /// validator refusal. The full-entry controls live in the integration test.
     #[test]
     fn closure_and_function_address_carriers_reach_the_named_native_floor() {
-        let native = NativeScalarCAbi::aarch64("aarch64-apple-darwin".into()).unwrap();
+        let native = NativeAbiContext::aarch64("aarch64-apple-darwin".into()).unwrap();
         let base = test_fixture::fixture(
             "aarch64-apple-darwin",
             vec![Ty::I64],

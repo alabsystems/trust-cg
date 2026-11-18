@@ -1197,6 +1197,54 @@ if xdg:
         self.assertTrue(err.startswith("error: [TCG-MIR-UNSUPPORTED]"), err)
         self.assertTrue(err.endswith("causes=[TCG-PROOF-465]"), err)
 
+    def test_compiler_launches_forward_only_advertised_descriptors(self):
+        read_fd, write_fd = os.pipe()
+        self.addCleanup(os.close, write_fd)
+        self.addCleanup(os.close, read_fd)
+        with tempfile.TemporaryFile() as lease, tempfile.TemporaryFile() as unrelated:
+            descriptors = {}
+            for fd in (read_fd, write_fd, lease.fileno()):
+                info = os.fstat(fd)
+                descriptors[fd] = (info.st_dev, info.st_ino)
+            other = os.fstat(unrelated.fileno())
+            compiler = self.compiler(f"""
+for fd, identity in {descriptors!r}.items():
+    try:
+        info = os.fstat(fd)
+    except OSError:
+        raise SystemExit(71)
+    assert (info.st_dev, info.st_ino) == identity
+try:
+    info = os.fstat({unrelated.fileno()})
+except OSError:
+    pass
+else:
+    assert (info.st_dev, info.st_ino) != {(other.st_dev, other.st_ino)!r}
+""")
+            self.h.env = {"PATH": os.defpath, "LANE_LOG": str(self.log)}
+            env = {"MAKEFLAGS": f"-j2 --jobserver-auth={read_fd},{write_fd}",
+                   "ATERM_SDK_LEASE_V3": str(lease.fileno())}
+            out = self.dir / "o"
+            ok, _, error = self.h.compile_once(self.src, out, "3", bridge=False, extra_env=env)
+            self.assertTrue(ok, error)
+            rss = self.h.compile_rss_sample(self.src, out, "3", bridge=False, extra_env=env)
+            self.assertEqual((rss["status"], rss["returncode"]), ("ok", 0))
+            sample = peak_rss.measure([str(compiler)], env={**self.h.env, **env},
+                                      python=sys.executable, inherit_resources=True)
+            self.assertEqual((sample.status, sample.returncode), ("ok", 0), sample.stderr)
+            sample = peak_rss.measure([str(compiler)], env={**self.h.env, **env})
+            self.assertEqual((sample.status, sample.returncode), ("ok", 71))
+
+    def test_invalid_compiler_transport_refuses_before_running(self):
+        self.compiler()
+        env = {"MAKEFLAGS": "--jobserver-auth=0,1"}
+        with self.assertRaisesRegex(peak_rss.ResourceRefusal, "malformed MAKEFLAGS descriptor"):
+            self.h.compile_once(self.src, self.dir / "o", "3", bridge=False, extra_env=env)
+        sample = peak_rss.measure([self.h.rustc], env={**self.h.env, **env}, inherit_resources=True)
+        self.assertEqual((sample.status, sample.returncode), ("wrapper-failed", 127))
+        self.assertIn("malformed MAKEFLAGS descriptor", sample.stderr)
+        self.assertFalse(self.log.exists())
+
     def test_rss_samples_keep_status_and_bytes(self):
         program = write_python_executable(self.dir / "prog",
                                           'x = b"\\x01" * (24 << 20)\nraise SystemExit(7)\n')

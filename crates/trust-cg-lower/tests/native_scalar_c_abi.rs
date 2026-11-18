@@ -5,7 +5,7 @@
 mod fixtures;
 
 use trust_cg_lower::{
-    CodegenLicensePolicy, GuardCarrierArch, NativeScalarCAbi, ObjectAccessModel,
+    CodegenLicensePolicy, GuardCarrierArch, NativeAbiContext, ObjectAccessModel,
     ObjectSymbolPolicy, TlsDialect, UnlicensedBodyPolicy,
 };
 use trust_ir::signature_abi::{AbiExtension, AbiPassMode};
@@ -22,12 +22,12 @@ fn lower(
     let (arch, native) = if triple.starts_with("aarch64-") {
         (
             GuardCarrierArch::AArch64,
-            NativeScalarCAbi::aarch64(triple.into()).unwrap(),
+            NativeAbiContext::aarch64(triple.into()).unwrap(),
         )
     } else {
         (
             GuardCarrierArch::X86_64,
-            NativeScalarCAbi::x86_system_v(triple.into()).unwrap(),
+            NativeAbiContext::x86_system_v(triple.into()).unwrap(),
         )
     };
     let access = ObjectAccessModel::from(if triple.contains("-apple-") {
@@ -169,7 +169,7 @@ fn contextless_template_inline_and_indirect_paths_keep_their_floor() {
         .collect();
     module.functions[1].blocks[0].body[0].inst = Inst::CallCannotUnwind { callee, args };
     assert!(lower(&module, triple).is_err());
-    assert!(NativeScalarCAbi::x86_system_v("x86_64-pc-windows-msvc".into()).is_err());
+    assert!(NativeAbiContext::x86_system_v("x86_64-pc-windows-msvc".into()).is_err());
 }
 
 #[test]

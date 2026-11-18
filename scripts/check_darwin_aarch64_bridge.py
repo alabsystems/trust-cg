@@ -728,16 +728,17 @@ TARGETS = (
         "A64_CORPUS lane=proofs-off cases=154 cells=462 llvm_runs=462 cg_runs=432 matched=432 refused=30 refusals=TCG-MIR-UNSUPPORTED:13,TCG-MIR-UNSUPPORTED/TCG-IR-LOWER:3,TCG-MIR-UNSUPPORTED/TCG-RET-ABI:6,TCG-MIR-UNSUPPORTED/TCG-SCALAR-CELL-LAYOUT:8 panic_message=0 diverged=0",
         "A64_CORPUS lane=certs-on cases=154 cells=154 llvm_runs=154 cg_runs=0 matched=0 refused=154 refusals=TCG-MIR-UNSUPPORTED:4,TCG-MIR-UNSUPPORTED/TCG-PROOF-465:144,TCG-MIR-UNSUPPORTED/TCG-RET-ABI:2,TCG-MIR-UNSUPPORTED/TCG-SCALAR-CELL-LAYOUT:4 panic_message=0 diverged=0",
     ), ((NATIVE_RUN, 1), (EXPECTED_REFUSAL, 1)), 1),
-    Target("bridge_feature_suites_aarch64", 8, HOST_ORACLE, (
+    Target("bridge_feature_suites_aarch64", 9, HOST_ORACLE, (
         "A64_FEATURE_SUITES family=closures suites=4 programs=48 cells=96 llvm_runs=96 cg_runs=96 matched=96 refused=0 refusals=none panic_message=0 diverged=0 unbuildable=0 oracle_off_pin=0",
         "A64_FEATURE_SUITES family=iterators suites=6 programs=153 cells=306 llvm_runs=306 cg_runs=239 matched=239 refused=67 refusals=TCG-MIR-UNSUPPORTED:27,TCG-MIR-UNSUPPORTED/TCG-MAP-ENTRY-USE:1,TCG-MIR-UNSUPPORTED/TCG-RET-ABI:21,TCG-MIR-UNSUPPORTED/TCG-STEPBY-METHOD:2,TCG-MIR-UNSUPPORTED/TCG-STEPBY-OPT-LEVEL:16 panic_message=0 diverged=0 unbuildable=0 oracle_off_pin=0",
         "A64_FEATURE_SUITES family=dyn_enums_try suites=5 programs=63 cells=126 llvm_runs=126 cg_runs=126 matched=126 refused=0 refusals=none panic_message=0 diverged=0 unbuildable=0 oracle_off_pin=0",
         "A64_FEATURE_SUITES family=heap_collections suites=7 programs=77 cells=154 llvm_runs=154 cg_runs=140 matched=140 refused=14 refusals=TCG-MIR-UNSUPPORTED:12,TCG-MIR-UNSUPPORTED/TCG-IR-LOWER:2 panic_message=0 diverged=0 unbuildable=0 oracle_off_pin=0",
-        "A64_FEATURE_SUITES family=strings_format suites=7 programs=165 cells=330 llvm_runs=330 cg_runs=285 matched=285 refused=45 refusals=TCG-MIR-UNSUPPORTED:13,TCG-MIR-UNSUPPORTED/TCG-COLLECTION-IMAGE:2,TCG-MIR-UNSUPPORTED/TCG-FMT-DECLINED:6,TCG-MIR-UNSUPPORTED/TCG-FMT-RTSTR:2,TCG-MIR-UNSUPPORTED/TCG-IR-LOWER:3,TCG-MIR-UNSUPPORTED/TCG-ITER-UNMODELED:6,TCG-MIR-UNSUPPORTED/TCG-PARSE-F64:6,TCG-MIR-UNSUPPORTED/TCG-RET-ABI:1,TCG-MIR-UNSUPPORTED/TCG-STR-CASE:6 panic_message=0 diverged=0 unbuildable=0 oracle_off_pin=0",
+        "A64_FEATURE_SUITES family=slice_capabilities suites=1 programs=6 cells=12 llvm_runs=12 cg_runs=10 matched=10 refused=2 refusals=TCG-MIR-UNSUPPORTED:2 panic_message=0 diverged=0 unbuildable=0 oracle_off_pin=0",
+        "A64_FEATURE_SUITES family=strings_format suites=7 programs=165 cells=330 llvm_runs=330 cg_runs=293 matched=293 refused=37 refusals=TCG-MIR-UNSUPPORTED:10,TCG-MIR-UNSUPPORTED/TCG-BOX-DEREF:2,TCG-MIR-UNSUPPORTED/TCG-COLLECTION-IMAGE:2,TCG-MIR-UNSUPPORTED/TCG-FMT-DECLINED:2,TCG-MIR-UNSUPPORTED/TCG-FMT-RTSTR:2,TCG-MIR-UNSUPPORTED/TCG-ITER-UNMODELED:6,TCG-MIR-UNSUPPORTED/TCG-PARSE-F64:6,TCG-MIR-UNSUPPORTED/TCG-RET-ABI:1,TCG-MIR-UNSUPPORTED/TCG-STR-CASE:6 panic_message=0 diverged=0 unbuildable=0 oracle_off_pin=0",
         "A64_FEATURE_SUITES family=std_main_statics_memory suites=8 programs=72 cells=144 llvm_runs=144 cg_runs=143 matched=143 refused=1 refusals=TCG-MIR-UNSUPPORTED:1 panic_message=0 diverged=0 unbuildable=0 oracle_off_pin=0",
         "A64_FEATURE_SUITES family=slices_aggregates_numerics suites=9 programs=157 cells=314 llvm_runs=314 cg_runs=314 matched=314 refused=0 refusals=none panic_message=0 diverged=0 unbuildable=0 oracle_off_pin=0",
         "A64_FEATURE_SUITES family=panics_unwind suites=2 programs=34 cells=68 llvm_runs=60 cg_runs=60 matched=60 refused=0 refusals=none panic_message=0 diverged=0 unbuildable=8 oracle_off_pin=0",
-    ), ((NATIVE_RUN, 8),), 8),
+    ), ((NATIVE_RUN, 9),), 9),
     Target("bridge_regressions_aarch64", 7, HOST_ORACLE, (
         "CLOSURE_DROP_CONSUMED rows=20 cells=40 matched=18 refused_closure_drop=8 refused_owned_drop=14 refused_box_glue=0 opts=0,3",
         "CLOSURE_DROP_ALLOCATION rows=5 cells=10 matched=2 refused_closure_drop=6 refused_owned_drop=2 opts=0,3",
@@ -768,6 +769,10 @@ OUT_OF_SCOPE = {
     "m100_str_memcpy_x86": (
         "x86_64-apple-darwin execution fixture; names the AArch64 triple only in a runner-probe "
         "unit test"
+    ),
+    "slice_parity_cross_targets": (
+        "cross-target object matrix requires the x86_64 Linux driver rust-lld and a "
+        "three-target sysroot; native Darwin print execution is in bridge_feature_suites_aarch64"
     ),
     "target_dir_resolution": (
         "unit tests of Cargo target-directory resolution; the triple is data, not a compile target"

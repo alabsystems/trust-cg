@@ -48,6 +48,9 @@ REGISTER_DECLARATIONS = {
     'trust_cg_x86_low3', 'trust_cg_x86_low3_body',
     'trust_cg_x86_is_extended', 'trust_cg_x86_is_extended_body',
     'trust_cg_x86_rex_byte', 'trust_cg_x86_rex_byte_body',
+    'trust_cg_x86_pack_fields', 'trust_cg_x86_pack_fields_body',
+    'trust_cg_x86_shr64_word', 'trust_cg_x86_shr64_word_body',
+    'trust_cg_x86_movabs_prefix', 'trust_cg_x86_movabs_prefix_body',
 }
 
 
@@ -56,10 +59,11 @@ def register_source_accepted(text, code, artifact_exists):
     rows = re.findall(
         r'Clean island kernel-checked: (\d+) declaration\(s\) registered \(([^\n]*)\)',
         text)
-    if code != 0 or not artifact_exists or len(rows) != 1 or rows[0][0] != '6':
+    expected = len(REGISTER_DECLARATIONS)
+    if code != 0 or not artifact_exists or len(rows) != 1 or int(rows[0][0]) != expected:
         return False
     names = [name.strip() for name in rows[0][1].split(',')]
-    return len(names) == 6 and set(names) == REGISTER_DECLARATIONS
+    return len(names) == expected and set(names) == REGISTER_DECLARATIONS
 
 
 def register_body_refused(text, code, artifact_exists, theorem):
@@ -99,7 +103,7 @@ def campaign(out):
     for name in INPUTS[:6]:
         commands.append((Path(name).stem, ROOT / "formal/lean",
             ["lake", "env", "lean", "-DwarningAsError=true", str(Path(name).relative_to("formal/lean"))]))
-    commands.append(("backend", ROOT, [str(ROOT / "scripts/trust_cargo.sh"), "test", "-p",
+    commands.append(("backend", ROOT, [str(ROOT / "scripts/trust_cargo.sh"), "test", "--locked", "-p",
         "trust-cg-codegen", "--test", "lean_encode_golden_binding"]))
     commands.append(("actual-register-controls", ROOT,
         [str(ROOT / "scripts/trust_cargo.sh"), "test", "--locked", "-p",
@@ -129,7 +133,7 @@ def campaign(out):
             steps[-1]['population'] = controls
             (out / "steps.json").write_text(json.dumps(steps, indent=2) + "\n")
         print(f"TRUST-CLEAN-STEP {label} passed", flush=True)
-    marker = "SHR-CHECKS axioms=foundational-only declarations=9 prefixes=16 backend_cases=4096 resident_choices=2 decoder_refusals=9"
+    marker = "SHR-CHECKS axioms=foundational-only declarations=12 prefixes=16 backend_cases=4096 resident_choices=2 decoder_refusals=9"
     if marker not in (out / "ShrChecks.log").read_text() or before != hashes():
         raise SystemExit("missing audit marker or inputs changed")
     source = ROOT / INPUTS[0]
@@ -138,19 +142,35 @@ def campaign(out):
         'const MASKED: u8 = trust_cg_x86_low3(255);\n'
         'const EXTENDED: bool = trust_cg_x86_is_extended(255) == 1;\n'
         'const REX: u8 = trust_cg_x86_rex_byte(1, 0, 1, 0);\n'
+        'const PACKED: u8 = trust_cg_x86_pack_fields(3, 5, 2);\n'
+        'const SHR64: u32 = trust_cg_x86_shr64_word(1, 7, 255);\n'
+        'const MOVABS: u16 = trust_cg_x86_movabs_prefix(1, 7);\n'
         'fn main() { assert_eq!(MASKED,7); assert!(EXTENDED); assert_eq!(REX,74); '
+        'assert_eq!(PACKED,0xEA); assert_eq!(SHR64,0xFFEFC149); assert_eq!(MOVABS,0xBF49); '
         'for r in 0u8..=255 { '
         'assert_eq!(trust_cg_x86_low3(r),r % 8); '
         'assert_eq!(trust_cg_x86_is_extended(r) == 1,u16::from(r)/8 != 0); } '
         'for flags in 0u8..16 { '
         'assert_eq!(trust_cg_x86_rex_byte(flags/8, (flags/4)%2, '
         '(flags/2)%2, flags%2),64+flags); } '
-        'println!("CLEAN-BITS low3=256 extended=256 rex=16 ctfe=3"); }\n')
+        'for high in 0u8..=255 { for middle in 0u8..8 { for low in 0u8..8 { '
+        'assert_eq!(trust_cg_x86_pack_fields(high,middle,low), '
+        '(high << 6) | (middle << 3) | low); } } } '
+        'for high in 0u8..2 { for low in 0u8..8 { for imm in 0u8..=255 { '
+        'assert_eq!(trust_cg_x86_shr64_word(high.into(),low.into(),imm.into()).to_le_bytes(), '
+        '[0x48+high,0xC1,0xE8+low,imm]); } } } '
+        'for high in 0u8..2 { for low in 0u8..8 { '
+        'assert_eq!(trust_cg_x86_movabs_prefix(high.into(),low.into()).to_le_bytes(), '
+        '[0x48+high,0xB8+low]); } } '
+        'println!("CLEAN-BITS low3=256 extended=256 rex=16 pack=16384 shr64=4096 movabs=16 ctfe=6"); }\n')
     cases = [('native-positive', wrapper, None)]
     for label, original, changed, theorem in [
         ('low3', 'reg &&& 7', 'reg &&& 6', 'trust_cg_x86_low3_body'),
         ('extended', 'reg < 8', 'reg < 9', 'trust_cg_x86_is_extended_body'),
         ('rex-byte', '0x40', '0x41', 'trust_cg_x86_rex_byte_body'),
+        ('pack-fields', 'high * 64', 'high * 32', 'trust_cg_x86_pack_fields_body'),
+        ('shr64-word', '0x00E8C148', '0x00E8C149', 'trust_cg_x86_shr64_word_body'),
+        ('movabs-prefix', '0xB848', '0xB849', 'trust_cg_x86_movabs_prefix_body'),
     ]:
         text = source.read_text()
         if text.count(original) != 2:
@@ -203,7 +223,7 @@ def campaign(out):
                 raise SystemExit('missing native proof census')
             runtime = subprocess.check_output([str(artifact)], timeout=30)
             (out / 'native-runtime.log').write_bytes(runtime)
-            if b'CLEAN-BITS low3=256 extended=256 rex=16 ctfe=3' not in runtime:
+            if b'CLEAN-BITS low3=256 extended=256 rex=16 pack=16384 shr64=4096 movabs=16 ctfe=6' not in runtime:
                 raise SystemExit('missing runtime/CTFE controls')
     if before != hashes():
         raise SystemExit('inputs changed during native controls')

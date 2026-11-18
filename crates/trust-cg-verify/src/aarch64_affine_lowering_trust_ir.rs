@@ -27,6 +27,8 @@ pub use final_bytes::{
 
 #[path = "aarch64_defined_callee.rs"]
 mod defined_callee;
+#[cfg(feature = "source-defined-call")]
+pub(crate) use defined_callee::scalar_abi as check_plain_integer_entry_abi;
 pub use defined_callee::{
     AttachedDefinedAffineCallee, DefinedAffineCallee, DefinedAffineCalleeError,
     DefinedCalleeEffects, DefinedCalleeScalarType,

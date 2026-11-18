@@ -21,7 +21,7 @@
 
 use thiserror::Error;
 
-use trust_cg_ir::{AArch64Opcode, BlockId, InstId, MachFunction, MachInst, MachOperand};
+use trust_cg_ir::{AArch64Opcode, BlockId, CondCode, InstId, MachFunction, MachInst, MachOperand};
 
 // ---------------------------------------------------------------------------
 // Errors
@@ -321,6 +321,7 @@ fn get_branch_target_block(inst: &MachInst) -> Option<BlockId> {
 // ---------------------------------------------------------------------------
 
 /// Relax a single out-of-range branch at position `inst_pos` in the block.
+/// An always-taken B.cond becomes a direct B in the same word slot.
 ///
 /// The pattern is: invert the short-range conditional branch to skip over an
 /// inserted unconditional B to the far target.
@@ -345,44 +346,31 @@ fn relax_one_branch(
 
     match inst.opcode {
         AArch64Opcode::BCond => {
-            // BCond has operands: [Imm(condition_code), Block(target)]
-            // Invert condition, make short branch skip the next instruction.
-            let cc_val = inst
-                .operands
-                .iter()
-                .find_map(|op| {
-                    if let MachOperand::Imm(v) = op {
-                        Some(*v)
-                    } else {
-                        None
-                    }
-                })
-                .unwrap_or(0);
-            let inverted_cc = invert_cc(cc_val as u8);
-
-            // Create inverted BCond that skips the next instruction.
-            // The +8 offset will be resolved in the final code emission;
-            // we use a sentinel block for now but actually we just need to
-            // branch over 1 instruction. We'll create a new block with just
-            // the B instruction, inserted right after this block in layout.
-            //
-            // Simpler approach: replace the BCond with BCond_inv(+8) and
-            // insert a B far_target right after it in the same block.
-
-            // Rewrite the BCond instruction in place: inverted condition, no
-            // block target (the +8 is implicit -- it always jumps over the
-            // next instruction).
+            let [MachOperand::Imm(encoding), MachOperand::Block(_)] = inst.operands.as_slice()
+            else {
+                return Err(RelaxError::MalformedFunction(format!(
+                    "out-of-range B.cond requires an immediate condition and a block, got {:?}",
+                    inst.operands
+                )));
+            };
+            let condition = CondCode::from_encoding(*encoding).ok_or_else(|| {
+                RelaxError::MalformedFunction(format!("invalid B.cond condition {encoding}"))
+            })?;
+            let mut far_b = MachInst::new(AArch64Opcode::B, vec![MachOperand::Block(far_target)]);
+            far_b.source_loc = inst.source_loc;
+            let Some(complement) = condition.logical_complement() else {
+                // AL and NV always take the branch for every NZCV state.
+                *func.inst_mut(inst_id) = far_b;
+                drop_obsolete_layout_edge(func, block_id);
+                return Ok(());
+            };
             let inv_bcond = MachInst::new(
                 AArch64Opcode::BCond,
-                vec![MachOperand::Imm(inverted_cc as i64), MachOperand::Imm(2)],
-                // Imm(2) = +8 bytes = skip 2 instructions (but we encode as
-                // offset in instruction units; the final pass resolves this).
-                // Actually: +8 bytes / 4 = 2 instruction units forward.
-                // But we just need to skip the *next* instruction (1 inst = 4 bytes).
-                // imm19 field = 2 means +8 bytes. We store raw imm here.
+                vec![
+                    MachOperand::Imm(i64::from(complement.encoding())),
+                    MachOperand::Imm(2), // +8 bytes skips the following B
+                ],
             );
-
-            let far_b = MachInst::new(AArch64Opcode::B, vec![MachOperand::Block(far_target)]);
 
             // Replace the original BCond with the inverted one and insert B
             // after it.
@@ -499,10 +487,33 @@ fn relax_one_branch(
     Ok(())
 }
 
-/// Invert an AArch64 condition code (as a u8).
-fn invert_cc(cc: u8) -> u8 {
-    // AArch64 condition codes: inversion is just flipping bit 0.
-    cc ^ 1
+/// Drop the physical fallthrough edge if the rewritten block has no other
+/// transfer to that successor. The final-stream checker owns resolved edges.
+fn drop_obsolete_layout_edge(func: &mut MachFunction, block: BlockId) {
+    let Some(next) = func
+        .block_order
+        .windows(2)
+        .find_map(|pair| (pair[0] == block).then_some(pair[1]))
+    else {
+        return;
+    };
+    let block_data = func.block(block);
+    if !block_data.succs.contains(&next)
+        || block_data.insts.iter().any(|&id| {
+            let inst = func.inst(id);
+            inst.is_branch()
+                && !is_branch_with_block_target(inst)
+                && inst
+                    .operands
+                    .iter()
+                    .any(|operand| operand.as_imm().is_some())
+        })
+        || crate::pipeline::derive_ir_cfg_edges_from_branch_operands(func).contains(&(block, next))
+    {
+        return;
+    }
+    func.block_mut(block).succs.retain(|target| *target != next);
+    func.block_mut(next).preds.retain(|source| *source != block);
 }
 
 // ---------------------------------------------------------------------------
@@ -726,21 +737,23 @@ fn is_padding(inst: &MachInst) -> bool {
 fn complemented_conditional(inst: &MachInst) -> Result<MachInst, String> {
     let mut complement = inst.clone();
     match inst.opcode {
-        AArch64Opcode::BCond => match inst.operands.first() {
-            Some(MachOperand::Imm(cc)) if (0..=13).contains(cc) => {
-                complement.operands[0] = MachOperand::Imm(cc ^ 1);
+        AArch64Opcode::BCond => {
+            match inst.operands.first() {
+                Some(MachOperand::Imm(cc)) => {
+                    let condition = CondCode::from_encoding(*cc)
+                        .ok_or_else(|| format!("condition code {cc} is outside 0..=15"))?;
+                    let inverse = condition.logical_complement().ok_or_else(|| {
+                    format!("condition code {cc} has no logical complement (AL/NV hold unconditionally)")
+                })?;
+                    complement.operands[0] = MachOperand::Imm(i64::from(inverse.encoding()));
+                }
+                other => {
+                    return Err(format!(
+                        "condition operand {other:?} is not an immediate condition code"
+                    ));
+                }
             }
-            Some(MachOperand::Imm(cc)) => {
-                return Err(format!(
-                    "condition code {cc} has no logical complement (AL/NV hold unconditionally)"
-                ));
-            }
-            other => {
-                return Err(format!(
-                    "condition operand {other:?} is not an immediate condition code"
-                ));
-            }
-        },
+        }
         AArch64Opcode::Cbz => complement.opcode = AArch64Opcode::Cbnz,
         AArch64Opcode::Cbnz => complement.opcode = AArch64Opcode::Cbz,
         AArch64Opcode::Tbz => complement.opcode = AArch64Opcode::Tbnz,
@@ -1373,21 +1386,6 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // test_invert_cc
-    // -----------------------------------------------------------------------
-    #[test]
-    fn test_invert_cc_values() {
-        assert_eq!(invert_cc(AArch64CC::EQ as u8), AArch64CC::NE as u8);
-        assert_eq!(invert_cc(AArch64CC::NE as u8), AArch64CC::EQ as u8);
-        assert_eq!(invert_cc(AArch64CC::HS as u8), AArch64CC::LO as u8);
-        assert_eq!(invert_cc(AArch64CC::LO as u8), AArch64CC::HS as u8);
-        assert_eq!(invert_cc(AArch64CC::GE as u8), AArch64CC::LT as u8);
-        assert_eq!(invert_cc(AArch64CC::LT as u8), AArch64CC::GE as u8);
-        assert_eq!(invert_cc(AArch64CC::GT as u8), AArch64CC::LE as u8);
-        assert_eq!(invert_cc(AArch64CC::LE as u8), AArch64CC::GT as u8);
-    }
-
-    // -----------------------------------------------------------------------
     // test_resolved_offsets
     // -----------------------------------------------------------------------
     #[test]
@@ -1724,6 +1722,88 @@ mod tests {
 
         // Second instruction: unconditional B to far target.
         assert_eq!(result.instructions[1].opcode, AArch64Opcode::B);
+    }
+
+    #[test]
+    fn far_al_and_nv_encode_one_unconditional_branch_to_the_original_target() {
+        let mut func = make_func("bcond_always_far", 3);
+        let target = BlockId(2);
+        let make_branch = |condition: CondCode| {
+            MachInst::new(
+                AArch64Opcode::BCond,
+                vec![
+                    MachOperand::Imm(i64::from(condition.encoding())),
+                    MachOperand::Block(target),
+                ],
+            )
+        };
+        let branch = add_inst(&mut func, BlockId(0), make_branch(CondCode::AL));
+        let filler = 1 << 18; // One word beyond the positive imm19 range.
+        for _ in 0..filler {
+            add_inst(
+                &mut func,
+                BlockId(1),
+                MachInst::new(AArch64Opcode::AlignNop, vec![]),
+            );
+        }
+        add_inst(&mut func, target, MachInst::new(AArch64Opcode::Ret, vec![]));
+        func.add_edge(BlockId(0), target);
+        func.add_edge(BlockId(1), target);
+
+        for condition in [CondCode::AL, CondCode::NV] {
+            *func.inst_mut(branch) = make_branch(condition);
+            func.add_edge(BlockId(0), BlockId(1));
+            let result = crate::lower::lower_function_no_frame(&mut func).unwrap();
+            assert_eq!(func.block(BlockId(0)).insts.as_slice(), [branch]);
+            assert_eq!(func.block(BlockId(0)).succs.as_slice(), [target]);
+            assert!(func.block(BlockId(1)).preds.is_empty());
+            assert_eq!(result.code.len(), (filler + 2) * 4);
+            assert_eq!(
+                u32::from_le_bytes(result.code[..4].try_into().unwrap()),
+                0x1400_0000 | (filler + 1) as u32,
+                "{condition:?} must take the far edge",
+            );
+        }
+    }
+
+    #[test]
+    fn far_al_rewrite_keeps_an_independent_edge_to_the_layout_successor() {
+        let mut func = make_func("bcond_always_shared_edge", 3);
+        let entry = BlockId(0);
+        let next = BlockId(1);
+        let target = BlockId(2);
+        let branch_to = |condition: CondCode, destination: BlockId| {
+            MachInst::new(
+                AArch64Opcode::BCond,
+                vec![
+                    MachOperand::Imm(i64::from(condition.encoding())),
+                    MachOperand::Block(destination),
+                ],
+            )
+        };
+        let other = add_inst(&mut func, entry, branch_to(CondCode::EQ, next));
+        let far = add_inst(&mut func, entry, branch_to(CondCode::AL, target));
+        func.add_edge(entry, next);
+        func.add_edge(entry, target);
+
+        for earlier_branch in [
+            branch_to(CondCode::EQ, next),
+            MachInst::new(
+                AArch64Opcode::BCond,
+                vec![
+                    MachOperand::Imm(i64::from(CondCode::EQ.encoding())),
+                    MachOperand::Imm(2),
+                    MachOperand::Special(trust_cg_ir::SpecialReg::XZR),
+                ],
+            ),
+        ] {
+            *func.inst_mut(other) = earlier_branch;
+            *func.inst_mut(far) = branch_to(CondCode::AL, target);
+            relax_one_branch(&mut func, entry, 1).unwrap();
+            assert_eq!(func.inst(far).opcode, AArch64Opcode::B);
+            assert_eq!(func.block(entry).succs.as_slice(), [next, target]);
+            assert_eq!(func.block(next).preds.as_slice(), [entry]);
+        }
     }
 
     // -----------------------------------------------------------------------

@@ -37,13 +37,13 @@ pub const COMPILE_ARTIFACT_PROFILE_USE_DISABLED_SHA256: &str =
 ///
 /// Proof-authoritative partitions require an explicit source-lock identity instead.
 pub const COMPILE_ARTIFACT_DEFAULT_TRUST_IR_IDENTITY: &str =
-    "trust_ir:8bae728257b123d6394b2dc049b3573ad885049f";
+    "trust_ir:899d46e7a303fad2b706a88a7a8eda41ec47dcfe";
 
 /// AY revision identity used by unchecked production cache partitions.
 ///
 /// Proof-authoritative partitions require an explicit source-lock identity instead.
 pub const COMPILE_ARTIFACT_DEFAULT_AY_IDENTITY: &str =
-    "ay:8bbc43108643d475a81a89b2b4f262e817ee1724";
+    "ay:12d411d420e27eea05099f8cd277eb288e8622c9";
 
 /// Maximum manifest size accepted when replaying a local compile artifact cache entry.
 pub const COMPILE_ARTIFACT_CACHE_MAX_MANIFEST_BYTES: u64 = 1024 * 1024;

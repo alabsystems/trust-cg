@@ -307,6 +307,26 @@ const PINNED_REASONS: &[(&str, &str)] = &[
         "template_blob_is_not_a_module",
         trust_cg_codegen::pipeline::TEMPLATE_IS_NOT_A_MODULE,
     ),
+    (
+        "box_deref_unestablished_parameter",
+        "BoxDerefConjunctUnestablished",
+    ),
+    (
+        "box_deref_unestablished_null_operand",
+        "BoxDerefConjunctUnestablished",
+    ),
+    (
+        "box_deref_unestablished_freed_operand",
+        "BoxDerefConjunctUnestablished",
+    ),
+    (
+        "box_deref_unestablished_loaded_operand",
+        "BoxDerefConjunctUnestablished",
+    ),
+    (
+        "blob_box_deref_unestablished_below_its_version",
+        "invalid tag: 3",
+    ),
 ];
 
 fn check_lane(lane: &CliLane, rows: &[Row], report: &Report, failures: &mut Vec<String>) {

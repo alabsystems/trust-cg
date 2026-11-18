@@ -17,6 +17,9 @@ homepage.workspace = true
 [lints]
 workspace = true
 
+[features]
+trust-child-resources = []
+
 [dependencies]
 sha2 = "0.10"
 

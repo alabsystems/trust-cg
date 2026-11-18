@@ -1400,6 +1400,7 @@ def cargo_config_record(
     auditor = cargo_config_auditor()
     return auditor.audit(
         cwd, os.environ if environment is None else environment, auditor.committed_config(ROOT, git), tool,
+        native_targo=True,
     )
 
 
@@ -1424,7 +1425,7 @@ def dependency_recorder():
 def dependency_identity(git: str, environment: dict | None = None) -> dict:
     """Record the Git dependencies the root Cargo.lock resolves in Cargo's home."""
     recorder = dependency_recorder()
-    cargo_home, origin = recorder.cargo_home_from(os.environ if environment is None else environment, ROOT)
+    cargo_home, origin = recorder.cargo_home_from(os.environ if environment is None else environment, ROOT, native_targo=True)
     return recorder.collect(ROOT / "Cargo.lock", cargo_home, git=git, cargo_home_source=origin)
 
 

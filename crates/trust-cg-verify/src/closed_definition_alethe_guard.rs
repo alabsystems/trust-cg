@@ -104,7 +104,7 @@ impl Composer<'_> {
 
     /// Eq(left,right) transports a genuine signed unit in either direction.
     /// Exact rule schemas dictate clause order, including negative units.
-    fn signed_transport(
+    pub(super) fn signed_transport(
         &mut self,
         left: &E,
         right: &E,

@@ -233,11 +233,81 @@ pub fn split_interval(
     split_interval_checked(interval, split_point, func).ok()
 }
 
+/// The arena's highest register ID across a sequence of
+/// [`split_interval_checked_cached`] calls on one function.
+///
+/// Every split asks for a fresh register ID through
+/// [`MachFunction::vreg_allocation_plan`], which scans every instruction for
+/// the highest ID in use; the greedy allocator's split loop made that one
+/// whole-function scan per split attempt. The cache takes the scan once, at
+/// the first attempt that needs it, and after each successful split records
+/// `max(cached, new_vreg)`.
+///
+/// Why every later plan issues the ID a fresh scan would: a declined split
+/// leaves the function and its counter unchanged. A successful split issues
+/// `new_vreg = max(next_vreg, highest + 1)`, sets `next_vreg = new_vreg + 1`,
+/// and adds no ID other than `new_vreg` (the operand rewrite and the copies
+/// name only the original and the new register). So after it every ID in the
+/// arena, and the cached value, is below `next_vreg`, and the next plan issues
+/// `next_vreg` either way. Before the first success the cached value is the
+/// scan itself.
+///
+/// Precondition, the caller's to keep: between the first use and the last,
+/// the function changes only through splits made with this cache. A function
+/// edited any other way needs a fresh cache. In test and debug builds every
+/// plan is compared with one built from a fresh scan.
+#[derive(Debug, Default)]
+pub(crate) struct SplitIdCache {
+    highest: Option<Option<u32>>,
+}
+
+impl SplitIdCache {
+    /// The ID plan for splitting `original_vreg`, which it observes.
+    fn plan(
+        &mut self,
+        func: &MachFunction,
+        original_vreg: VReg,
+    ) -> crate::machine_types::VRegAllocationPlan {
+        let highest = *self.highest.get_or_insert_with(|| func.highest_vreg_id());
+        let mut plan = func.vreg_allocation_plan_with_highest(highest);
+        plan.observe(original_vreg);
+        #[cfg(any(test, debug_assertions))]
+        {
+            let mut fresh = func.vreg_allocation_plan();
+            fresh.observe(original_vreg);
+            assert_eq!(
+                plan.peek_id(),
+                fresh.peek_id(),
+                "split ID cache would issue a different register ID in `{}`",
+                func.name
+            );
+        }
+        plan
+    }
+
+    fn record(&mut self, new_vreg: VReg) {
+        if let Some(highest) = &mut self.highest {
+            *highest = Some(highest.map_or(new_vreg.id, |h| h.max(new_vreg.id)));
+        }
+    }
+}
+
 /// Split a live interval and report why unsupported split points fail.
 pub fn split_interval_checked(
     interval: &LiveInterval,
     split_point: u32,
     func: &mut MachFunction,
+) -> Result<SplitResult, SplitError> {
+    split_interval_checked_cached(interval, split_point, func, &mut SplitIdCache::default())
+}
+
+/// [`split_interval_checked`], taking the arena's highest register ID from
+/// `ids_cache` (see [`SplitIdCache`] for when that is exact) instead of scanning.
+pub(crate) fn split_interval_checked_cached(
+    interval: &LiveInterval,
+    split_point: u32,
+    func: &mut MachFunction,
+    ids_cache: &mut SplitIdCache,
 ) -> Result<SplitResult, SplitError> {
     // Validate: split point must be within the interval's overall extent.
     if split_point <= interval.start() || split_point >= interval.end() {
@@ -259,8 +329,7 @@ pub fn split_interval_checked(
         split_copy_plan(func, split_point, &rewrite_positions).map_err(SplitError::UnsafeCfg)?;
 
     let original_vreg = interval.vreg;
-    let mut ids = split_helper_timed(6, || func.vreg_allocation_plan());
-    ids.observe(original_vreg);
+    let mut ids = split_helper_timed(6, || ids_cache.plan(func, original_vreg));
     let new_vreg = ids
         .allocate(original_vreg.class)
         .ok_or(SplitError::VirtualRegisterExhausted)?;
@@ -330,6 +399,7 @@ pub fn split_interval_checked(
     rewrite_split_operands(func, original_vreg, new_vreg, split_point, &new_interval);
 
     copy_plan.insert_copies(func, original_vreg, new_vreg);
+    ids_cache.record(new_vreg);
 
     Ok(SplitResult {
         original_vreg,
@@ -1588,6 +1658,38 @@ mod tests {
         // New interval should cover [10, 20).
         assert_eq!(result.new_interval.start(), 10);
         assert_eq!(result.new_interval.end(), 20);
+    }
+
+    /// A sequence of splits made through one [`SplitIdCache`] issues the same
+    /// register IDs, and leaves the same function, as the same splits each
+    /// planned from a fresh whole-function scan. The counter starts stale
+    /// (below IDs the arena already names), so the first plan must take the
+    /// scan's answer, and the later ones must follow the counter the splits
+    /// advance.
+    #[test]
+    fn split_id_cache_issues_the_scanned_ids_across_splits() {
+        let mut cached = make_test_func(20);
+        cached.next_vreg = 3;
+        let mut fresh = cached.clone();
+        let mut ids = SplitIdCache::default();
+        let mut issued = Vec::new();
+        for (id, point) in [(0u32, 10u32), (1, 12), (2, 9), (4, 15), (0, 11)] {
+            let interval = make_interval(id, &[(id, 20)], &[id + 2, 18], &[id]);
+            let a = split_interval_checked_cached(&interval, point, &mut cached, &mut ids);
+            let b = split_interval_checked(&interval, point, &mut fresh);
+            assert_eq!(
+                a.as_ref().map(|r| r.new_vreg).ok(),
+                b.as_ref().map(|r| r.new_vreg).ok()
+            );
+            issued.extend(a.ok().map(|r| r.new_vreg.id));
+            assert_eq!(format!("{cached:?}"), format!("{fresh:?}"));
+        }
+        assert_eq!(
+            issued.first(),
+            Some(&20),
+            "the first ID comes from the scan"
+        );
+        assert!(issued.windows(2).all(|w| w[1] == w[0] + 1), "{issued:?}");
     }
 
     #[test]

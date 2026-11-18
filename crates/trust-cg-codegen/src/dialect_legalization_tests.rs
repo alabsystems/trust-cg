@@ -33,6 +33,56 @@ fn handle_ty() -> Ty {
     Ty::Dialect(Box::new(DialectTy::new(NS, "handle", 1)))
 }
 
+#[test]
+fn box_type_substitution_visits_pointer_and_pointee_without_restamping_its_fact() {
+    use trust_ir::box_validity::{
+        BoxDerefSite, BoxFactSession, BoxPointee, BoxValidityFact, PremiseRoot,
+    };
+    let mut inst = Inst::BoxDeref {
+        ptr_ty: Ty::PtrConst(Box::new(handle_ty())),
+        pointee: BoxPointee::Sized { ty: handle_ty() },
+        operand: v(17),
+        fact: Box::new(BoxValidityFact::premise(
+            BoxDerefSite {
+                item: [3; 16],
+                ordinal: 5,
+            },
+            BoxFactSession::PROOF_SNAPSHOT,
+            PremiseRoot::ParamByValue,
+        )),
+    };
+    let original = inst.clone();
+    let carriers = HashMap::from([(DialectTy::new(NS, "handle", 1), Ty::U32)]);
+    let mut seen = Vec::new();
+    inst_types_mut(&mut inst, |ty| {
+        seen.push(ty.clone());
+        substitute_ty(ty, &carriers);
+    });
+    let mut expected = Vec::new();
+    original.visit_type_roots(|ty| expected.push(ty.clone()));
+    assert_eq!(seen, expected);
+    let Inst::BoxDeref {
+        ptr_ty,
+        pointee,
+        operand,
+        fact,
+    } = &inst
+    else {
+        panic!()
+    };
+    assert_eq!(ptr_ty, &Ty::PtrConst(Box::new(Ty::U32)));
+    assert_eq!(pointee.ty(), &Ty::U32);
+    let Inst::BoxDeref {
+        fact: original_fact,
+        ..
+    } = &original
+    else {
+        panic!()
+    };
+    assert_eq!(fact, original_fact);
+    assert_eq!(*operand, v(17));
+}
+
 fn op_node(op: DialectInst, result: Option<u32>) -> InstrNode {
     let node = InstrNode::new(Inst::DialectOp(Box::new(op)));
     match result {

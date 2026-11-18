@@ -9327,6 +9327,19 @@ impl InstructionSelector {
             // returning a by-value aggregate — `-> Result<i64,i64>`, and the
             // coroutine resume fn's `-> CoroutineState<Y,R>` — lower on aarch64.
             if sig_ty.is_aggregate() {
+                if matches!(sig_ty, Type::Struct(fields) if fields.is_empty())
+                    && &arg_ty != sig_ty
+                    && arg_ty != Type::I64
+                {
+                    // Ignoring physical bytes does not erase the logical
+                    // return type. Retain only the exact empty value or the
+                    // existing I64 aggregate-storage address representation.
+                    return Err(ISelError::ReturnTypeMismatch {
+                        index: i,
+                        expected: format!("{sig_ty:?}"),
+                        actual: format!("{arg_ty:?}"),
+                    });
+                }
                 continue;
             }
             let sig_class = reg_class_for_type(sig_ty);
@@ -9991,7 +10004,33 @@ impl InstructionSelector {
                 self.define_value(val, addr, ty.clone());
                 return Ok(());
             }
-            ArgLocation::Ignore | ArgLocation::Stack { .. } => {
+            ArgLocation::Ignore => {
+                if !matches!(ty, Type::Struct(fields) if fields.is_empty()) || sret_addr.is_some() {
+                    return Err(ISelError::UnsupportedReturnLocation);
+                }
+                // No byte or return register crosses this ABI boundary.
+                // Preserve the logical aggregate value using the same private
+                // address carrier as ignored formal arguments. This slot is
+                // implementation storage, not an original source allocation,
+                // initialized payload, pointer image or provenance witness.
+                let slot = self.func.stack_slots.len() as u32;
+                self.func.stack_slots.push(StackSlotInfo::new(1, 1));
+                let dst = self.new_vreg(RegClass::Gpr64);
+                self.emit(
+                    block,
+                    ISelInst::new(
+                        AArch64Opcode::AddPCRel,
+                        vec![
+                            ISelOperand::VReg(dst),
+                            ISelOperand::PReg(SP),
+                            ISelOperand::StackSlot(slot),
+                        ],
+                    ),
+                );
+                self.define_value(val, ISelOperand::VReg(dst), ty.clone());
+                return Ok(());
+            }
+            ArgLocation::Stack { .. } => {
                 return Err(ISelError::UnsupportedReturnLocation);
             }
             ArgLocation::RegSequence(regs) if regs.is_empty() => {
@@ -13043,6 +13082,12 @@ impl InstructionSelector {
         agg_ty: &Type,
         block: Block,
     ) -> Result<(), ISelError> {
+        if matches!(agg_ty, Type::Struct(fields) if fields.is_empty()) {
+            // The source value was still evaluated and Return's logical arity
+            // checked. An empty-record result has no payload to read or return
+            // register to define; it does not become a scalar or source Unit.
+            return Ok(());
+        }
         let size = agg_ty.bytes();
 
         // Check for HFA first: return in consecutive typed FPR registers.
@@ -30204,6 +30249,124 @@ mod tests {
             regs.get(&key(&ISelOperand::PReg(gpr::X0))).copied(),
             regs.get(&key(&ISelOperand::PReg(gpr::X1))).copied(),
         )
+    }
+
+    #[test]
+    fn empty_aggregate_return_keeps_logical_arity_without_payload_reads() {
+        let empty = Type::Struct(vec![]);
+        let sig = Signature {
+            params: vec![empty.clone()],
+            returns: vec![empty.clone()],
+        };
+        let mut isel = InstructionSelector::new_darwin_test("empty_return".into(), sig.clone());
+        let block = Block(0);
+        isel.lower_formal_arguments(&sig, block).unwrap();
+        let missing = Instruction {
+            opcode: Opcode::Return,
+            args: vec![],
+            results: vec![],
+        };
+        assert!(matches!(
+            isel.select_return(&missing, block),
+            Err(ISelError::ReturnArityMismatch {
+                expected: 1,
+                actual: 0
+            })
+        ));
+        let wrong = Instruction {
+            opcode: Opcode::Return,
+            args: vec![Value(9)],
+            results: vec![],
+        };
+        assert!(matches!(
+            isel.select_return(&wrong, block),
+            Err(ISelError::UndefinedValue(_))
+        ));
+        let wrong_reg = isel.new_vreg(RegClass::Fpr64);
+        isel.define_value(Value(9), ISelOperand::VReg(wrong_reg), Type::F64);
+        assert!(matches!(
+            isel.select_return(&wrong, block),
+            Err(ISelError::ReturnTypeMismatch { .. })
+        ));
+        isel.select_return(
+            &Instruction {
+                opcode: Opcode::Return,
+                args: vec![Value(0)],
+                results: vec![],
+            },
+            block,
+        )
+        .unwrap();
+        assert_eq!(isel.func.sig.returns, vec![empty]);
+        let instructions = &isel.func.blocks[&block].insts;
+        assert_eq!(instructions.len(), 2);
+        assert_eq!(instructions[0].opcode, AArch64Opcode::AddPCRel);
+        assert_eq!(instructions[1].opcode, AArch64Opcode::Ret);
+        assert!(instructions[1].implicit_uses.is_empty());
+    }
+
+    #[test]
+    fn empty_aggregate_return_call_result_uses_only_private_address_storage() {
+        let empty = Type::Struct(vec![]);
+        let mut isel = InstructionSelector::new_darwin_test(
+            "empty_call_result".into(),
+            Signature {
+                params: vec![],
+                returns: vec![],
+            },
+        );
+        let block = Block(0);
+        isel.materialize_aggregate_call_result(Value(9), &empty, &ArgLocation::Ignore, None, block)
+            .unwrap();
+        assert_eq!(isel.value_type(&Value(9)), empty);
+        assert!(matches!(
+            isel.use_value(&Value(9)),
+            Ok(ISelOperand::VReg(_))
+        ));
+        assert_eq!(isel.func.stack_slots.len(), 1);
+        assert_eq!(isel.func.stack_slots[0].size, 1);
+        assert_eq!(isel.func.stack_slots[0].align, 1);
+        assert_eq!(isel.func.blocks[&block].insts.len(), 1);
+        assert_eq!(
+            isel.func.blocks[&block].insts[0].opcode,
+            AArch64Opcode::AddPCRel
+        );
+        let source = isel.use_value(&Value(9)).unwrap();
+        isel.select_aggregate_return(source, &empty, block).unwrap();
+        assert_eq!(isel.func.blocks[&block].insts.len(), 1);
+    }
+
+    #[test]
+    fn empty_aggregate_return_refuses_false_ignore_or_hidden_pointer() {
+        let empty = Type::Struct(vec![]);
+        for (ty, hidden) in [
+            (Type::Struct(vec![Type::I64]), None),
+            (Type::Array(Box::new(Type::I8), 0), None),
+            (empty, Some(ISelOperand::PReg(gpr::X8))),
+        ] {
+            let mut isel = InstructionSelector::new_darwin_test(
+                "bad_empty_result".into(),
+                Signature {
+                    params: vec![],
+                    returns: vec![],
+                },
+            );
+            assert!(matches!(
+                isel.materialize_aggregate_call_result(
+                    Value(9),
+                    &ty,
+                    &ArgLocation::Ignore,
+                    hidden,
+                    Block(0)
+                ),
+                Err(ISelError::UnsupportedReturnLocation)
+            ));
+            assert!(isel.func.stack_slots.is_empty());
+            assert!(matches!(
+                isel.use_value(&Value(9)),
+                Err(ISelError::UndefinedValue(_))
+            ));
+        }
     }
 
     #[test]

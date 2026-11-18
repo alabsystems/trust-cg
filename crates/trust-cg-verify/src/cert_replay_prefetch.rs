@@ -56,7 +56,9 @@
 //! the store's switches: with no store (`TCG_NO_CERT_STORE`,
 //! `TCG_NO_PROOF_CACHE`) or while the verdict DB records, nothing is read,
 //! prefetched or written. A process that never calls [`set_scope`] (the CLI,
-//! TY, the test suites) is unaffected.
+//! TY, the test suites) is unaffected. A hint's modification time is its last
+//! use (it is set when the hint is read or written), and the store's sweep
+//! evicts hints by it over [`REPLAY_HINT_CAP_BYTES`].
 //!
 //! # End of the compile
 //!
@@ -86,7 +88,19 @@ pub(crate) const MAX_HINTED_REPLAYS: usize = 4_096;
 const MAX_HINT_BYTES: u64 = 512 * 1024;
 
 /// Subdirectory of the certificate store that holds the hints.
-const HINT_NAMESPACE: &str = "replay-hints";
+pub(crate) const HINT_NAMESPACE: &str = "replay-hints";
+
+/// The most bytes of hints the store keeps: 64 MiB. Hints are evicted by the
+/// certificates' rule (least recently used first, by modification time; a
+/// read and a write each mark a use) in a sweep of their own, started with
+/// the certificates' ([`crate::obligation_cert_store::note_store_grew`]).
+/// `TCG_PROOF_REPLAY_HINT_CAP_BYTES` overrides it for tests and benchmarks
+/// only, as a rustc-bridge compile refuses `TCG_*`. On m18 on 2026-11-12 the
+/// store held 306,348 hints in 1.2 GiB, 4 KiB on average, most of them for
+/// scopes of worktrees long gone (a scope hashes the input path). 64 MiB
+/// keeps about 16,000 of that size; an evicted hint costs its scope's next
+/// compile its prefetch only.
+pub(crate) const REPLAY_HINT_CAP_BYTES: u64 = 64 << 20;
 
 /// What one hint file says: the certificates the scope's last compile
 /// consumed or published, in first-use order, and whether it queried the
@@ -230,8 +244,17 @@ pub fn prefetched_replays() -> u64 {
     PREFETCHED.load(Ordering::Relaxed)
 }
 
+/// Read this scope's hint, marking it used.
 fn read_hint() -> Option<ReplayHint> {
-    read_hint_at(&hint_path()?)
+    read_used_hint_at(&hint_path()?)
+}
+
+/// Read the hint at `path` and, when there is one, mark it used
+/// ([`crate::obligation_cert_store::mark_used`]).
+fn read_used_hint_at(path: &std::path::Path) -> Option<ReplayHint> {
+    let hint = read_hint_at(path)?;
+    crate::obligation_cert_store::mark_used(path);
+    Some(hint)
 }
 
 fn read_hint_at(path: &std::path::Path) -> Option<ReplayHint> {
@@ -356,9 +379,27 @@ pub fn persist() -> PersistOutcome {
         }
     };
     let loaded = LOADED.lock().unwrap_or_else(|p| p.into_inner()).clone();
-    let outcome = write_hint_at(&path, &hint, loaded.as_ref());
+    let outcome = write_hint_into_store(&path, &hint, loaded.as_ref());
     if outcome == PersistOutcome::Written {
         *LOADED.lock().unwrap_or_else(|p| p.into_inner()) = Some(hint);
+    }
+    outcome
+}
+
+/// [`write_hint_at`] the hint at `path`, in a store's
+/// [`HINT_NAMESPACE`] folder, and when it is written tell the store it grew
+/// ([`crate::obligation_cert_store::note_store_grew`]), which sweeps the
+/// store's folders when their sweeps are due.
+fn write_hint_into_store(
+    path: &std::path::Path,
+    hint: &ReplayHint,
+    loaded: Option<&ReplayHint>,
+) -> PersistOutcome {
+    let outcome = write_hint_at(path, hint, loaded);
+    if outcome == PersistOutcome::Written
+        && let Some(store) = path.parent().and_then(std::path::Path::parent)
+    {
+        crate::obligation_cert_store::note_store_grew(store);
     }
     outcome
 }
@@ -627,6 +668,75 @@ mod tests {
             None
         );
         assert_eq!(starts.load(Ordering::Relaxed), 1);
+    }
+
+    /// Set the modification time of the file at `path` to `hours` ago.
+    fn used_hours_ago(path: &std::path::Path, hours: u64) {
+        std::fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(
+                std::time::SystemTime::now() - std::time::Duration::from_secs(3600 * hours),
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn replay_hint_eviction_removes_the_least_recently_used_over_the_cap() {
+        let store = tempfile::tempdir().unwrap();
+        let hints = store.path().join(HINT_NAMESPACE);
+        let hint = ReplayHint {
+            keys: vec![key('a')],
+            resident_solver: false,
+        };
+        // Four hints, the first used longest ago.
+        let paths: Vec<_> = (0..4)
+            .map(|index| {
+                let path = hints.join(format!("{index:064x}.hint"));
+                assert_eq!(write_hint_at(&path, &hint, None), PersistOutcome::Written);
+                used_hours_ago(&path, 10 - index);
+                path
+            })
+            .collect();
+        let size = std::fs::metadata(&paths[0]).unwrap().len();
+        // A fifth written the way `persist` writes one, over a cap of four:
+        // the write starts the sweep, which removes the least recently used
+        // down to nine tenths of the cap, leaving three.
+        let fifth = hints.join(format!("{:064x}.hint", 4));
+        let cap = (4 * size).to_string();
+        assert_eq!(
+            trust_cg_process_env::with_env_overrides(
+                &[(crate::obligation_cert_store::HINT_CAP_ENV, &cap)],
+                || write_hint_into_store(&fifth, &hint, None)
+            ),
+            PersistOutcome::Written
+        );
+        crate::obligation_cert_store::wait_for_sweep_for_test(store.path());
+        for (index, path) in paths.iter().enumerate() {
+            assert_eq!(path.exists(), index >= 2, "hint {index}");
+        }
+        assert!(fifth.exists());
+    }
+
+    #[test]
+    fn replay_hint_read_marks_the_hint_used() {
+        let store = tempfile::tempdir().unwrap();
+        let path = store.path().join(HINT_NAMESPACE).join("scope.hint");
+        let hint = ReplayHint {
+            keys: vec![key('b')],
+            resident_solver: true,
+        };
+        assert_eq!(write_hint_at(&path, &hint, None), PersistOutcome::Written);
+        used_hours_ago(&path, 10);
+        assert_eq!(read_used_hint_at(&path), Some(hint));
+        let since_use = std::time::SystemTime::now()
+            .duration_since(std::fs::metadata(&path).unwrap().modified().unwrap())
+            .unwrap_or_default();
+        assert!(
+            since_use < std::time::Duration::from_secs(3600),
+            "a read is a use: the hint's last use is now, not ten hours ago"
+        );
     }
 
     #[test]

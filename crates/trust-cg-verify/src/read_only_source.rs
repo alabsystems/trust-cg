@@ -115,6 +115,7 @@ impl Kind {
 enum Profile {
     ReadOnly,
     ScalarMemory(scalar_memory::Endpoint),
+    VoidMemory(scalar_memory::Endpoint),
     ScalarReturns(scalar_memory::Endpoint),
     ConditionalWrapper(scalar_memory::Endpoint),
     NativeAggregates(scalar_memory::Endpoint),
@@ -122,6 +123,9 @@ enum Profile {
 }
 
 impl Profile {
+    fn void_memory(self) -> bool {
+        matches!(self, Self::VoidMemory(_))
+    }
     fn native_events(self) -> bool {
         matches!(self, Self::NativeAggregates(_))
     }
@@ -140,6 +144,7 @@ impl Profile {
         matches!(
             self,
             Self::ScalarMemory(_)
+                | Self::VoidMemory(_)
                 | Self::ScalarReturns(_)
                 | Self::ConditionalWrapper(_)
                 | Self::NativeAggregates(_)
@@ -370,6 +375,7 @@ struct Observations {
     target: native_aggregate_target::Effects,
     native: Vec<native_aggregates::PendingNativeAggregateEvent>,
     result: Option<Term>,
+    normal_return: Option<Term>,
     vector: Option<Vec<Term>>,
     conditional: Option<conditional_wrapper::ObservedEffects>,
     reads: Vec<Read>,

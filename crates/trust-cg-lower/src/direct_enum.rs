@@ -237,7 +237,8 @@ impl DirectEnumImage {
 
 /// The `EnumDef` behind `ty` when `ty` is a DIRECT-TAG `Ty::Enum`: one with
 /// no producer descriptor, or a `Direct`-encoded one. Niche and untagged
-/// encodings answer `None`; their carriers are answered elsewhere.
+/// encodings answer `None`; their carriers are answered elsewhere. The separate
+/// DirectWithUninhabited storage-profile family is explicitly unmodeled here.
 pub(crate) fn direct_enum_def<'a>(ty: &Ty, enums: &'a [EnumDef]) -> Option<&'a EnumDef> {
     let Ty::Enum(eid) = ty else {
         return None;
@@ -287,18 +288,15 @@ pub(crate) fn enum_layout_matches_canonical(
 ) -> Result<(), String> {
     let tag_offset = match layout.encoding {
         EnumTagEncoding::Direct { tag_offset } => tag_offset,
+        EnumTagEncoding::DirectWithUninhabited { .. } => {
+            return Err("DirectWithUninhabited has inactive variants; canonical LIR enum agreement is not modeled".to_owned());
+        }
         EnumTagEncoding::Niche { .. } => {
             return Err("niche tag encoding; the LIR enum has no niche representation".to_string());
         }
         EnumTagEncoding::Untagged | EnumTagEncoding::SingleInhabited { .. } => {
             return Err(
                 "untagged encoding; the LIR enum has no tag-free representation".to_string(),
-            );
-        }
-        EnumTagEncoding::DirectWithUninhabited { .. } => {
-            return Err(
-                "direct-with-uninhabited encoding is not yet represented by the native enum carrier"
-                    .to_string(),
             );
         }
     };
@@ -843,6 +841,17 @@ pub(crate) fn direct_enum_carrier(
     refinements_validated: bool,
     depth: usize,
 ) -> Result<Type, AdapterError> {
+    if edef.layout.as_ref().is_some_and(|layout| {
+        matches!(
+            layout.encoding,
+            EnumTagEncoding::DirectWithUninhabited { .. }
+        )
+    }) {
+        return Err(refusal(
+            edef,
+            "DirectWithUninhabited storage profiles are not modeled; its proved-uninhabited variants and declared offsets cannot be treated as Direct",
+        ));
+    }
     let lane = direct_enum_tag_lane(edef).map_err(|reason| refusal(edef, reason))?;
     let variants = variant_lir_types(edef, tables, refinements_validated, depth)?;
     let canonical = Type::Enum {
@@ -881,6 +890,17 @@ pub(crate) fn direct_enum_image(
     payload_offset: Option<u32>,
     module: Option<&Module>,
 ) -> Result<DirectEnumImage, AdapterError> {
+    if edef.layout.as_ref().is_some_and(|layout| {
+        matches!(
+            layout.encoding,
+            EnumTagEncoding::DirectWithUninhabited { .. }
+        )
+    }) {
+        return Err(refusal(
+            edef,
+            "DirectWithUninhabited storage profiles are not modeled; its proved-uninhabited variants and declared offsets cannot be treated as Direct",
+        ));
+    }
     let lane = direct_enum_tag_lane(edef).map_err(|reason| refusal(edef, reason))?;
     match edef.layout.as_ref() {
         Some(layout) => {
@@ -957,6 +977,79 @@ pub fn module_direct_enum_image(
 mod tests {
     use super::*;
     use trust_ir::EnumVariant;
+
+    #[test]
+    fn inactive_direct_storage_is_not_reinterpreted_as_the_legacy_direct_image() {
+        use trust_ir::{FieldStorageLayout, UninhabitedVariantLayout};
+        let dead = EnumDef::new(EnumId::new(9), "Infallible", vec![]);
+        let mut definition = EnumDef::new(
+            EnumId::new(7),
+            "DirectWithDeadStorage",
+            vec![
+                variant("Dead", vec![Ty::Enum(dead.id)]),
+                variant("Live", vec![Ty::U32]),
+            ],
+        )
+        .with_repr(EnumTagRepr::U32);
+        definition.layout = Some(EnumLayoutDescriptor {
+            encoding: EnumTagEncoding::DirectWithUninhabited {
+                tag_offset: 0,
+                variants: vec![UninhabitedVariantLayout {
+                    variant: 0,
+                    size: 4,
+                    align: 4,
+                    fields: vec![FieldStorageLayout { size: 0, align: 1 }],
+                }],
+            },
+            size: 8,
+            align: 4,
+            variant_field_offsets: vec![vec![4], vec![4]],
+        });
+        let mut module = Module::new("current_direct_storage_boundary");
+        module.enums = vec![definition, dead];
+        assert!(
+            module.enum_layout_shape(EnumId::new(7)).is_ok(),
+            "the shared IR describes a real storage layout"
+        );
+        let definition = &module.enums[0];
+        let original = definition.layout.clone();
+        let tables = LayoutTables {
+            structs: &[],
+            types: &[],
+            enums: &module.enums,
+            records: &[],
+            closures: &[],
+        };
+        let error = direct_enum_carrier(definition, tables, false, 0).unwrap_err();
+        assert!(error.to_string().contains("DirectWithUninhabited"));
+        let carrier = Type::Struct(vec![Type::Array(Box::new(Type::I32), 2)]);
+        assert!(
+            direct_enum_image(definition, tables, &carrier, Some(4), Some(&module))
+                .unwrap_err()
+                .to_string()
+                .contains("DirectWithUninhabited")
+        );
+        assert!(
+            enum_layout_matches_canonical(definition.layout.as_ref().unwrap(), &carrier)
+                .unwrap_err()
+                .contains("DirectWithUninhabited")
+        );
+        assert_eq!(
+            definition.layout, original,
+            "the inactive roster and all physical offsets remain intact"
+        );
+
+        let legacy = EnumDef::new(
+            EnumId::new(0),
+            "LiveDirect",
+            vec![variant("A", vec![Ty::U32]), variant("B", vec![Ty::U32])],
+        )
+        .with_repr(EnumTagRepr::U32);
+        assert!(
+            direct_enum_carrier(&legacy, tables, false, 0).is_ok(),
+            "the existing direct family remains modeled"
+        );
+    }
 
     fn variant(name: &str, fields: Vec<Ty>) -> EnumVariant {
         EnumVariant {

@@ -23,6 +23,9 @@ use std::sync::Arc;
 #[path = "closed_definition_alethe_guard.rs"]
 mod guard;
 
+#[path = "closed_definition_alethe_array.rs"]
+mod arrays;
+
 // Unsupported by the current captured checker: construction/diagnostics only.
 #[cfg(test)]
 #[path = "closed_definition_alethe_polynomial.rs"]
@@ -35,6 +38,18 @@ mod tests;
 #[cfg(test)]
 #[path = "closed_definition_alethe_guard_tests.rs"]
 mod guard_tests;
+
+#[cfg(test)]
+#[path = "closed_definition_alethe_read_tests.rs"]
+mod read_tests;
+
+#[cfg(test)]
+#[path = "closed_definition_alethe_fixture.rs"]
+mod fixture;
+
+#[cfg(test)]
+#[path = "closed_definition_alethe_array_tests.rs"]
+mod array_tests;
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub(crate) enum ClosedDefinitionRefusal {
@@ -296,6 +311,9 @@ impl<'a> Graph<'a> {
             let literal = if let Some(definition) = self.definitions.get(&id) {
                 reserve_work::<Id>(&[], edges, 1)?;
                 self.nodes[definition.rhs].literal.clone()
+            } else if matches!(self.nodes[id].original, E::Select { .. }) {
+                self.read_plan(id, visits, edges)?
+                    .and_then(|plan| self.nodes[plan.value].literal.clone())
             } else {
                 let node = &self.nodes[id];
                 reserve_work::<Id>(&[], edges, node.children.len())?;
@@ -369,6 +387,9 @@ fn literal_operator(node: &E) -> bool {
             | E::BvMul { width: 1..=64, .. }
             | E::BvAnd { width: 1..=64, .. }
             | E::BvOr { width: 1..=64, .. }
+            | E::BvUle { width: 1..=64, .. }
+            | E::BvShl { width: 1..=64, .. }
+            | E::Extract { width: 1..=64, .. }
             | E::BvXor { width: 1..=64, .. }
             | E::BvNeg { width: 1..=64, .. }
             | E::Concat { width: 1..=64, .. }
@@ -526,6 +547,7 @@ enum LiteralWork {
     Visit(Id),
     Alias { node: Id, definition: Definition },
     Compound(Id),
+    ArrayRead { node: Id, plan: arrays::ReadPlan },
 }
 
 enum TruthWork {
@@ -546,6 +568,8 @@ struct Composer<'a> {
     /// inventory. No branch- or guard-local fact may enter this memo.
     literal_equalities: HashMap<Id, Id>,
     keys: Vec<Id>,
+    /// Root-local positive units indexed by selection keys only. Every use
+    /// still derives equality of the ORIGINAL terms and transports the unit.
     known_true: HashMap<Id, (Id, Id)>,
     truths: HashMap<Id, Id>,
     /// Signed units derived from this candidate's sole original refutation.
@@ -560,6 +584,29 @@ struct Composer<'a> {
 }
 
 impl Composer<'_> {
+    fn index_root_truths(&mut self) -> Result<(), ClosedDefinitionRefusal> {
+        // A projected conjunct may mention a source alias while the goal
+        // mentions its genuinely equal lowered alias. Exact-ID lookup alone
+        // misses that unit. Index only facts already proved under this SAME
+        // original refutation; never infer a unit from a key or expose it to
+        // unconditional literal metadata. One bounded scan replaces repeated
+        // searches through the root inventory for each Boolean goal.
+        for node in 0..self.graph.nodes.len() {
+            reserve_visits(&mut self.visits, 1)?;
+            if let Some(fact) = self
+                .root_facts
+                .as_ref()
+                .and_then(|facts| facts.get(node, true))
+            {
+                reserve_work::<Id>(&[], &mut self.edges, 1)?;
+                self.known_true
+                    .entry(self.keys[node])
+                    .or_insert((node, fact.proof()));
+            }
+        }
+        Ok(())
+    }
+
     fn selected_ite(&mut self, id: Id) -> Result<Option<(Id, Id)>, ClosedDefinitionRefusal> {
         if let Some(proof) = self.selected_ites.get(&id) {
             return Ok(Some(*proof));
@@ -657,6 +704,17 @@ impl Composer<'_> {
                             definition,
                         });
                         pending.push(LiteralWork::Visit(definition.rhs));
+                    } else if matches!(node.original, E::Select { .. }) {
+                        let plan = self
+                            .graph
+                            .read_plan(id, &mut self.visits, &mut self.edges)?
+                            .ok_or(ClosedDefinitionRefusal::Unsupported(
+                                "no closed array read derivation",
+                            ))?;
+                        let dependencies = plan.dependencies();
+                        reserve_work(&pending, &mut self.edges, dependencies.len() + 1)?;
+                        pending.push(LiteralWork::ArrayRead { node: id, plan });
+                        pending.extend(dependencies.into_iter().rev().map(LiteralWork::Visit));
                     } else if !literal_operator(node.original) {
                         return Err(ClosedDefinitionRefusal::Unsupported(
                             "no literal derivation",
@@ -689,6 +747,19 @@ impl Composer<'_> {
                         value,
                         "trans",
                         &[definition.premise, self.literal_equalities[&definition.rhs]],
+                    )?;
+                    self.literal_equalities.insert(id, proof);
+                }
+                LiteralWork::ArrayRead { node: id, plan } => {
+                    let path = self.array_read_equality(id, &plan)?;
+                    let value = self.graph.nodes[id].literal.as_ref().ok_or(
+                        ClosedDefinitionRefusal::Unsupported("closed array read lost its literal"),
+                    )?;
+                    let proof = self.text.equality(
+                        self.graph.nodes[id].spelled(),
+                        value,
+                        "trans",
+                        &[path, self.literal_equalities[&plan.value]],
                     )?;
                     self.literal_equalities.insert(id, proof);
                 }
@@ -838,6 +909,17 @@ impl Composer<'_> {
                             continue;
                         }
                     }
+                    // Two ground predicates can compute to the same Boolean
+                    // while their actual operands differ. Prove each complete
+                    // ORIGINAL term equal to that literal before attempting
+                    // positional congruence; selection metadata alone proves
+                    // nothing. The existing derivation checks every defining
+                    // equation/array read/operator under the same work caps.
+                    if let Some(id) = self.literal(pair)? {
+                        self.equalities.insert(pair, id);
+                        active.remove(&pair);
+                        continue;
+                    }
                     let left = &self.graph.nodes[pair.0];
                     let right = &self.graph.nodes[pair.1];
                     if left.head == right.head && left.children.len() == right.children.len() {
@@ -861,10 +943,13 @@ impl Composer<'_> {
                         pending.extend(children.into_iter().rev().map(Work::Visit));
                         continue;
                     }
-                    if let Some(id) = self.literal(pair)? {
-                        self.equalities.insert(pair, id);
-                        active.remove(&pair);
-                        continue;
+                    if crate::diag::solve_trace_enabled() {
+                        let a = &self.graph.nodes[pair.0];
+                        let b = &self.graph.nodes[pair.1];
+                        eprintln!(
+                            "TCG_SOLVE_TRACE closed_definition_no_congruence left_head={:?} left_literal={:?} right_head={:?} right_literal={:?}",
+                            a.head, a.literal, b.head, b.literal
+                        );
                     }
                     return Err(ClosedDefinitionRefusal::Unsupported(
                         "no congruence derivation",
@@ -1457,6 +1542,9 @@ fn compose_candidate(
         composer.root_facts = Some(facts);
     } else if boolean_goal {
         composer.root_facts = Some(composer.original_boolean_facts(&true_premises)?);
+    }
+    if boolean_goal {
+        composer.index_root_truths()?;
     }
     let equal = if boolean_goal {
         let truth = composer.truth(goal.1, goal.0)?;

@@ -24,6 +24,9 @@
 //! - `165..=196` FPR16 (H0-H31, aliases lower 16 bits of V0-V31)
 //! - `197..=228` FPR8  (B0-B31, aliases lower 8 bits of V0-V31)
 
+#[path = "../../../formal/lean/Trust/A64/ConditionBits.lean"]
+clean mod condition_bits;
+
 // ---------------------------------------------------------------------------
 // PReg — Physical Register
 // ---------------------------------------------------------------------------
@@ -898,6 +901,18 @@ pub const CS: CondCode = CondCode::HS; // Carry set = unsigned higher or same
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ParseCondCodeError;
 
+const CONDITION_TRUTH: [u16; 16] = {
+    let mut table = [0; 16];
+    let mut nzcv = 0u32;
+    while nzcv < table.len() as u32 {
+        table[nzcv as usize] =
+            trust_cg_a64_cond_truth_mask(nzcv >> 3, (nzcv >> 2) & 1, (nzcv >> 1) & 1, nzcv & 1)
+                as u16;
+        nzcv += 1;
+    }
+    table
+};
+
 impl core::fmt::Display for ParseCondCodeError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.write_str("invalid AArch64 condition-code mnemonic")
@@ -909,6 +924,15 @@ impl CondCode {
     #[inline]
     pub const fn encoding(self) -> u8 {
         self as u8
+    }
+
+    /// Convert a machine operand to a four-bit architectural condition.
+    pub const fn from_encoding(encoding: i64) -> Option<Self> {
+        if encoding < 0 || encoding >= 16 {
+            return None;
+        }
+        // SAFETY: all values in the checked range are CondCode variants.
+        Some(unsafe { core::mem::transmute::<u8, Self>(encoding as u8) })
     }
 
     /// Toggle bit zero of the condition's encoding.
@@ -930,11 +954,11 @@ impl CondCode {
     /// | AL       | NV       |
     #[inline]
     pub const fn invert(self) -> Self {
-        // Safety: flipping bit 0 of a valid 4-bit code produces a valid 4-bit code.
-        // All 16 values of the enum are defined, so this is always valid.
-        let inv = (self as u8) ^ 1;
-        // SAFETY: all 16 values 0b0000..=0b1111 are valid CondCode variants.
-        unsafe { core::mem::transmute::<u8, CondCode>(inv) }
+        let inverted = trust_cg_a64_cond_toggle(self as u32);
+        match Self::from_encoding(inverted as i64) {
+            Some(condition) => condition,
+            None => panic!("condition bit toggle must produce a four-bit encoding"),
+        }
     }
 
     /// Return a condition holding exactly when this condition does not.
@@ -943,10 +967,20 @@ impl CondCode {
     /// state; no condition code represents their always-false complement.
     #[inline]
     pub const fn logical_complement(self) -> Option<Self> {
-        match self {
-            Self::AL | Self::NV => None,
-            _ => Some(self.invert()),
+        if trust_cg_a64_cond_complementable(self as u32) == 1 {
+            Some(self.invert())
+        } else {
+            None
         }
+    }
+
+    /// Evaluate the condition for a packed four-bit NZCV value.
+    #[inline]
+    pub const fn holds(self, nzcv: u8) -> Option<bool> {
+        if nzcv >= 16 {
+            return None;
+        }
+        Some((CONDITION_TRUTH[nzcv as usize] >> self.encoding()) & 1 != 0)
     }
 
     /// Return the assembly mnemonic suffix (e.g., `"eq"`, `"ne"`, `"hs"`).
@@ -1374,6 +1408,10 @@ mod tests {
         ];
         let mut complement_checks = 0;
         for cc in all {
+            assert_eq!(CondCode::from_encoding(i64::from(cc.encoding())), Some(cc));
+            for nzcv in 0..16 {
+                assert_eq!(cc.holds(nzcv), Some(holds(cc, nzcv)), "{cc:?}/{nzcv:04b}");
+            }
             if let Some(complement) = cc.logical_complement() {
                 assert_eq!(complement.logical_complement(), Some(cc));
                 for nzcv in 0..16 {
@@ -1397,6 +1435,10 @@ mod tests {
                 );
             }
         }
+        for invalid in [i64::MIN, -1, 16, 256, i64::MAX] {
+            assert_eq!(CondCode::from_encoding(invalid), None);
+        }
+        assert_eq!(CondCode::EQ.holds(16), None);
         assert_eq!(complement_checks, 224);
     }
 

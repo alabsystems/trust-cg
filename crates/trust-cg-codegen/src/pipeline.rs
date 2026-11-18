@@ -10799,9 +10799,12 @@ fn encode_function_with_fixups_under(
 
 /// Policy-aware raw JIT entry: the JIT encodes through its own pipeline's
 /// integrity policy, which a verifying configuration makes proof-grade.
+/// External observers of an already prepared stream can select the same
+/// enforcing policy without accessing the Core compiler's private fixup-site
+/// sidecar. Returned bytes and fixups supply no source or proof authority.
 // The raw JIT encodes through the `_prechecked` variant; tests drive this form.
 #[cfg_attr(not(test), allow(dead_code))]
-pub(crate) fn encode_function_with_fixups_for_pipeline(
+pub fn encode_function_with_fixups_for_pipeline(
     pipeline: &Pipeline,
     func: &IrMachFunction,
 ) -> Result<(Vec<u8>, crate::macho::fixup::FixupList), PipelineError> {

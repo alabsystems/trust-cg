@@ -30,6 +30,7 @@ mod decode;
 mod dom;
 mod operands;
 mod reader;
+mod region;
 mod registry;
 mod rejection;
 mod replay;
@@ -43,6 +44,7 @@ use std::collections::BTreeMap;
 
 use trust_ir::{Function, Module};
 
+pub use region::{RegionRejection, RegionVerdict, check_region};
 pub use registry::{Registry, RegistryError};
 pub use rejection::{Body, DecodeError, NonCanonicalKind, Rejection, TermSite};
 pub use terms::Leaf;
@@ -115,14 +117,14 @@ pub fn check(
     let out_terms = reader::terms(&oa, &mut interner, Body::Output)?;
 
     // Item 5: decode and replay.
-    let d = decode::decode(derivation)?;
+    let d = decode::decode(derivation, decode::Tier::E)?;
     if d.function != input.name {
         return Err(Rejection::FunctionNameMismatch {
             derivation: d.function.clone(),
             function: input.name.clone(),
         });
     }
-    let conclusions = replay::replay(&d, registry, &mut interner)?;
+    let conclusions = replay::replay(&d, registry, &mut interner, &replay::OrderFreeTable::new())?;
 
     // Item 4: every skeleton operand.
     let (skeleton_operands, changed_operands) = justify_operands(

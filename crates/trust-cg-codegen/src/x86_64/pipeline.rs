@@ -12713,6 +12713,188 @@ pub fn set_x86_ra_call_split_disabled(disabled: bool) -> bool {
     }
 }
 
+static LEAF_FRAME_ELISION_DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+static O2_FIXPOINT_ITERATIONS: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+
+/// How many iterations an O2 compile's x86 machine-pass schedule may run in a
+/// certificate-free compile when no driver installed a number: the O3 bound.
+/// The schedule's late structural passes (bounds-check elimination,
+/// if-conversion, the branch layout) expose work to the earlier cleanup passes
+/// (CSE, the peephole's read-modify-write fusion and SIB folds) that a single
+/// pass over the schedule leaves undone; O3 already iterates to this bound.
+const X86_O2_FIXPOINT_CERTIFICATE_FREE_DEFAULT: u32 = TCG_X86_O3_FIXPOINT_MAX_ITERATIONS;
+
+/// Install the O2 machine-pass iteration bound from a TRACKED option, once
+/// (`-Ztrust-ir-cg-args=x86-o2-fixpoint-iterations=N`; 1 is the single pass).
+pub fn set_x86_o2_fixpoint_iterations(iterations: u32) -> bool {
+    match O2_FIXPOINT_ITERATIONS.set(iterations) {
+        Ok(()) => true,
+        Err(requested) => O2_FIXPOINT_ITERATIONS.get() == Some(&requested),
+    }
+}
+
+/// Whether a compile that keeps proof certificates withholds the O2 fixpoint:
+/// then O2 runs its schedule once, as it always has. Iterating changes the
+/// emitted bytes, and no compile with proof certificates has exercised it.
+pub fn x86_o2_fixpoint_withheld(opted_out: bool, proof_certificates: bool) -> bool {
+    opted_out || proof_certificates
+}
+
+/// The O3 bound, which is also the largest O2 bound
+/// [`set_x86_o2_fixpoint_iterations`] honours.
+pub const X86_O2_FIXPOINT_MAX_ITERATIONS: u32 = TCG_X86_O3_FIXPOINT_MAX_ITERATIONS;
+
+/// The O2 machine-pass iteration bound in `mode`: one pass when certificates
+/// are kept (`Withheld`); the installed bound, else the O3 bound, in a
+/// certificate-free compile; the installed bound, else one pass, otherwise.
+fn x86_o2_fixpoint_iterations_in(mode: X86AllocationQuality) -> u32 {
+    let installed = O2_FIXPOINT_ITERATIONS.get().copied();
+    match mode {
+        X86AllocationQuality::Withheld => 1,
+        X86AllocationQuality::Installed => installed.unwrap_or(1),
+        X86AllocationQuality::CertificateFree => {
+            installed.unwrap_or(X86_O2_FIXPOINT_CERTIFICATE_FREE_DEFAULT)
+        }
+    }
+    .clamp(1, TCG_X86_O3_FIXPOINT_MAX_ITERATIONS)
+}
+
+/// Install the frameless-leaf switch from a TRACKED option, once
+/// (`-Ztrust-ir-cg-args=no-x86-leaf-frame-elision`); see
+/// [`x86_function_is_frameless_leaf`].
+pub fn set_x86_leaf_frame_elision_disabled(disabled: bool) -> bool {
+    match LEAF_FRAME_ELISION_DISABLED.set(disabled) {
+        Ok(()) => true,
+        Err(requested) => LEAF_FRAME_ELISION_DISABLED.get() == Some(&requested),
+    }
+}
+
+/// Whether a compile that keeps proof certificates withholds frameless
+/// leaves. Eliding the `push rbp; mov rbp,rsp; ... pop rbp` frame changes the
+/// emitted bytes and the per-function frame metadata, and no compile with
+/// proof certificates has exercised it, so a caller that keeps certificates
+/// disables it; the proofs-off lane keeps it on unless opted out.
+pub fn x86_leaf_frame_elision_withheld(opted_out: bool, proof_certificates: bool) -> bool {
+    opted_out || proof_certificates
+}
+
+static IMUL_CERTIFICATE_FREE_REDUCTIONS_DISABLED: std::sync::OnceLock<bool> =
+    std::sync::OnceLock::new();
+
+/// Install the certificate-free IMUL reductions' switch from a TRACKED
+/// option, once (`-Ztrust-ir-cg-args=no-x86-imul-certificate-free-reductions`);
+/// see `trust_cg_opt::X86Peephole::with_certificate_free_imul_reductions`.
+pub fn set_x86_imul_certificate_free_reductions_disabled(disabled: bool) -> bool {
+    match IMUL_CERTIFICATE_FREE_REDUCTIONS_DISABLED.set(disabled) {
+        Ok(()) => true,
+        Err(requested) => IMUL_CERTIFICATE_FREE_REDUCTIONS_DISABLED.get() == Some(&requested),
+    }
+}
+
+/// Whether a compile that keeps proof certificates withholds the
+/// certificate-free IMUL reductions (the `x * 2` doubling LEA and the
+/// store-passing flags scan of every `ImulRRI` reduction). They change the
+/// emitted bytes, and the certificate-lane census that showed identical row
+/// counts ran on certificate compiles that exit 1 on the measuring host, so a
+/// caller that keeps certificates disables them; the proofs-off lane keeps
+/// them on unless opted out.
+pub fn x86_imul_certificate_free_reductions_withheld(
+    opted_out: bool,
+    proof_certificates: bool,
+) -> bool {
+    opted_out || proof_certificates
+}
+
+/// Whether the certificate-free IMUL reductions are enabled in `mode`: off
+/// when certificates are kept (`Withheld`), on by default in a
+/// certificate-free compile, and only on an installed `false` otherwise.
+fn x86_imul_certificate_free_reductions_enabled_in(mode: X86AllocationQuality) -> bool {
+    x86_ra_quality_enabled_in(
+        mode,
+        IMUL_CERTIFICATE_FREE_REDUCTIONS_DISABLED.get().copied(),
+        true,
+    )
+}
+
+/// Whether frameless leaves are enabled in `mode`: like the allocation-quality
+/// changes, off when certificates are kept (`Withheld`), on by default in a
+/// certificate-free compile, and only on an installed `false` otherwise.
+fn x86_leaf_frame_elision_enabled_in(mode: X86AllocationQuality) -> bool {
+    x86_ra_quality_enabled_in(mode, LEAF_FRAME_ELISION_DISABLED.get().copied(), true)
+}
+
+/// Whether a whole module admits frameless leaves: an ELF System V object
+/// compiled without `panic=unwind` in which no function carries
+/// exception-handling structure. Such a module emits no `.eh_frame`
+/// (`x86_module_emits_eh_frame` is false for it whatever the frames are), so
+/// a function without frame metadata never reaches the ELF unwind planner's
+/// "every function needs a prologue-describing FDE" refusal. Every other
+/// module (Mach-O and COFF objects, raw bytes, the Windows ABI, unwinding
+/// modules) keeps every frame.
+fn x86_module_admits_frameless_leaves(
+    config: &X86PipelineConfig,
+    functions: &[X86ISelFunction],
+) -> bool {
+    config.emit_frame
+        && !config.panic_unwind
+        && config.output_format == X86OutputFormat::Elf
+        && config.call_abi == X86CallAbi::SystemV
+        && x86_leaf_frame_elision_enabled_in(config.allocation_quality)
+        && functions.iter().all(|func| func.eh_info.is_empty())
+}
+
+/// Whether an operand names RSP or RBP (any width), directly or as an
+/// address register. Conservative: any GPR whose hardware encoding is 4 or 5
+/// counts.
+fn x86_operand_names_frame_register(operand: &X86ISelOperand) -> bool {
+    match operand {
+        X86ISelOperand::PReg(reg) => reg.is_gpr() && matches!(reg.hw_enc(), 4 | 5),
+        X86ISelOperand::MemAddr { base, .. } => x86_operand_names_frame_register(base),
+        X86ISelOperand::SibMemAddr { base, index, .. } => {
+            x86_operand_names_frame_register(base) || x86_operand_names_frame_register(index)
+        }
+        X86ISelOperand::StackSlot(_) => true,
+        _ => false,
+    }
+}
+
+/// Whether `func`, after register allocation, spill installation and the
+/// two-address fixup, is a leaf that needs no frame: no stack slot (so no
+/// local, spill or frame-relative address), no callee-saved GPR or XMM to
+/// save, no outgoing call area, no call, push, pop or dynamic stack
+/// allocation, no exception-handling structure, and no operand that names
+/// RSP or RBP (so no incoming stack argument read through the frame
+/// pointer). Such a function never reads or writes the stack and runs with
+/// RSP as it was at entry, so the `push rbp; mov rbp, rsp; ...; pop rbp`
+/// frame has no effect on its results; without it CFA = RSP + 8 at every
+/// instruction. Fails closed: anything not recognised keeps the frame.
+fn x86_function_is_frameless_leaf(func: &X86ISelFunction, assignment: &X86RegAssignment) -> bool {
+    if !assignment.used_callee_saved.is_empty()
+        || !assignment.used_callee_saved_xmms.is_empty()
+        || !func.stack_slots.is_empty()
+        || func.max_outgoing_call_bytes != 0
+        || !func.eh_info.is_empty()
+        || function_has_x86_dynamic_stack_alloc_pseudos(func)
+    {
+        return false;
+    }
+    // A stack-slot operand is refused by the operand scan
+    // (`x86_operand_names_frame_register` counts `StackSlot`).
+    func.blocks.values().all(|block| {
+        block.insts.iter().all(|inst| {
+            !matches!(
+                inst.opcode,
+                X86Opcode::Call
+                    | X86Opcode::CallR
+                    | X86Opcode::CallM
+                    | X86Opcode::Push
+                    | X86Opcode::Pop
+            ) && !inst.operands.iter().any(x86_operand_names_frame_register)
+        })
+    })
+}
+
 /// Whether a compile that keeps proof certificates withholds the four
 /// allocation-quality changes (ABI copy hints, caller-saved-first order,
 /// cold-call weight, call split). They change which registers and which
@@ -12739,7 +12921,10 @@ fn x86_ra_quality_enabled(installed_disabled: Option<bool>) -> bool {
 /// Which allocation-quality policy one pipeline's register allocation follows
 /// (`X86PipelineConfig::allocation_quality`). The four changes are the ABI
 /// copy hints, caller-saved-first order, cold-call weighting and the
-/// conditional-call split.
+/// conditional-call split; the same policy also decides frameless leaves
+/// (`x86_leaf_frame_elision_enabled_in`), the O2 machine-pass fixpoint
+/// (`x86_o2_fixpoint_iterations_in`) and the certificate-free IMUL
+/// reductions (`x86_imul_certificate_free_reductions_enabled_in`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum X86AllocationQuality {
     /// Follow the process policy a driver installed through the setters
@@ -16432,6 +16617,13 @@ pub struct X86PipelineConfig {
     /// `CertificateFree` when it emits none and requests it
     /// (`CompilerConfig::x86_certificate_free_allocation`).
     pub allocation_quality: X86AllocationQuality,
+    /// Whether the module being assembled admits frameless leaves
+    /// ([`x86_module_admits_frameless_leaves`]). `assemble_module` decides it
+    /// for each module on its own copy of the configuration, replacing
+    /// whatever a caller set; every other entry point (single-function
+    /// compiles, the per-function APIs) sees the default `false` and keeps
+    /// the frame of every function.
+    pub frameless_leaf_module_admitted: bool,
 }
 
 impl Default for X86PipelineConfig {
@@ -16448,6 +16640,7 @@ impl Default for X86PipelineConfig {
             macho_build_version: crate::apple_deployment::MachOBuildVersion::DEFAULT,
             weak_function_definitions: std::collections::BTreeSet::new(),
             allocation_quality: X86AllocationQuality::Installed,
+            frameless_leaf_module_admitted: false,
         }
     }
 }
@@ -20406,14 +20599,22 @@ impl X86Pipeline {
 
     #[cfg(test)]
     fn default_x86_pass_manager() -> trust_cg_opt::X86PassManager {
-        Self::x86_o2_pass_manager(X86PipelineConfig::default().call_abi)
+        Self::x86_o2_pass_manager(X86PipelineConfig::default().call_abi, false)
     }
 
-    fn x86_o1_pass_manager() -> trust_cg_opt::X86PassManager {
-        Self::x86_o1_pass_manager_with_branch_layout(x86_branch_layout_enabled())
+    /// `imul_certificate_free`: see
+    /// `trust_cg_opt::X86Peephole::with_certificate_free_imul_reductions`.
+    fn x86_o1_pass_manager(imul_certificate_free: bool) -> trust_cg_opt::X86PassManager {
+        Self::x86_o1_pass_manager_with_branch_layout(
+            x86_branch_layout_enabled(),
+            imul_certificate_free,
+        )
     }
 
-    fn x86_o1_pass_manager_with_branch_layout(branch_layout: bool) -> trust_cg_opt::X86PassManager {
+    fn x86_o1_pass_manager_with_branch_layout(
+        branch_layout: bool,
+        imul_certificate_free: bool,
+    ) -> trust_cg_opt::X86PassManager {
         // O1 is the production policy the rustc backend selects. It runs the
         // verified local cleanups (peephole + DCE) plus two loop/dataflow wins:
         //
@@ -20453,10 +20654,13 @@ impl X86Pipeline {
             // peephole are admission-gated on the REAL reconstruction
             // discharge (fail-closed `|_| false` default in
             // `X86Peephole::default`).
-            .with_pass(Box::new(trust_cg_opt::X86Peephole::with_admissions(
-                admit_x86_reconstructed_opcode,
-                admit_x86_constmul_shift,
-            )))
+            .with_pass(Box::new(
+                trust_cg_opt::X86Peephole::with_admissions(
+                    admit_x86_reconstructed_opcode,
+                    admit_x86_constmul_shift,
+                )
+                .with_certificate_free_imul_reductions(imul_certificate_free),
+            ))
             .with_pass(Box::new(trust_cg_opt::X86DeadCodeElimination));
         if x86_if_convert_enabled() {
             pm = pm.with_pass(Box::new(trust_cg_opt::X86IfConvert::new(
@@ -20484,13 +20688,21 @@ impl X86Pipeline {
         pm
     }
 
-    fn x86_o2_pass_manager(call_abi: X86CallAbi) -> trust_cg_opt::X86PassManager {
-        Self::x86_o2_pass_manager_with_branch_layout(x86_branch_layout_enabled(), call_abi)
+    fn x86_o2_pass_manager(
+        call_abi: X86CallAbi,
+        imul_certificate_free: bool,
+    ) -> trust_cg_opt::X86PassManager {
+        Self::x86_o2_pass_manager_with_branch_layout(
+            x86_branch_layout_enabled(),
+            call_abi,
+            imul_certificate_free,
+        )
     }
 
     fn x86_o2_pass_manager_with_branch_layout(
         branch_layout: bool,
         call_abi: X86CallAbi,
+        imul_certificate_free: bool,
     ) -> trust_cg_opt::X86PassManager {
         // LICM runs first so the loop-invariant constant materializations it
         // hoists into the preheader are exposed to copy-prop/CSE/DCE, and the
@@ -20643,10 +20855,13 @@ impl X86Pipeline {
             // The RMW fusion and the variable-rotate collapse inside the
             // peephole are admission-gated on the REAL reconstruction
             // discharge — see `admit_x86_reconstructed_opcode`.
-            .with_pass(Box::new(trust_cg_opt::X86Peephole::with_admissions(
-                admit_x86_reconstructed_opcode,
-                admit_x86_constmul_shift,
-            )));
+            .with_pass(Box::new(
+                trust_cg_opt::X86Peephole::with_admissions(
+                    admit_x86_reconstructed_opcode,
+                    admit_x86_constmul_shift,
+                )
+                .with_certificate_free_imul_reductions(imul_certificate_free),
+            ));
         // Dominated-identical-compare bounds-check elimination (safety-critical,
         // sound by construction). Runs AFTER the peephole's cmp+setcc+zero-test
         // +Jcc fusion, which collapses the frontend's materialized-boolean
@@ -20794,13 +21009,18 @@ impl X86Pipeline {
     fn x86_pass_manager_for_opt_level(
         opt_level: trust_cg_opt::OptLevel,
         call_abi: X86CallAbi,
+        allocation_quality: X86AllocationQuality,
     ) -> trust_cg_opt::X86PassManager {
+        let imul_certificate_free =
+            x86_imul_certificate_free_reductions_enabled_in(allocation_quality);
         match opt_level {
             trust_cg_opt::OptLevel::O0 => trust_cg_opt::X86PassManager::new(),
-            trust_cg_opt::OptLevel::O1 => Self::x86_o1_pass_manager(),
+            trust_cg_opt::OptLevel::O1 => Self::x86_o1_pass_manager(imul_certificate_free),
             trust_cg_opt::OptLevel::O2
             | trust_cg_opt::OptLevel::Os
-            | trust_cg_opt::OptLevel::O3 => Self::x86_o2_pass_manager(call_abi),
+            | trust_cg_opt::OptLevel::O3 => {
+                Self::x86_o2_pass_manager(call_abi, imul_certificate_free)
+            }
         }
     }
 
@@ -20816,10 +21036,17 @@ impl X86Pipeline {
         let stats = if self.config.opt_level == trust_cg_opt::OptLevel::O0 {
             trust_cg_opt::X86PassStats::default()
         } else {
-            let mut pass_manager =
-                Self::x86_pass_manager_for_opt_level(self.config.opt_level, self.config.call_abi);
+            let mut pass_manager = Self::x86_pass_manager_for_opt_level(
+                self.config.opt_level,
+                self.config.call_abi,
+                self.config.allocation_quality,
+            );
+            let o2_iterations = x86_o2_fixpoint_iterations_in(self.config.allocation_quality);
             match self.config.opt_level {
                 trust_cg_opt::OptLevel::O0 => trust_cg_opt::X86PassStats::default(),
+                trust_cg_opt::OptLevel::O2 if o2_iterations > 1 => {
+                    pass_manager.run_to_fixpoint(func, o2_iterations)
+                }
                 trust_cg_opt::OptLevel::O1
                 | trust_cg_opt::OptLevel::O2
                 | trust_cg_opt::OptLevel::Os => pass_manager.run_once_with_stats(func),
@@ -22150,9 +22377,15 @@ impl X86Pipeline {
         reject_windows_x64_frameless_non_leaf(&self.config, &func)?;
 
         // Phase 3: Resolve fixed stack slots and insert prologue/epilogue.
+        // A frameless leaf (only in a module `assemble_module` admitted, see
+        // `x86_module_admits_frameless_leaves`) gets neither and carries no
+        // frame metadata, like an `emit_frame: false` function.
+        let frameless_leaf = self.config.frameless_leaf_module_admitted
+            && x86_module_admits_frameless_leaves(&self.config, std::slice::from_ref(&func))
+            && x86_function_is_frameless_leaf(&func, &assignment);
         let mut frame_metadata = None;
         let mut spill_disps: HashSet<i32> = HashSet::new();
-        if self.config.emit_frame {
+        if self.config.emit_frame && !frameless_leaf {
             let layout = compute_x86_stack_frame_layout(
                 &func,
                 assignment.used_callee_saved.len(),
@@ -23027,7 +23260,21 @@ impl X86Pipeline {
         // in that same function order, so the emitted object is byte-for-byte
         // identical to the serial path. No per-function symbol numbering,
         // counter, or map-iteration order feeds the emitted bytes.
-        let per_func = self.encode_functions_ordered(functions, run_x86_passes, parallel)?;
+        // Frameless leaves are decided per module: only a module that emits no
+        // unwind tables at all may contain a function without frame metadata.
+        // A caller's own setting of the flag is replaced by this decision.
+        let admitted = x86_module_admits_frameless_leaves(&self.config, functions);
+        let decided_pipeline;
+        let encoder = if admitted == self.config.frameless_leaf_module_admitted {
+            self
+        } else {
+            decided_pipeline = X86Pipeline::new(X86PipelineConfig {
+                frameless_leaf_module_admitted: admitted,
+                ..self.config.clone()
+            });
+            &decided_pipeline
+        };
+        let per_func = encoder.encode_functions_ordered(functions, run_x86_passes, parallel)?;
 
         // Phase 1b: Reassemble per-function buffers SEQUENTIALLY (fast memcpy),
         // in deterministic function order. `text_offset` is the running length
@@ -30549,6 +30796,7 @@ mod tests {
             let pm = X86Pipeline::x86_pass_manager_for_opt_level(
                 level,
                 X86PipelineConfig::default().call_abi,
+                X86AllocationQuality::Installed,
             );
             pm.pass_names()
                 .into_iter()
@@ -30730,8 +30978,8 @@ mod tests {
                 .collect::<Vec<_>>()
         };
 
-        let o1_on = X86Pipeline::x86_o1_pass_manager_with_branch_layout(true);
-        let o1_off = X86Pipeline::x86_o1_pass_manager_with_branch_layout(false);
+        let o1_on = X86Pipeline::x86_o1_pass_manager_with_branch_layout(true, false);
+        let o1_off = X86Pipeline::x86_o1_pass_manager_with_branch_layout(false, false);
         assert_eq!(
             names(&o1_on).last().map(String::as_str),
             Some("x86-branch-layout")
@@ -30739,8 +30987,8 @@ mod tests {
         assert_eq!(names(&o1_on)[..names(&o1_on).len() - 1], names(&o1_off)[..]);
 
         let call_abi = X86PipelineConfig::default().call_abi;
-        let o2_on = X86Pipeline::x86_o2_pass_manager_with_branch_layout(true, call_abi);
-        let o2_off = X86Pipeline::x86_o2_pass_manager_with_branch_layout(false, call_abi);
+        let o2_on = X86Pipeline::x86_o2_pass_manager_with_branch_layout(true, call_abi, false);
+        let o2_off = X86Pipeline::x86_o2_pass_manager_with_branch_layout(false, call_abi, false);
         assert_eq!(
             names(&o2_on).last().map(String::as_str),
             Some("x86-branch-layout")
@@ -31454,6 +31702,126 @@ mod tests {
         );
     }
 
+    /// The certificate-free IMUL reductions follow the certificate policy
+    /// through the production O1/O2/O3 schedules: `x * 2` (flags dead) keeps
+    /// its IMUL when certificates are kept or nothing is installed, and
+    /// becomes the doubling LEA in a certificate-free compile. Nothing is
+    /// installed in the unit-test process.
+    #[test]
+    fn the_imul_certificate_free_reductions_follow_the_certificate_policy() {
+        assert!(!x86_imul_certificate_free_reductions_enabled_in(
+            X86AllocationQuality::Withheld
+        ));
+        assert!(!x86_imul_certificate_free_reductions_enabled_in(
+            X86AllocationQuality::Installed
+        ));
+        assert!(x86_imul_certificate_free_reductions_enabled_in(
+            X86AllocationQuality::CertificateFree
+        ));
+        assert!(x86_imul_certificate_free_reductions_withheld(false, true));
+        assert!(x86_imul_certificate_free_reductions_withheld(true, false));
+        assert!(!x86_imul_certificate_free_reductions_withheld(false, false));
+        let opcodes = |level, quality| {
+            let mut func = minimal_func("imul_double");
+            func.next_vreg = 2;
+            for inst in [
+                X86ISelInst::new(
+                    X86Opcode::MovRR,
+                    vec![test_vreg_op(0), X86ISelOperand::PReg(RDI)],
+                ),
+                X86ISelInst::new(
+                    X86Opcode::ImulRRI,
+                    vec![test_vreg_op(1), test_vreg_op(0), X86ISelOperand::Imm(2)],
+                ),
+                X86ISelInst::new(
+                    X86Opcode::CmpRI,
+                    vec![test_vreg_op(1), X86ISelOperand::Imm(30)],
+                ),
+                X86ISelInst::new(
+                    X86Opcode::MovRR,
+                    vec![X86ISelOperand::PReg(RAX), test_vreg_op(1)],
+                ),
+                X86ISelInst::new(X86Opcode::Ret, vec![]),
+            ] {
+                func.push_inst(Block(0), inst);
+            }
+            X86Pipeline::new(X86PipelineConfig {
+                opt_level: level,
+                allocation_quality: quality,
+                ..X86PipelineConfig::default()
+            })
+            .run_x86_optimization_passes(&mut func);
+            func.blocks[&Block(0)]
+                .insts
+                .iter()
+                .map(|inst| inst.opcode)
+                .collect::<Vec<_>>()
+        };
+        for level in [
+            trust_cg_opt::OptLevel::O1,
+            trust_cg_opt::OptLevel::O2,
+            trust_cg_opt::OptLevel::O3,
+        ] {
+            for quality in [
+                X86AllocationQuality::Withheld,
+                X86AllocationQuality::Installed,
+            ] {
+                let kept = opcodes(level, quality);
+                assert!(
+                    kept.contains(&X86Opcode::ImulRRI),
+                    "{level:?} {quality:?} {kept:?}"
+                );
+                assert!(
+                    !kept.contains(&X86Opcode::LeaSib),
+                    "{level:?} {quality:?} {kept:?}"
+                );
+            }
+            let free = opcodes(level, X86AllocationQuality::CertificateFree);
+            assert!(!free.contains(&X86Opcode::ImulRRI), "{level:?} {free:?}");
+            assert!(free.contains(&X86Opcode::LeaSib), "{level:?} {free:?}");
+        }
+    }
+
+    #[test]
+    fn the_o2_fixpoint_bound_follows_the_certificate_policy() {
+        // Nothing is installed in the unit-test process.
+        assert_eq!(
+            x86_o2_fixpoint_iterations_in(X86AllocationQuality::Withheld),
+            1
+        );
+        assert_eq!(
+            x86_o2_fixpoint_iterations_in(X86AllocationQuality::Installed),
+            1
+        );
+        assert_eq!(
+            x86_o2_fixpoint_iterations_in(X86AllocationQuality::CertificateFree),
+            TCG_X86_O3_FIXPOINT_MAX_ITERATIONS
+        );
+        let run = |quality| {
+            let mut func = optimizable_add_ri_func("x86_o2_fixpoint");
+            X86Pipeline::new(X86PipelineConfig {
+                opt_level: trust_cg_opt::OptLevel::O2,
+                allocation_quality: quality,
+                ..X86PipelineConfig::default()
+            })
+            .run_x86_optimization_passes(&mut func)
+        };
+        let single = X86Pipeline::x86_o2_pass_manager(X86CallAbi::SystemV, false).num_passes();
+        // Certificates kept, or nothing installed: one pass over the schedule.
+        for quality in [
+            X86AllocationQuality::Withheld,
+            X86AllocationQuality::Installed,
+        ] {
+            assert_eq!(run(quality).total_pass_runs(), single, "{quality:?}");
+        }
+        // Certificate-free: the schedule iterates (it changes the function on
+        // its first iteration, so a second one runs) within the O3 bound.
+        let free = run(X86AllocationQuality::CertificateFree);
+        assert!(free.iterations > 1, "{free:?}");
+        assert!(free.iterations <= TCG_X86_O3_FIXPOINT_MAX_ITERATIONS);
+        assert!(free.total_pass_runs() > single);
+    }
+
     #[test]
     fn x86_opt_level_o3_runs_production_schedule_to_bounded_fixpoint() {
         let mut func = optimizable_add_ri_func("x86_opt_level_o3");
@@ -31467,7 +31835,7 @@ mod tests {
         assert!(stats.iterations <= TCG_X86_O3_FIXPOINT_MAX_ITERATIONS);
         assert!(
             stats.total_pass_runs()
-                >= X86Pipeline::x86_o2_pass_manager(pipeline.config.call_abi).num_passes(),
+                >= X86Pipeline::x86_o2_pass_manager(pipeline.config.call_abi, false).num_passes(),
             "O3 should run at least one production-order iteration"
         );
         assert_eq!(
@@ -37900,6 +38268,388 @@ mod tests {
             .expect("frameless panic=unwind ELF module must emit");
         assert!(find_elf_section(&object, ".eh_frame").is_none());
         assert!(find_elf_section(&object, ".gcc_except_table").is_none());
+    }
+
+    /// A leaf returning `a + b` from its two integer arguments: no stack slot,
+    /// no call, no callee-saved register, no RSP/RBP operand.
+    fn frameless_leaf_candidate(name: &str) -> X86ISelFunction {
+        let mut func = minimal_func(name);
+        func.sig.params = vec![Type::I64, Type::I64];
+        func.sig.returns = vec![Type::I64];
+        let a = VReg::new(0, RegClass::Gpr64);
+        let b = VReg::new(1, RegClass::Gpr64);
+        let sum = VReg::new(2, RegClass::Gpr64);
+        func.next_vreg = 3;
+        for inst in [
+            X86ISelInst::new(
+                X86Opcode::MovRR,
+                vec![X86ISelOperand::VReg(a), X86ISelOperand::PReg(RDI)],
+            ),
+            X86ISelInst::new(
+                X86Opcode::MovRR,
+                vec![X86ISelOperand::VReg(b), X86ISelOperand::PReg(RSI)],
+            ),
+            X86ISelInst::new(
+                X86Opcode::AddRR,
+                vec![
+                    X86ISelOperand::VReg(sum),
+                    X86ISelOperand::VReg(a),
+                    X86ISelOperand::VReg(b),
+                ],
+            ),
+            X86ISelInst::new(
+                X86Opcode::MovRR,
+                vec![X86ISelOperand::PReg(RAX), X86ISelOperand::VReg(sum)],
+            ),
+            X86ISelInst::new(X86Opcode::Ret, vec![]),
+        ] {
+            func.push_inst(Block(0), inst);
+        }
+        func
+    }
+
+    fn elf_text(object: &[u8]) -> Vec<u8> {
+        let text = find_elf_section(object, ".text").expect("ELF object has .text");
+        object[text.offset..text.offset + text.size].to_vec()
+    }
+
+    const X86_FRAME_PROLOGUE: [u8; 4] = [0x55, 0x48, 0x89, 0xe5];
+
+    fn compile_leaf_module(config: X86PipelineConfig, funcs: &[X86ISelFunction]) -> Vec<u8> {
+        X86Pipeline::new(config)
+            .compile_module(funcs)
+            .expect("leaf module compiles")
+    }
+
+    #[test]
+    fn a_certificate_free_elf_leaf_is_emitted_without_a_frame() {
+        let funcs = vec![frameless_leaf_candidate("leaf_add")];
+        let elf = |quality| X86PipelineConfig {
+            output_format: X86OutputFormat::Elf,
+            allocation_quality: quality,
+            ..X86PipelineConfig::default()
+        };
+        let free = elf_text(&compile_leaf_module(
+            elf(X86AllocationQuality::CertificateFree),
+            &funcs,
+        ));
+        assert!(!free.starts_with(&X86_FRAME_PROLOGUE), "{free:02x?}");
+        assert!(!free.contains(&0x5d), "no `pop rbp`: {free:02x?}");
+        assert!(free.contains(&0xc3), "{free:02x?}");
+        // Certificates kept, or nothing installed: the frame stays.
+        for quality in [
+            X86AllocationQuality::Withheld,
+            X86AllocationQuality::Installed,
+        ] {
+            let framed = elf_text(&compile_leaf_module(elf(quality), &funcs));
+            assert!(
+                framed.starts_with(&X86_FRAME_PROLOGUE),
+                "{quality:?}: {framed:02x?}"
+            );
+        }
+        // A caller's own setting of the module flag is replaced by the
+        // module decision.
+        let forced = elf_text(&compile_leaf_module(
+            X86PipelineConfig {
+                frameless_leaf_module_admitted: true,
+                ..elf(X86AllocationQuality::Withheld)
+            },
+            &funcs,
+        ));
+        assert!(forced.starts_with(&X86_FRAME_PROLOGUE), "{forced:02x?}");
+    }
+
+    #[test]
+    fn frameless_leaves_need_an_unwind_free_elf_system_v_module() {
+        let funcs = vec![frameless_leaf_candidate("leaf_add")];
+        let free = X86PipelineConfig {
+            output_format: X86OutputFormat::Elf,
+            allocation_quality: X86AllocationQuality::CertificateFree,
+            ..X86PipelineConfig::default()
+        };
+        assert!(x86_module_admits_frameless_leaves(&free, &funcs));
+        for config in [
+            X86PipelineConfig {
+                panic_unwind: true,
+                ..free.clone()
+            },
+            X86PipelineConfig {
+                output_format: X86OutputFormat::MachO,
+                ..free.clone()
+            },
+            X86PipelineConfig {
+                output_format: X86OutputFormat::RawBytes,
+                ..free.clone()
+            },
+            X86PipelineConfig {
+                call_abi: X86CallAbi::WindowsX64,
+                ..free.clone()
+            },
+            X86PipelineConfig {
+                emit_frame: false,
+                ..free.clone()
+            },
+            X86PipelineConfig {
+                allocation_quality: X86AllocationQuality::Withheld,
+                ..free.clone()
+            },
+        ] {
+            assert!(
+                !x86_module_admits_frameless_leaves(&config, &funcs),
+                "{config:?}"
+            );
+        }
+        // One function with exception-handling structure keeps every frame
+        // of the module, since the module then emits `.eh_frame`.
+        let mut with_eh = frameless_leaf_candidate("pad_owner");
+        with_eh.eh_info.personality = Some("rust_eh_personality".to_string());
+        assert!(!x86_module_admits_frameless_leaves(
+            &free,
+            &[funcs[0].clone(), with_eh]
+        ));
+        // Mach-O output keeps the frame in the emitted bytes too.
+        let macho = X86Pipeline::new(X86PipelineConfig {
+            output_format: X86OutputFormat::MachO,
+            ..free.clone()
+        })
+        .compile_module(&funcs)
+        .expect("Mach-O leaf module compiles");
+        assert!(
+            macho
+                .windows(X86_FRAME_PROLOGUE.len())
+                .any(|w| w == X86_FRAME_PROLOGUE),
+            "Mach-O leaf keeps its frame"
+        );
+    }
+
+    #[test]
+    fn a_leaf_that_touches_the_stack_or_calls_keeps_its_frame() {
+        let free = X86PipelineConfig {
+            output_format: X86OutputFormat::Elf,
+            allocation_quality: X86AllocationQuality::CertificateFree,
+            ..X86PipelineConfig::default()
+        };
+        let framed = |func: X86ISelFunction| {
+            let text = elf_text(&compile_leaf_module(free.clone(), &[func]));
+            text.starts_with(&X86_FRAME_PROLOGUE)
+        };
+        assert!(!framed(frameless_leaf_candidate("plain")));
+
+        // An incoming stack argument read through RBP.
+        let mut rbp_read = frameless_leaf_candidate("rbp_read");
+        let loaded = VReg::new(3, RegClass::Gpr64);
+        rbp_read.next_vreg = 4;
+        rbp_read.blocks.get_mut(&Block(0)).unwrap().insts.insert(
+            0,
+            X86ISelInst::new(
+                X86Opcode::MovRM,
+                vec![
+                    X86ISelOperand::VReg(loaded),
+                    X86ISelOperand::MemAddr {
+                        base: Box::new(X86ISelOperand::PReg(RBP)),
+                        disp: 16,
+                    },
+                ],
+            ),
+        );
+        assert!(framed(rbp_read));
+
+        // A call.
+        let mut caller = frameless_leaf_candidate("caller");
+        caller.blocks.get_mut(&Block(0)).unwrap().insts.insert(
+            2,
+            X86ISelInst::new(
+                X86Opcode::Call,
+                vec![X86ISelOperand::Symbol("callee".to_string())],
+            ),
+        );
+        assert!(framed(caller));
+
+        // A stack slot.
+        let mut slot = frameless_leaf_candidate("slot");
+        slot.stack_slots.push(StackSlotInfo::new(8, 8));
+        let stored = X86ISelInst::new(
+            X86Opcode::MovMR,
+            vec![
+                X86ISelOperand::MemAddr {
+                    base: Box::new(X86ISelOperand::StackSlot(0)),
+                    disp: 0,
+                },
+                X86ISelOperand::VReg(VReg::new(0, RegClass::Gpr64)),
+            ],
+        );
+        slot.blocks
+            .get_mut(&Block(0))
+            .unwrap()
+            .insts
+            .insert(2, stored);
+        assert!(framed(slot));
+    }
+
+    /// The per-function compile re-checks the module conditions, so a caller
+    /// that sets `frameless_leaf_module_admitted` itself and compiles one
+    /// function (not through `assemble_module`) still keeps the frame
+    /// whenever the configuration does not admit frameless leaves.
+    #[test]
+    fn a_callers_admission_flag_does_not_override_the_module_conditions() {
+        let leaf = frameless_leaf_candidate("leaf_add");
+        let code = |config: X86PipelineConfig| {
+            X86Pipeline::new(X86PipelineConfig {
+                output_format: X86OutputFormat::Elf,
+                frameless_leaf_module_admitted: true,
+                ..config
+            })
+            .compile_function_with_fixups(&leaf)
+            .expect("leaf compiles")
+            .0
+        };
+        let free = code(X86PipelineConfig {
+            allocation_quality: X86AllocationQuality::CertificateFree,
+            ..X86PipelineConfig::default()
+        });
+        assert!(!free.starts_with(&X86_FRAME_PROLOGUE), "{free:02x?}");
+        for config in [
+            X86PipelineConfig {
+                allocation_quality: X86AllocationQuality::Withheld,
+                ..X86PipelineConfig::default()
+            },
+            X86PipelineConfig {
+                allocation_quality: X86AllocationQuality::CertificateFree,
+                panic_unwind: true,
+                ..X86PipelineConfig::default()
+            },
+        ] {
+            let framed = code(config.clone());
+            assert!(
+                framed.starts_with(&X86_FRAME_PROLOGUE),
+                "{config:?}: {framed:02x?}"
+            );
+        }
+        // A module with exception-handling structure in ANOTHER function
+        // emits `.eh_frame`, which needs every function's frame:
+        // `assemble_module` replaces the caller's `true`, so the leaf keeps
+        // its frame and the module emits (the unwind planner would refuse a
+        // frameless function there).
+        X86Pipeline::new(X86PipelineConfig {
+            output_format: X86OutputFormat::Elf,
+            allocation_quality: X86AllocationQuality::CertificateFree,
+            frameless_leaf_module_admitted: true,
+            ..X86PipelineConfig::default()
+        })
+        .compile_module(&[build_x86_eh_test_function("eh_owner"), leaf])
+        .expect("a module with EH structure keeps every frame and emits");
+    }
+
+    /// Each condition of `x86_function_is_frameless_leaf` on its own keeps
+    /// the frame: the candidate passes, and every single change below (one
+    /// per condition, none of which another condition also catches) makes it
+    /// fail.
+    #[test]
+    fn every_frameless_leaf_condition_keeps_the_frame_on_its_own() {
+        let plain = || frameless_leaf_candidate("leaf");
+        let empty = || X86RegAssignment {
+            allocation: X86Allocation::default(),
+            used_callee_saved: Vec::new(),
+            used_callee_saved_xmms: Vec::new(),
+            spill_plan: X86SpillPlan::default(),
+        };
+        assert!(x86_function_is_frameless_leaf(&plain(), &empty()));
+
+        let mut callee_saved = empty();
+        callee_saved.used_callee_saved.push(RBX);
+        assert!(!x86_function_is_frameless_leaf(&plain(), &callee_saved));
+        let mut callee_saved_xmm = empty();
+        callee_saved_xmm
+            .used_callee_saved_xmms
+            .push(trust_cg_ir::x86_64_regs::XMM6);
+        assert!(!x86_function_is_frameless_leaf(&plain(), &callee_saved_xmm));
+
+        // A stack slot no operand names.
+        let mut slot = plain();
+        slot.stack_slots.push(StackSlotInfo::new(8, 8));
+        assert!(!x86_function_is_frameless_leaf(&slot, &empty()));
+        let mut outgoing = plain();
+        outgoing.max_outgoing_call_bytes = 16;
+        assert!(!x86_function_is_frameless_leaf(&outgoing, &empty()));
+        let mut eh = plain();
+        eh.eh_info.personality = Some("rust_eh_personality".to_string());
+        assert!(!x86_function_is_frameless_leaf(&eh, &empty()));
+
+        // One instruction, operands free of RSP/RBP, per refused opcode.
+        let r = X86ISelOperand::PReg(RAX);
+        for (opcode, operands) in [
+            (
+                X86Opcode::Call,
+                vec![X86ISelOperand::Symbol("f".to_string())],
+            ),
+            (X86Opcode::CallR, vec![r.clone()]),
+            (
+                X86Opcode::CallM,
+                vec![X86ISelOperand::MemAddr {
+                    base: Box::new(r.clone()),
+                    disp: 0,
+                }],
+            ),
+            (X86Opcode::Push, vec![r.clone()]),
+            (X86Opcode::Pop, vec![r.clone()]),
+            (X86Opcode::StackAlloc, vec![r.clone(), r.clone()]),
+        ] {
+            let mut func = plain();
+            func.blocks
+                .get_mut(&Block(0))
+                .unwrap()
+                .insts
+                .insert(2, X86ISelInst::new(opcode, operands));
+            assert!(
+                !x86_function_is_frameless_leaf(&func, &empty()),
+                "{opcode:?}"
+            );
+        }
+        // An RSP operand in an otherwise admitted instruction.
+        let mut rsp = plain();
+        rsp.blocks.get_mut(&Block(0)).unwrap().insts.insert(
+            2,
+            X86ISelInst::new(
+                X86Opcode::MovRR,
+                vec![X86ISelOperand::PReg(RAX), X86ISelOperand::PReg(RSP)],
+            ),
+        );
+        assert!(!x86_function_is_frameless_leaf(&rsp, &empty()));
+    }
+
+    #[test]
+    fn the_frame_register_scan_sees_rsp_and_rbp_at_every_width_and_in_addresses() {
+        use trust_cg_ir::x86_64_regs::{BP16, BPL, EBP, ESP, SP16, SPL};
+        for reg in [RSP, RBP, ESP, EBP, SP16, BP16, SPL, BPL] {
+            assert!(
+                x86_operand_names_frame_register(&X86ISelOperand::PReg(reg)),
+                "{reg:?}"
+            );
+        }
+        assert!(!x86_operand_names_frame_register(&X86ISelOperand::PReg(
+            RAX
+        )));
+        assert!(!x86_operand_names_frame_register(&X86ISelOperand::PReg(
+            R12
+        )));
+        assert!(!x86_operand_names_frame_register(&X86ISelOperand::PReg(
+            R13
+        )));
+        assert!(x86_operand_names_frame_register(
+            &X86ISelOperand::SibMemAddr {
+                base: Box::new(X86ISelOperand::PReg(RAX)),
+                index: Box::new(X86ISelOperand::PReg(RBP)),
+                scale: 1,
+                disp: 0,
+            }
+        ));
+        assert!(x86_operand_names_frame_register(&X86ISelOperand::MemAddr {
+            base: Box::new(X86ISelOperand::PReg(RSP)),
+            disp: 8,
+        }));
+        assert!(x86_operand_names_frame_register(
+            &X86ISelOperand::StackSlot(0)
+        ));
     }
 
     /// An EH function whose module was compiled WITHOUT frame lowering has no

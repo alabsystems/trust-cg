@@ -224,6 +224,25 @@ class GuardCommandsTests(unittest.TestCase):
 
 
 class GuardTransportTests(unittest.TestCase):
+    def test_explicit_ordinary_executes_the_exact_guard_without_worker_discovery(self):
+        commands = bump.Commands(Path("/synthetic/root"), Path("/chosen/targo"),
+                                 guard_admission="ordinary")
+        args = ["--unverified", "test", "--locked", "-p", "pkg", "--test", "guard"]
+        with patch.object(commands, "run", return_value=receipt()) as run, \
+                redirect_stdout(io.StringIO()):
+            commands.rust_guard(args, ("alpha", "beta"))
+        run.assert_called_once_with([
+            "/chosen/targo", "--unverified", "test", "--config", "build.test-jobs=1", *args[2:]],
+            cwd=commands.root, capture=True, env={"RUST_TEST_THREADS": "1"})
+
+    def test_explicit_ordinary_refusal_never_retries_another_interface(self):
+        commands = bump.Commands(Path("/synthetic/root"), Path("/chosen/targo"),
+                                 guard_admission="ordinary")
+        with patch.object(commands, "run", side_effect=bump.Refusal("ordinary admission refused")) as run:
+            with self.assertRaisesRegex(bump.Refusal, "ordinary admission refused"):
+                commands.rust_guard(["--unverified", "test"], ("alpha", "beta"))
+        self.assertEqual(run.call_count, 1)
+
     def test_explicit_fixed_profile_uses_its_api_and_the_same_owned_serial_config(self):
         commands = bump.Commands(Path("/synthetic/root"), Path("/chosen/targo"),
                                  guard_admission="original-fixed-v1")

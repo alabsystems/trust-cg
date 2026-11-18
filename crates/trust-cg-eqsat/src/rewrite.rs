@@ -35,7 +35,6 @@ use trust_ir::ValueId;
 
 use crate::EngineConfig;
 use crate::derivation::{ProofRef, TermRef};
-use crate::eval;
 use crate::graph::{Entry, Graph, Hit, Id, Key, LeafPos, Node};
 use crate::proof::{EngineResult, Prover, invariant};
 use crate::rules::{Pat, Rule};
@@ -52,6 +51,14 @@ enum Binding {
         residue: u128,
         term: TermRef,
     },
+}
+
+/// The residue a variable is bound to, when it is bound to a constant.
+fn constant_of(binds: &Binds, var: usize) -> Option<u128> {
+    match binds.get(var).copied().flatten() {
+        Some(Binding::Const { residue, .. }) => Some(residue),
+        _ => None,
+    }
 }
 
 impl Binding {
@@ -300,19 +307,7 @@ impl<'r> Engine<'r> {
 
     fn side_conditions_hold(&self, rule: &Rule, ty: ScalarTy, binds: &Binds) -> EngineResult<bool> {
         let width = self.width(ty)?;
-        for cond in rule.conds() {
-            match binds.get(cond.var()).copied().flatten() {
-                Some(Binding::Const { residue, .. }) => {
-                    if !cond.holds(residue, width) {
-                        return Ok(false);
-                    }
-                }
-                // A condition on an unbound or non-constant variable never
-                // holds (fail-closed; the rule parser already refuses it).
-                _ => return Ok(false),
-            }
-        }
-        Ok(true)
+        Ok(rule.side_conditions_hold(width, |var| constant_of(binds, var)))
     }
 
     /// Build the rhs of one match and record the edge from `current`.
@@ -671,17 +666,10 @@ impl<'r> Engine<'r> {
                 Ok((made.id, term, proof))
             }
             Pat::Eval(op, vars) => {
-                let desc = op.desc(ty);
-                let mut residues = Vec::with_capacity(vars.len());
-                for var in vars {
-                    match binds.get(*var).copied().flatten() {
-                        Some(Binding::Const { residue, .. }) => residues.push(residue),
-                        _ => return invariant("an eval argument without a constant binding"),
-                    }
-                }
-                let Some(value) = eval::op(self.widths, desc, &residues) else {
-                    return invariant("eval of an operator outside its domain");
-                };
+                let (desc, value) =
+                    crate::rules::eval_instance(self.widths, ty, *op, vars, |var| {
+                        constant_of(binds, var)
+                    })?;
                 let made = self.constant(desc.result_ty(), value)?;
                 let term = self.graph.canon(made.id)?;
                 Ok((made.id, term, made.proof))

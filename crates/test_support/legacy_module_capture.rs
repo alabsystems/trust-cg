@@ -2,20 +2,22 @@
 
 //! Test-only v55-v57 capture compatibility with the v58+ module schema.
 //! `closure_layouts` follows `drop_glue` in positional serialization, so the
-//! latter now always emits, including when empty. Upgrade only the EXPECTED
-//! historical JSON's missing table; retain all actual fields and every authored
-//! expected field exactly. This grants no source, caller, proof or native authority.
+//! tables now always emit, including when empty. Upgrade only the EXPECTED
+//! historical JSON's two missing empty tables; retain all actual fields and
+//! every authored expected field exactly. This grants no source, caller, proof
+//! or native authority.
 
 use serde_json::Value;
 use trust_ir::Module;
 
 fn upgraded_expected(legacy: &Value) -> Value {
     let mut expected = legacy.clone();
-    expected
+    let object = expected
         .as_object_mut()
-        .expect("legacy module capture must be a JSON object")
-        .entry("drop_glue")
-        .or_insert_with(|| Value::Array(vec![]));
+        .expect("legacy module capture must be a JSON object");
+    for table in ["drop_glue", "closure_layouts"] {
+        object.entry(table).or_insert_with(|| Value::Array(vec![]));
+    }
     expected
 }
 
@@ -69,10 +71,12 @@ mod tests {
 
     fn legacy(module: &Module) -> Value {
         let mut image = serde_json::to_value(module).unwrap();
-        assert_eq!(
-            image.as_object_mut().unwrap().remove("drop_glue"),
-            Some(json!([])),
-        );
+        for table in ["drop_glue", "closure_layouts"] {
+            assert_eq!(
+                image.as_object_mut().unwrap().remove(table),
+                Some(json!([]))
+            );
+        }
         image
     }
 
@@ -133,7 +137,7 @@ mod tests {
     }
 
     #[test]
-    fn missing_empty_drop_glue_upgrades_expected_only() {
+    fn missing_empty_schema_tables_upgrade_expected_only() {
         let module = module(17);
         let expected = legacy(&module);
         let retained = expected.clone();
@@ -141,6 +145,8 @@ mod tests {
         assert_eq!(expected, retained);
         assert!(expected.get("drop_glue").is_none());
         assert_eq!(upgraded_expected(&expected)["drop_glue"], json!([]));
+        assert!(expected.get("closure_layouts").is_none());
+        assert_eq!(upgraded_expected(&expected)["closure_layouts"], json!([]));
     }
 
     #[test]
@@ -238,6 +244,40 @@ mod tests {
             expected["drop_glue"] = malformed.clone();
             assert_eq!(upgraded_expected(&expected)["drop_glue"], malformed);
             refuses(&actual, &expected);
+        }
+    }
+
+    #[test]
+    fn nonempty_and_malformed_closure_layouts_are_never_defaulted_or_erased() {
+        use trust_ir::{ClosureLayoutDescriptor, ClosureTy, ClosureTyId, FuncTyId};
+        let mut actual = module(17);
+        actual.closure_types.push(ClosureTy {
+            func: FuncTyId::new(0),
+            captures: vec![],
+        });
+        actual.closure_layouts.push(ClosureLayoutDescriptor {
+            closure: ClosureTyId::new(0),
+            size: 0,
+            align: 1,
+            capture_offsets: vec![],
+            origin: None,
+        });
+        assert!(trust_ir_build::validate_module(&actual).is_empty());
+        let expected = serde_json::to_value(&actual).unwrap();
+        assert_legacy_module_image(&actual, &expected, "exact recorded closure layout");
+        let mut missing = expected.clone();
+        missing.as_object_mut().unwrap().remove("closure_layouts");
+        refuses(&actual, &missing);
+        for malformed in [
+            json!(null),
+            json!("invalid"),
+            json!([]),
+            json!([{"unknown": true}]),
+        ] {
+            let mut changed = expected.clone();
+            changed["closure_layouts"] = malformed.clone();
+            assert_eq!(upgraded_expected(&changed)["closure_layouts"], malformed);
+            refuses(&actual, &changed);
         }
     }
 }

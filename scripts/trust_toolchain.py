@@ -161,14 +161,78 @@ def _probe_environment() -> dict:
     return without_untracked_controls(os.environ)
 
 
+def resource_fds(env: Mapping[str, str]) -> tuple[int, ...]:
+    """Preserve only advertised live transport descriptions, never grant authority.
+
+    The native owners still authenticate GNU/SDK/CPU custody. A Python launch
+    must not silently close its caller's actual descriptions or pass unrelated
+    descriptors. Malformed or closed locators refuse before running a row.
+    """
+    descriptors: set[int] = set()
+
+    def add(word: str, name: str) -> None:
+        if not re.fullmatch(r"[1-9][0-9]{0,9}", word) or int(word) < 3:
+            raise ToolchainError(f"inherited resources: malformed {name} descriptor")
+        descriptor = int(word)
+        try:
+            os.fstat(descriptor)
+        except (OSError, OverflowError) as error:
+            raise ToolchainError(f"inherited resources: {name} descriptor is not live") from error
+        descriptors.add(descriptor)
+
+    for name in ("ATERM_SDK_LEASE_V3", "ATERM_WORKLOAD_HOST_STORE_FD_V1",
+                 "TRUST_CPU_IMPLICIT_FD"):
+        if name in env:
+            add(env[name], name)
+    fixed_name = "TRUST_FIXED_ADMISSION_FD_V1"
+    if fixed_name in env:
+        if env[fixed_name] == "requires-live-ancestor-v1":
+            # The native nested owner deliberately advertises no direct FD.
+            # Preserve its opaque locator; Targo authenticates the ancestor.
+            if not env.get("TRUST_FIXED_CLAIM_HANDOFF_V1"):
+                raise ToolchainError("inherited resources: fixed marker needs its original ancestor advertisement")
+        else:
+            add(env[fixed_name], fixed_name)
+    for name in ("ATERM_WORKLOAD_CPU_FDS_V1", "BUILD_SLOT_FENCE_FDS"):
+        if name in env:
+            words = env[name].split(",")
+            if not 1 <= len(words) <= 128 or len(set(words)) != len(words):
+                raise ToolchainError(f"inherited resources: malformed {name} descriptor set")
+            for word in words:
+                add(word, name)
+    # FIFO/path and native handoff advertisements are deliberately left intact
+    # for the maintained GNU importer. Only its numeric pipe transport needs
+    # descriptor inheritance at this Python boundary.
+    for name in ("CARGO_MAKEFLAGS", "MAKEFLAGS", "MFLAGS"):
+        # GNU uses the last auth advertisement, even when it disables the
+        # jobserver or selects a non-pipe style. Legacy fds is only a fallback,
+        # matching the maintained GNU importer; never revive an obsolete pipe.
+        value = ""
+        for spelling in ("auth", "fds"):
+            advertisements = re.findall(
+                rf"(?:^|\s)--jobserver-{spelling}=([^\s]*)", env.get(name, ""))
+            if advertisements:
+                value = advertisements[-1]
+                break
+        pair = re.fullmatch(r"([0-9]+),([0-9]+)", value)
+        if pair:
+            add(pair[1], name)
+            add(pair[2], name)
+    return tuple(sorted(descriptors))
+
+
 def _probe(command: Sequence[str], *, environment: Optional[dict] = None,
            cwd: Optional[Path] = None, subtree: bool = False) -> str:
+    if environment is None and not subtree:
+        environment = _probe_environment()
+    descriptors = resource_fds(os.environ if environment is None else environment)
     try:
         if subtree:
             # Targo's scheduled query has a compiler child. Own the new group
             # and stop it before deleting its temporary source on any failure.
             child = subprocess.Popen(list(command), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                     text=True, env=environment, cwd=cwd, start_new_session=True)
+                                     text=True, env=environment, cwd=cwd, start_new_session=True,
+                                     pass_fds=descriptors)
             try:
                 output, diagnostics = child.communicate(timeout=PROBE_TIMEOUT_SECONDS)
             except BaseException:
@@ -189,7 +253,7 @@ def _probe(command: Sequence[str], *, environment: Optional[dict] = None,
         else:
             result = subprocess.run(
                 list(command), capture_output=True, text=True,
-                env=_probe_environment() if environment is None else environment, cwd=cwd,
+                env=environment, cwd=cwd, pass_fds=descriptors,
                 timeout=PROBE_TIMEOUT_SECONDS, check=False,
             )
     except (OSError, subprocess.TimeoutExpired) as error:

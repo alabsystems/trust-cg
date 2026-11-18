@@ -21,6 +21,7 @@ use crate::registry::{Cond, Direction, Pat, Registry, Rule};
 use crate::rejection::{Rejection, TermSite};
 use crate::semantics::eval;
 use crate::terms::{Interner, Leaf, Node, TermError, TermId};
+use crate::types::OpDesc;
 use crate::types::Sty;
 
 /// A replayed conclusion `(lhs, rhs, direction)`.
@@ -39,12 +40,26 @@ fn combine(a: Direction, b: Direction) -> Direction {
     }
 }
 
+/// An order-free node of a Tier S region as `Impl` steps read it
+/// (docs/eqsat-tier-s.md section 2.3): its operand and the orders of its
+/// family. The key of the table is the node's result leaf.
+#[derive(Clone, Debug)]
+pub(crate) struct OrderFreeNode {
+    pub(crate) operand: TermId,
+    pub(crate) orders: Vec<u32>,
+}
+
+/// The order-free nodes of the input region, by result leaf term. Empty for
+/// a function (Tier E), whose decoder refuses `Impl` steps.
+pub(crate) type OrderFreeTable = BTreeMap<TermId, OrderFreeNode>;
+
 /// Checks the rule table against the registry, interns the term table and
 /// replays every proof. Returns each proof's conclusion, by proof index.
 pub(crate) fn replay(
     d: &Derivation,
     registry: &Registry,
     interner: &mut Interner,
+    order_free: &OrderFreeTable,
 ) -> Result<Vec<Conclusion>, Rejection> {
     // Rule table: same name and same statement digest.
     let mut table: Vec<&Rule> = Vec::with_capacity(d.rules.len());
@@ -180,6 +195,36 @@ pub(crate) fn replay(
                     .map(|(n, t)| (n.clone(), ids[*t as usize]))
                     .collect();
                 rule_step(i, r, *ty, &sigma, premises, interner)?
+            }
+            RawProof::Impl { leaf, order } => {
+                // One-way by construction: the conclusion is `refines`, so
+                // `Sym` of it (or of anything built on it) is refused.
+                let leaf = ids[*leaf as usize];
+                let mismatch = |detail: String| Rejection::ImplementMismatch { proof: i, detail };
+                let Some(node) = order_free.get(&leaf) else {
+                    return Err(mismatch(format!(
+                        "{} is not the result of an order-free node of the input region",
+                        interner.render(leaf)
+                    )));
+                };
+                if !node.orders.contains(order) {
+                    return Err(mismatch(format!(
+                        "order {order} is not in the family {:?} of {}",
+                        node.orders,
+                        interner.render(leaf)
+                    )));
+                }
+                let Some(ty) = interner.ty(leaf) else {
+                    return Err(mismatch("the leaf names no term".to_owned()));
+                };
+                let rhs = interner
+                    .op(OpDesc::Pinned(*order, ty), &[node.operand])
+                    .map_err(|e| term_rejection(e, TermSite::Proof(i)))?;
+                Conclusion {
+                    lhs: leaf,
+                    rhs,
+                    dir: Direction::Refines,
+                }
             }
         };
         out.push(c);

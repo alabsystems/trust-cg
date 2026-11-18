@@ -3395,7 +3395,26 @@ fn try_closed_definition_proof(
     crate::process_cost::mark("closed_definition_compose_end");
     let candidate = match candidate {
         Ok(candidate) if candidate.definitions > 0 => candidate,
-        _ => return None,
+        Ok(candidate) => {
+            if crate::diag::solve_trace_enabled() {
+                eprintln!(
+                    "TCG_SOLVE_TRACE closed_definition_candidate_refused obligation={:?} definitions={} proof_bytes={}",
+                    obligation.name,
+                    candidate.definitions,
+                    candidate.text.len()
+                );
+            }
+            return None;
+        }
+        Err(reason) => {
+            if crate::diag::solve_trace_enabled() {
+                eprintln!(
+                    "TCG_SOLVE_TRACE closed_definition_candidate_refused obligation={:?} reason={reason:?}",
+                    obligation.name
+                );
+            }
+            return None;
+        }
     };
     crate::process_cost::mark("closed_definition_check_begin");
     // A Clean check of a proof: the checker's own deadline (OD-223).
@@ -11279,10 +11298,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn test_verify_with_cli_enforces_process_timeout() {
-        // This test replaces the process-global resident solver with a
-        // temporary executable.  Serialize it with every other resident-
-        // solver test so it cannot evict a sibling test's live process and
-        // perturb that test's invocation-count assertions.
+        // Keep the fake solver serialized with the other transport controls.
         let _batch_lock = ay_batch_test_lock();
         // Keep the fixture far beyond the assertion budget. The full verifier
         // suite saturates the host with thousands of proof tests, so a
@@ -11291,7 +11307,12 @@ mod tests {
         // with a 10-second outer bound still proves that timeout teardown did
         // not wait for natural process exit, while remaining stable under
         // publication-suite load.
-        let solver_path = write_temp_solver_script("#!/bin/sh\nsleep 30\necho unsat\n");
+        // First-exec assessment of a new executable and queueing behind an
+        // unrelated resident query happen outside the solver deadline. Warm
+        // this fixture and use the fresh public path so this wall-clock bound
+        // measures the configured process timeout. Separate resident controls
+        // check its admission deadline and complete process-group teardown.
+        let solver_path = write_warm_solver_script("#!/bin/sh\nsleep 30\necho unsat\n");
 
         let x = SmtExpr::var("x", 8);
         let obligation = ProofObligation {
@@ -11306,16 +11327,19 @@ mod tests {
         };
 
         let start = Instant::now();
-        let result = verify_with_cli(
-            &obligation,
-            &AYConfig {
-                solver: Some(crate::ay_identity::test_fixtures::pin(
-                    std::path::Path::new(&solver_path),
-                )),
-                timeout_ms: 50,
-                produce_models: true,
-            },
-        );
+        let result =
+            trust_cg_process_env::with_env_overrides(&[("TCG_NO_SOLVER_SERVER", "1")], || {
+                verify_with_cli(
+                    &obligation,
+                    &AYConfig {
+                        solver: Some(crate::ay_identity::test_fixtures::pin(
+                            std::path::Path::new(&solver_path),
+                        )),
+                        timeout_ms: 50,
+                        produce_models: true,
+                    },
+                )
+            });
         let elapsed = start.elapsed();
 
         let _ = std::fs::remove_file(&solver_path);

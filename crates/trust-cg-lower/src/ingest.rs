@@ -355,7 +355,7 @@ fn admit_at<'m>(
         .collect();
     if let Some(refusal) = errors
         .iter()
-        .find_map(|error| named_validation_refusal(module, error))
+        .find_map(|error| named_validation_refusal(module, license.box_validity_floor(), error))
     {
         return Err(refusal);
     }
@@ -401,8 +401,17 @@ pub fn admission_findings(
     let linked = license
         .authenticated_imports()
         .and_then(|imports| imports.bind_for_ingestion(module));
+    // A Box floor finding is discharged only at a license floor that
+    // consults this backend's re-derivation (never the default `Refuse`) and
+    // only when its conjunct is re-derived from the function itself, by the
+    // shared acceptance check's own predicate; every other finding stands.
+    let box_floor = license.box_validity_floor();
+    let mut rederiver = crate::box_deref::ModuleRederiver::new(module);
     trust_ir_build::validate_module_for_codegen_with(module, &admission)
         .into_iter()
+        .filter(|error| {
+            !crate::box_deref::discharged_by_rederivation(&mut rederiver, box_floor, error)
+        })
         .filter(|error| !linked.as_ref().is_some_and(|imports| imports.covers(error)))
         .filter(|error| !exempt_by_consumer_registry(error, lowerable_dialects))
         .collect()

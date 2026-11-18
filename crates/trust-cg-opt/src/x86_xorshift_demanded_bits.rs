@@ -106,7 +106,7 @@
 //! the HIGH bits, which no x86 consumer in the accepted table demands, and a
 //! variable shift amount has no static `k`.
 
-use std::collections::HashMap;
+use crate::fast_hash::FxHashMap as HashMap;
 
 use trust_cg_ir::regs::VReg;
 use trust_cg_ir::x86_64_ops::X86Opcode;
@@ -162,7 +162,7 @@ fn trace_enabled() -> bool {
 /// and is counted.
 fn def_counts(func: &X86ISelFunction) -> HashMap<VReg, u32> {
     use crate::effects::x86_produces_value;
-    let mut counts: HashMap<VReg, u32> = HashMap::new();
+    let mut counts: HashMap<VReg, u32> = HashMap::default();
     for block_id in &func.block_order {
         let Some(block) = func.blocks.get(block_id) else {
             continue;
@@ -183,7 +183,7 @@ fn def_counts(func: &X86ISelFunction) -> HashMap<VReg, u32> {
 /// `src` only. A multi-def link makes the chain's value position-dependent, and
 /// this pass has no liveness, so such a link is refused rather than traversed.
 fn copy_links(func: &X86ISelFunction, defs: &HashMap<VReg, u32>) -> HashMap<VReg, VReg> {
-    let mut links: HashMap<VReg, VReg> = HashMap::new();
+    let mut links: HashMap<VReg, VReg> = HashMap::default();
     for block_id in &func.block_order {
         let Some(block) = func.blocks.get(block_id) else {
             continue;
@@ -280,7 +280,7 @@ fn run_scoped(func: &mut X86ISelFunction, trace: bool) -> bool {
 
     // Producers: the xor's def (by copy-root) -> (x, k), for the PAIR
     // `ShlRI t, x', k` + `XorRR y, x, t` where x' and x share a copy root.
-    let mut shifts: HashMap<VReg, (VReg, u32)> = HashMap::new();
+    let mut shifts: HashMap<VReg, (VReg, u32)> = HashMap::default();
     for block_id in &func.block_order {
         let Some(block) = func.blocks.get(block_id) else {
             continue;
@@ -319,7 +319,7 @@ fn run_scoped(func: &mut X86ISelFunction, trace: bool) -> bool {
         }
     }
 
-    let mut producers: HashMap<VReg, (VReg, u32)> = HashMap::new();
+    let mut producers: HashMap<VReg, (VReg, u32)> = HashMap::default();
     for block_id in &func.block_order {
         let Some(block) = func.blocks.get(block_id) else {
             continue;

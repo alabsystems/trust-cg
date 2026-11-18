@@ -144,9 +144,9 @@ mod tests {
         prepare_for("aarch64-unknown-linux-gnu", module, lir, level)
     }
 
-    /// Both object targets the sealed Core path prepares for. A sealed-Core
-    /// preparation is proof-grade without the builder selecting it, so the
-    /// Apple red zone never drops the envelope the source-bound frame binds.
+    /// Exercise the frame theorem on both sealed-Core object targets. Linear
+    /// leaves ordinarily omit their zero-storage frame, so these frame-specific
+    /// fixtures request the FP/LR envelope explicitly.
     const SEALED_CORE_TRIPLES: [&str; 2] = ["aarch64-unknown-linux-gnu", "aarch64-apple-darwin"];
 
     fn prepare_for(triple: &str, module: &Module, lir: &Function, level: OptLevel) -> MachFunction {
@@ -154,6 +154,7 @@ mod tests {
             opt_level: level,
             verify: false,
             target_triple: triple.into(),
+            aarch64_force_frame_pointers: true,
             ..Default::default()
         })
         .prepare_function_with_metrics_for_sealed_core(lir, None, module, 0)

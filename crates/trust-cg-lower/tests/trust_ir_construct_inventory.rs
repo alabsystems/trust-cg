@@ -463,7 +463,7 @@ fn ty_rows() -> Vec<Row> {
         row(T, "Tuple", executed(cg!("e2e_aarch64_nested_bytes"), "native_nested_tuple_bytes_and_empty_leaf_o0_through_o3"), "Ty::Tuple", "nested tuples with an empty leaf"),
         row(T, "Enum", executed(cg!("e2e_aarch64_direct_enums"), "native_direct_enums_agree_with_the_c_oracle_and_the_interpreter_o0_through_o3"), "Ty::Enum", "direct-tag enums against a C oracle and the reference interpreter"),
         row(T, "Func", executed(cg!("e2e_aarch64_closures"), "nested_closure_fndef_and_symbol_addr_constants_materialize_at_every_level"), "Ty::Func", "function-typed constants reified and called"),
-        row(T, "FnItem", refused(&["Ty::FnItem", "no native value ABI", "function-item coercion"], SELF_FILE, REFUSAL_GATE), "Ty::FnItem", "v73 nominal zero-storage function identity: never a code pointer or an ABI value until an explicit coercion reifies it")
+        row(T, "FnItem", refused(&["Ty::FnItem", "no checked nominal singleton transport", "must not replace it"], SELF_FILE, REFUSAL_GATE), "Ty::FnItem", "the contextless type probe has no nominal singleton transport; the explicit native profile retains a closed singleton identity without an ABI slot, and only an actual Reify creates a function pointer")
             .probe(probe_fn_item_type),
         row(T, "Ref", executed(cg!("e2e_aarch64_construct_sweep_types"), "native_reference_carriers_load_and_store_through_ptr_to_ptr_o0_through_o3"), "Ty::Ref(", "shared reference parameter loaded through, from `PtrToPtr` and from C, against the interpreter and C")
             .probe(probe_reference_pointer_carriers),
@@ -773,12 +773,12 @@ fn constant_rows() -> Vec<Row> {
             C,
             "FnItem",
             refused(
-                &["[TCG-FN-ITEM]", "nominal zero-sized identity", "explicit coercion"],
+                &["Constant::FnItem", "no checked nominal singleton transport", "must not replace it"],
                 SELF_FILE,
                 REFUSAL_GATE,
             ),
             "Constant::FnItem",
-            "v73 zero-byte nominal function identity; native lowering refuses to invent an address-bearing Ty::Func value",
+            "the ordinary constant probe has no checked nominal singleton transport and still refuses to invent Unit, I64 or an address-bearing Ty::Func value",
         )
         .probe(probe_fn_item_constant),
         row(

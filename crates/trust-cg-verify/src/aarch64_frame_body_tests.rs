@@ -1177,3 +1177,6 @@ fn frame_body_readonly_leaf_requires_real_replay_and_exact_linked_endpoints() {
     // Deliberately no native invocation or source-license claim: this fixture
     // qualifies the shared frame join and strict replay, not pointee access.
 }
+
+#[path = "aarch64_exact_callee_memory_tests.rs"]
+mod exact_memory_tests;

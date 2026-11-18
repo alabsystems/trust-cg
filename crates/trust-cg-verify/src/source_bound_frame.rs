@@ -42,7 +42,12 @@ pub use crate::source_bound_body::read_only_source::{
 };
 
 pub use crate::source_bound_body::read_only_source::scalar_memory::{
-    ScalarMemoryAccess, ScalarMemoryCodec, ScalarMemorySourceQueries, bind_scalar_memory_source,
+    ScalarMemoryAccess, ScalarMemoryCodec, ScalarMemorySourceQueries, VoidMemorySourceQueries,
+    bind_scalar_memory_source, bind_void_memory_source,
+};
+#[cfg(feature = "source-defined-call")]
+pub use crate::source_bound_body::read_only_source::scalar_memory::{
+    bind_licensed_void_memory_source, bind_licensed_word_status_source,
 };
 
 pub use crate::source_bound_body::read_only_source::conditional_wrapper::{

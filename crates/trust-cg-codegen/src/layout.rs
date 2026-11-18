@@ -16,7 +16,7 @@
 use std::collections::HashSet;
 use std::sync::OnceLock;
 use trust_cg_ir::aarch64_regs::SP as AARCH64_SP;
-use trust_cg_ir::{AArch64Opcode, BlockId, InstId, MachFunction, MachInst, MachOperand};
+use trust_cg_ir::{AArch64Opcode, BlockId, CondCode, InstId, MachFunction, MachInst, MachOperand};
 use trust_cg_opt::dom::DomTree;
 use trust_cg_opt::loops::{LoopAnalysis, NaturalLoop};
 
@@ -1116,6 +1116,10 @@ fn bcond_cc(inst: &MachInst) -> Option<i64> {
     })
 }
 
+fn bcond_complement(inst: &MachInst) -> Option<CondCode> {
+    CondCode::from_encoding(bcond_cc(inst)?)?.logical_complement()
+}
+
 /// True if a conditional pair's terminator can be inverted so its fall-through
 /// and branch-taken targets swap: `BCond` with a real invertible cc (`0..=13`,
 /// AArch64 flips bit 0; `AL`/`NV` rejected), or a compare-and-branch whose
@@ -1123,7 +1127,7 @@ fn bcond_cc(inst: &MachInst) -> Option<i64> {
 fn cond_pair_invertible(func: &MachFunction, cp: &CondPair) -> bool {
     let cond = func.inst(cp.cond_id);
     match cond.opcode {
-        AArch64Opcode::BCond => bcond_cc(cond).is_some_and(|cc| (0..=13).contains(&cc)),
+        AArch64Opcode::BCond => bcond_complement(cond).is_some(),
         AArch64Opcode::Cbz | AArch64Opcode::Cbnz | AArch64Opcode::Tbz | AArch64Opcode::Tbnz => true,
         _ => false,
     }
@@ -1144,15 +1148,14 @@ fn invert_cond_pair(func: &mut MachFunction, block: BlockId, cp: &CondPair) -> b
     let cond = func.inst(cp.cond_id);
     let (new_opcode, new_operands) = match cond.opcode {
         AArch64Opcode::BCond => {
-            let cc = match bcond_cc(cond) {
-                Some(cc) if (0..=13).contains(&cc) => cc,
-                _ => return false,
+            let Some(inverse) = bcond_complement(cond) else {
+                return false;
             };
             let ops = cond
                 .operands
                 .iter()
                 .map(|op| match op {
-                    MachOperand::Imm(_) => MachOperand::Imm(cc ^ 1),
+                    MachOperand::Imm(_) => MachOperand::Imm(i64::from(inverse.encoding())),
                     MachOperand::Block(_) => MachOperand::Block(cp.ft_target),
                     other => other.clone(),
                 })
@@ -3117,13 +3120,12 @@ fn rotate_top_tested_loops(func: &mut MachFunction) -> bool {
         if *exit_target != exit {
             continue;
         }
-        // Only genuine, invertible condition codes (0..=13). AArch64 inverts a
-        // condition by flipping encoding bit 0; AL(14)/NV(15) are unconditional
-        // and are rejected.
-        if !(0..=13).contains(cc) {
+        // AL and NV are unconditional and have no logical complement.
+        let Some(inverse) = CondCode::from_encoding(*cc).and_then(CondCode::logical_complement)
+        else {
             continue;
-        }
-        let inverted_cc = cc ^ 1;
+        };
+        let inverted_cc = i64::from(inverse.encoding());
 
         // Bd's last real instruction must be `b H` (the unconditional back-edge).
         let Some(back_edge_id) = last_real_inst(func, body) else {

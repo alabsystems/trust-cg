@@ -53,7 +53,9 @@ fn preflight(lir: &Function, profile: Profile) -> Result<()> {
     if lir.blocks.is_empty()
         || lir.signature.params.is_empty()
         || lir.signature.params.iter().any(|ty| *ty != Type::I64)
-        || if profile.vector_returns() {
+        || if profile.void_memory() {
+            lir.signature.params != [Type::I64, Type::I64] || !lir.signature.returns.is_empty()
+        } else if profile.vector_returns() {
             !(1..=8).contains(&lir.signature.returns.len())
                 || lir
                     .signature
@@ -183,6 +185,7 @@ fn shape(instruction: &Instruction, profile: Profile) -> Result<()> {
         Opcode::Store { ty, align } if profile.writable() && memory_shape(ty, *align, profile) => {
             (2, 0)
         }
+        Opcode::Return if profile.void_memory() => (0, 0),
         Opcode::Return if profile.vector_returns() && (1..=8).contains(&arguments) => {
             (arguments, 0)
         }
@@ -531,6 +534,7 @@ fn graph_with_projection(
                     alignment: u64::from(align.unwrap_or(ty.align())),
                     byte_width: memory_width(ty, profile).expect("preflight scalar store width"),
                 },
+                Opcode::Return if profile.void_memory() => Operation::VoidReturn,
                 Opcode::Return if profile.vector_returns() => Operation::VectorReturn(
                     node.args
                         .iter()

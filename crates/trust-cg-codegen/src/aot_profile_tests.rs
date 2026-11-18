@@ -476,6 +476,38 @@ fn aot_counter_public_absent_sink_preserves_the_function_and_emits_no_counter_sy
 #[test]
 fn aot_counter_public_parallel_batch_reserves_sites_in_input_order() {
     use trust_cg_lower::instructions::{Instruction, Opcode, Value};
+    // The verifier captures its worker policy for the process lifetime. Select
+    // this test's cap before any verifier use, independently of sibling tests;
+    // changing a previously captured policy must continue to refuse.
+    const CHILD: &str = "AOT_COUNTER_PARALLEL_BATCH_CHILD";
+    const PASSED: &str = "[AOT-COUNTER-PARALLEL-BATCH-PASS]";
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(
+            std::env::current_exe().expect("current trust-cg-codegen test executable"),
+        )
+        .args([
+            "pipeline::aot_profile_tests::aot_counter_public_parallel_batch_reserves_sites_in_input_order",
+            "--exact",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env(CHILD, "1")
+        .env(crate::resource_limits::TRUST_CG_MAX_PARALLELISM_ENV, "2")
+        .output()
+        .expect("run isolated AOT counter batch test");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success(),
+            "isolated counter batch failed:\nstdout:\n{}\nstderr:\n{stderr}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        assert!(
+            stderr.contains(PASSED),
+            "counter batch assertions did not execute: {stderr}"
+        );
+        return;
+    }
+    assert_eq!(std::env::var(CHILD).unwrap(), "1");
     crate::env_lock::with_env_edits(|env| {
         env.set(crate::resource_limits::TRUST_CG_MAX_PARALLELISM_ENV, "2");
         let mut inputs: Vec<_> = (0..32)
@@ -544,6 +576,7 @@ fn aot_counter_public_parallel_batch_reserves_sites_in_input_order() {
         }
         assert_eq!(*sink.lock().unwrap(), *serial_sink.lock().unwrap());
     });
+    eprintln!("{PASSED}");
 }
 
 #[test]

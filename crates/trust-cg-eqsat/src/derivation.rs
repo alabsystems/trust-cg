@@ -3,7 +3,10 @@
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // Copyright 2026 Andrew Yates | License: Apache-2.0
 
-//! The derivation byte format, version 1 (`docs/eqsat-tier-e.md` section 7.2).
+//! The derivation byte format (`docs/eqsat-tier-e.md` section 7.2): version
+//! 1 for a Tier E function, version 2 for a Tier S region
+//! (`docs/eqsat-tier-s.md` section 6: version 1 plus the pinned-reduction
+//! operator and the `Impl` step).
 //!
 //! [`DerivationBuilder`] interns terms and proofs (structurally equal entries
 //! get one reference) and [`DerivationBuilder::finish`] writes the canonical
@@ -25,8 +28,12 @@ pub use crate::vocab::{BinOpCode, CastOpCode, CmpPred, OpDesc, ScalarTy, UnOpCod
 /// The magic bytes that open every derivation.
 pub const MAGIC: [u8; 8] = *b"TCGEQSAT";
 
-/// The format version this crate writes.
+/// The format version of a Tier E (function) derivation.
 pub const VERSION: u32 = 1;
+
+/// The format version of a Tier S (region) derivation
+/// (`docs/eqsat-tier-s.md` section 6).
+pub const REGION_VERSION: u32 = 2;
 
 /// A rule-table entry of a [`DerivationBuilder`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -87,11 +94,18 @@ pub(crate) enum ProofEntry {
         bindings: Vec<(String, TermRef)>,
         side_conditions: u32,
     },
+    /// `Impl(leaf, order)` (version 2 only): the order-free node whose
+    /// result is `leaf`, implemented by the reduction pinned at `order`.
+    Impl {
+        leaf: TermRef,
+        order: u32,
+    },
 }
 
 /// Builds one derivation. See the module docs: no meaning is checked.
 #[derive(Debug, Clone)]
 pub struct DerivationBuilder {
+    version: u32,
     function: String,
     rules: Vec<(String, [u8; 32])>,
     rule_index: BTreeMap<(String, [u8; 32]), RuleRef>,
@@ -113,6 +127,7 @@ impl DerivationBuilder {
     #[must_use]
     pub fn new(function_name: &str) -> Self {
         Self {
+            version: VERSION,
             function: function_name.to_owned(),
             rules: Vec::new(),
             rule_index: BTreeMap::new(),
@@ -122,6 +137,15 @@ impl DerivationBuilder {
             proof_index: BTreeMap::new(),
             claims: Vec::new(),
         }
+    }
+
+    /// A builder for a version-2 derivation about the Tier S region named
+    /// `region_name` (`docs/eqsat-tier-s.md` section 6).
+    #[must_use]
+    pub fn new_region(region_name: &str) -> Self {
+        let mut builder = Self::new(region_name);
+        builder.version = REGION_VERSION;
+        builder
     }
 
     /// Register a rule-table entry `(name, digest)` (interned).
@@ -226,6 +250,14 @@ impl DerivationBuilder {
         })
     }
 
+    /// `Impl(leaf, order)`: the order-free node whose result is `leaf`,
+    /// implemented by the reduction pinned at `order` over its operand.
+    /// Version 2 only; nothing is checked (a version-1 builder encodes it
+    /// too, and a checker refuses the bytes).
+    pub fn implement(&mut self, leaf: TermRef, order: u32) -> ProofRef {
+        self.proof(ProofEntry::Impl { leaf, order })
+    }
+
     /// Claim `proof`'s conclusion (repeated claims are kept once).
     pub fn claim(&mut self, proof: ProofRef) {
         if !self.claims.contains(&proof) {
@@ -303,7 +335,9 @@ impl<'a> Encoder<'a> {
             };
             if expanded {
                 match entry {
-                    ProofEntry::Refl(term) => self.visit_term(*term),
+                    ProofEntry::Refl(term) | ProofEntry::Impl { leaf: term, .. } => {
+                        self.visit_term(*term);
+                    }
                     ProofEntry::Rule { rule, bindings, .. } => {
                         if let Some(used) = self.rules_used.get_mut(rule.0 as usize) {
                             *used = true;
@@ -322,7 +356,9 @@ impl<'a> Encoder<'a> {
             }
             stack.push((proof, true));
             let children: Vec<ProofRef> = match entry {
-                ProofEntry::Refl(_) | ProofEntry::Rule { .. } => Vec::new(),
+                ProofEntry::Refl(_) | ProofEntry::Rule { .. } | ProofEntry::Impl { .. } => {
+                    Vec::new()
+                }
                 ProofEntry::Sym(p) => vec![*p],
                 ProofEntry::Trans(p, q) => vec![*p, *q],
                 ProofEntry::Congr(_, ps) => ps.clone(),
@@ -372,7 +408,7 @@ impl<'a> Encoder<'a> {
 
         let mut out = Vec::new();
         out.extend_from_slice(&MAGIC);
-        put_u32(&mut out, VERSION);
+        put_u32(&mut out, self.builder.version);
         put_str(&mut out, &self.builder.function);
         put_u32(&mut out, index_u32(used.len()));
         for (_, (name, digest)) in &used {
@@ -462,6 +498,11 @@ impl<'a> Encoder<'a> {
                         put_u32(&mut out, premise);
                     }
                 }
+                ProofEntry::Impl { leaf, order } => {
+                    out.push(0x06);
+                    put_u32(&mut out, self.term_number(*leaf));
+                    put_u32(&mut out, *order);
+                }
             }
         }
         let mut claim_numbers: Vec<u32> = claims
@@ -492,4 +533,11 @@ fn put_str(out: &mut Vec<u8>, text: &str) {
 #[must_use]
 pub fn header_only(function_name: &str) -> Vec<u8> {
     DerivationBuilder::new(function_name).finish()
+}
+
+/// The version-2 derivation with nothing to justify
+/// (`docs/eqsat-tier-s.md` section 6).
+#[must_use]
+pub fn region_header_only(region_name: &str) -> Vec<u8> {
+    DerivationBuilder::new_region(region_name).finish()
 }

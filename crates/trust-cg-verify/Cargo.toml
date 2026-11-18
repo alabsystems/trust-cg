@@ -56,9 +56,9 @@ trust-ir = { workspace = true }
 trust-ir-build = { workspace = true, optional = true }
 # Match the Clean revision owned by the pinned TrustIR family. No path patch
 # or substitute semantics may supply the replay vocabulary.
-clean-kernel = { git = "https://github.com/alabsystems/clean.git", rev = "fae0c94829740c9ffe527eeeb4ea472f9c08001b", optional = true }
-clean-olean = { git = "https://github.com/alabsystems/clean.git", rev = "fae0c94829740c9ffe527eeeb4ea472f9c08001b", optional = true, default-features = false }
-clean-verify = { git = "https://github.com/alabsystems/clean.git", rev = "fae0c94829740c9ffe527eeeb4ea472f9c08001b", optional = true }
+clean-kernel = { git = "https://github.com/alabsystems/clean.git", rev = "e86b4b61e665f73b4737dd360773677561462f7e", optional = true }
+clean-olean = { git = "https://github.com/alabsystems/clean.git", rev = "e86b4b61e665f73b4737dd360773677561462f7e", optional = true, default-features = false }
+clean-verify = { git = "https://github.com/alabsystems/clean.git", rev = "e86b4b61e665f73b4737dd360773677561462f7e", optional = true }
 thiserror = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

@@ -10,6 +10,12 @@
 //!
 //! Reference: `~/llvm-project-ref/llvm/lib/Target/AArch64/AArch64InstrFormats.td`
 
+#[path = "../../../../formal/lean/Trust/A64/MoveWideBits.lean"]
+clean mod move_wide_bits;
+
+#[path = "../../../../formal/lean/Trust/A64/AddSubImmBits.lean"]
+clean mod add_sub_imm_bits;
+
 // ---------------------------------------------------------------------------
 // Condition codes (ARM ARM C1.2.4)
 // ---------------------------------------------------------------------------
@@ -204,14 +210,13 @@ pub fn encode_add_sub_imm(sf: u32, op: u32, s: u32, sh: u32, imm12: u32, rn: u32
     debug_assert!(rn <= 31);
     debug_assert!(rd <= 31);
 
-    (sf << 31)
-        | (op << 30)
-        | (s << 29)
-        | (0b100010 << 23)
-        | (sh << 22)
-        | (imm12 << 10)
-        | (rn << 5)
-        | rd
+    let sf_op_s = (sf << 2) | (op << 1) | s;
+    if sh <= 1 && imm12 <= 0xFFF && (rn | rd) <= 31 {
+        trust_cg_a64_add_sub_imm_word(sf_op_s, sh, imm12, rn, rd)
+    } else {
+        // Preserve the release behavior of raw fields that overlap other bits.
+        (sf_op_s << 29) | (0b100010 << 23) | (sh << 22) | (imm12 << 10) | (rn << 5) | rd
+    }
 }
 
 /// Encode **Move Wide (immediate)** — MOVN, MOVZ, MOVK.
@@ -249,7 +254,8 @@ pub fn encode_move_wide(sf: u32, opc: u32, hw: u32, imm16: u32, rd: u32) -> u32 
     let imm16 = imm16 & 0xFFFF;
     let rd = rd & 0b1_1111;
 
-    (sf << 31) | (opc << 29) | (0b100101 << 23) | (hw << 21) | (imm16 << 5) | rd
+    // Merge sf and opc before packing to preserve their original bitwise OR.
+    trust_cg_a64_move_wide_word((sf << 2) | opc, hw, imm16, rd)
 }
 
 /// Encode **Conditional Branch** — B.cond.
@@ -1074,10 +1080,33 @@ mod tests {
     }
 
     #[test]
+    fn test_add_sub_imm_raw_field_overlap() {
+        assert_eq!(encode_add_sub_imm(1, 1, 1, 1, 1, 1, 0), 0xF140_0420);
+        #[cfg(not(debug_assertions))]
+        {
+            assert_eq!(encode_add_sub_imm(1, 1, 1, 1, 0x1001, 1, 0), 0xF140_0420);
+            assert_eq!(encode_add_sub_imm(0, 3, 5, 1, 1, 1, 0), 0xF140_0420);
+        }
+    }
+
+    #[test]
     fn test_fixed_bits_move_wide() {
         // Bits 28:23 must be 100101 for move wide
         let enc = encode_move_wide(0, 0b10, 0, 0, 0);
         assert_eq!((enc >> 23) & 0x3F, 0b100101);
+    }
+
+    #[test]
+    fn test_move_wide_preserves_raw_carriers() {
+        assert_eq!(
+            encode_move_wide(1, 3, 0xFFFF_FFFE, 0xFEDC_1234, 31),
+            0xF2C2_469F
+        );
+        #[cfg(not(debug_assertions))]
+        assert_eq!(
+            encode_move_wide(1, 7, 0xFFFF_FFFE, 0xFEDC_1234, u32::MAX),
+            0xF2C2_469F
+        );
     }
 
     #[test]

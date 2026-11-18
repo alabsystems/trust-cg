@@ -1,9 +1,9 @@
 // Author: Andrew Yates | Copyright 2026 Andrew Yates | Apache-2.0
 
-//! Compact fixed-field denotation for the architectural SBFM/ASR alias.
+//! Compact fixed-field denotation for architectural ASR and MOV aliases.
 //!
 //! This optional API does not replace the registered value denotation. Symbolic
-//! bitfield overrides and all other instruction rows delegate to that unchanged
+//! bitfield overrides and every nonalias instruction row delegate to that unchanged
 //! implementation, preserving its expression/query identity. No source opcode,
 //! normal-form equality, simplifier, proof or instruction credit selects a row.
 //!
@@ -17,7 +17,8 @@ use super::{
 use crate::aarch64_semantics::encode_asr_rr;
 use trust_cg_ir::cc::OperandSize;
 
-/// Denote the valid fixed SBFM alias with `imms == datasize-1` as arithmetic
+/// Denote the exact ORR/ZR/LSL#0 MOV alias as a register read, and the
+/// valid fixed SBFM alias with `imms == datasize-1` as arithmetic
 /// right shift. Both fields must be concrete: either bitfield override causes
 /// an exact delegation to [`denote_a64_value_word`]. All other rows also use
 /// that existing API unchanged. Manually malformed SBFM fields are refused.
@@ -29,6 +30,31 @@ pub fn denote_a64_value_word_compact(
     word: &A64ValueWord,
     fields: &FieldOverrides,
 ) -> Result<A64Effect, A64DenoteRefusal> {
+    if let A64ValueWord::LogicalShiftedReg {
+        sf,
+        opc: 1,
+        shift: 0,
+        n: 0,
+        rm,
+        imm6: 0,
+        rn: 31,
+        rd,
+    } = *word
+    {
+        if sf > 1 || rm > 31 || rd > 31 {
+            return Err(A64DenoteRefusal::UnmodeledInstruction(
+                "invalid decoded MOV register fields",
+            ));
+        }
+        // Arm's MOV (register) alias selects exactly these encoding fields.
+        // W reads retain the architecture's full-X zero extension; register
+        // 31 is ZR/discard. No source identity or equality goal selects it.
+        return Ok(A64Effect {
+            dest: gpr_dest_zr(rd),
+            value: zext(read_gpr_zr(rm, 32 << sf), 64),
+            writes_nzcv: false,
+        });
+    }
     let A64ValueWord::Bitfield {
         sf,
         opc: 0,
@@ -99,6 +125,75 @@ mod tests {
             node.for_each_child(&mut |child| pending.push(child));
         }
         count
+    }
+
+    #[test]
+    fn all_mov_register_fields_keep_full_w_x_values_and_nonaliases_delegate() {
+        for sf in 0..=1 {
+            for rm in 0..32 {
+                for rd in 0..32 {
+                    let raw = (sf << 31) | 0x2a00_03e0 | (rm << 16) | rd;
+                    let word = decode_a64_value_word(raw).unwrap();
+                    let generic = denote_a64_value_word(&word, &FieldOverrides::default()).unwrap();
+                    let compact =
+                        denote_a64_value_word_compact(&word, &FieldOverrides::default()).unwrap();
+                    assert_eq!(compact.dest, generic.dest);
+                    assert!(!compact.writes_nzcv);
+                    assert_eq!(compact.value.bv_width(), 64);
+                    for input in [
+                        0,
+                        1,
+                        u64::MAX,
+                        0x8000_0000_0000_0000,
+                        0x0123_4567_89ab_cdef,
+                        0xffff_ffff_0000_0001,
+                    ] {
+                        let mut env = EvalEnv::default();
+                        if rm != 31 {
+                            env.insert(format!("x{rm}"), input);
+                        }
+                        let expected = if rm == 31 {
+                            0
+                        } else if sf == 0 {
+                            u64::from(input as u32)
+                        } else {
+                            input
+                        };
+                        assert_eq!(generic.value.try_eval(&env).unwrap().as_u64(), expected);
+                        assert_eq!(compact.value.try_eval(&env).unwrap().as_u64(), expected);
+                    }
+                    // Every alias-defining field has an independent changed
+                    // encoding: source Rn, inversion, shift kind/amount, opcode.
+                    for changed in [
+                        raw & !(31 << 5),
+                        raw | (1 << 21),
+                        raw | (1 << 22),
+                        raw | (1 << 10),
+                        raw ^ (1 << 29),
+                    ] {
+                        let other = decode_a64_value_word(changed).unwrap();
+                        assert_eq!(
+                            denote_a64_value_word_compact(&other, &FieldOverrides::default())
+                                .unwrap(),
+                            denote_a64_value_word(&other, &FieldOverrides::default()).unwrap()
+                        );
+                    }
+                }
+            }
+        }
+        for (sf, rm, rd) in [(2, 1, 0), (1, 32, 0), (1, 1, 32)] {
+            let word = A64ValueWord::LogicalShiftedReg {
+                sf,
+                opc: 1,
+                shift: 0,
+                n: 0,
+                rm,
+                imm6: 0,
+                rn: 31,
+                rd,
+            };
+            assert!(denote_a64_value_word_compact(&word, &FieldOverrides::default()).is_err());
+        }
     }
 
     #[test]

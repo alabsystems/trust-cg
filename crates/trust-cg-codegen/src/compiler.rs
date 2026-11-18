@@ -1953,11 +1953,17 @@ pub struct CompilerConfig {
     /// default digest is unchanged; refused at the closed-JIT Core proof-grade
     /// boundary like every other non-default control.
     pub link_unit_definitions: BTreeSet<String>,
-    /// Give an x86-64 object compile the register-allocation quality changes
-    /// the rustc bridge installs for `no-proof-certs` (ABI copy hints,
-    /// caller-saved-first order, cold-call weighting, the conditional-call
-    /// split), unless an installed process policy opted out of one
+    /// Give an x86-64 object compile the code-quality changes the rustc
+    /// bridge installs for `no-proof-certs`: the register-allocation changes
+    /// (ABI copy hints, caller-saved-first order, cold-call weighting, the
+    /// conditional-call split), frameless leaves in an object without unwind
+    /// tables, the O2 machine-pass fixpoint and the certificate-free IMUL
+    /// reductions, each unless an installed process policy opted out of it
     /// ([`crate::x86_64::pipeline::X86AllocationQuality::CertificateFree`]).
+    /// The name predates everything but the allocation changes and is kept
+    /// because it is a compile-policy Artifact field
+    /// (`TAG_COMPILER_X86_CERTIFICATE_FREE_ALLOCATION`): it requests the
+    /// certificate-free code-quality policy as a whole.
     ///
     /// A driver that keeps no proof certificates and installs no policy (the
     /// TY ahead-of-time path) sets this to get them. It changes emitted bytes,
@@ -6456,6 +6462,18 @@ mod core_stack_entry;
 pub use core_defined_call_install::CoreDefinedCallInstallationFailure;
 #[cfg(feature = "verify")]
 pub use core_stack_entry::CoreOwnedStackEntry;
+#[cfg(feature = "source-defined-call")]
+#[path = "core_context_output.rs"]
+pub(crate) mod core_context_output;
+#[cfg(feature = "source-defined-call")]
+pub use core_context_output::{CoreOwnedContextOutputEntry, CoreWordMemoryObservation};
+#[cfg(feature = "source-defined-call")]
+#[path = "core_four_pointer_status.rs"]
+pub(crate) mod core_four_pointer_status;
+#[cfg(feature = "source-defined-call")]
+pub use core_four_pointer_status::{
+    CoreFourWordStatusObservation, CoreOwnedFourPointerStatusEntry,
+};
 
 struct CoreCompilationSource {
     module: std::sync::Arc<trust_ir::Module>,
@@ -6467,6 +6485,16 @@ enum CoreMachineCompilationOutcome {
     Ordinary(PreparedCoreAddressFreeMachine),
     #[cfg(feature = "verify")]
     Conditional(core_peer_entry::PreparedPeer),
+}
+
+enum CoreMachineEntryMode<'a> {
+    Ordinary(std::marker::PhantomData<&'a ()>),
+    #[cfg(feature = "verify")]
+    Peer(&'a str),
+    #[cfg(feature = "source-defined-call")]
+    ContextOutput(&'a mut core_context_output::ContextCompilation),
+    #[cfg(feature = "source-defined-call")]
+    FourPointerStatus(&'a mut core_four_pointer_status::StatusCompilation),
 }
 
 #[cfg(feature = "verify")]
@@ -6657,7 +6685,11 @@ fn compile_policy_qualified_core_to_address_free_machine(
     qualified: &PolicyQualifiedCoreJitCompilationPlan,
     machine_rejection: &mut Option<CoreMachineProofRejection>,
 ) -> Result<PreparedCoreAddressFreeMachine, CoreAddressFreeMachineCompilationError> {
-    match compile_policy_qualified_core_machine_mode(qualified, machine_rejection, None)? {
+    match compile_policy_qualified_core_machine_mode(
+        qualified,
+        machine_rejection,
+        CoreMachineEntryMode::Ordinary(std::marker::PhantomData),
+    )? {
         #[cfg(feature = "verify")]
         CoreMachineCompilationOutcome::Ordinary(compiled) => Ok(compiled),
         #[cfg(feature = "verify")]
@@ -6673,10 +6705,68 @@ fn compile_policy_qualified_core_to_address_free_machine(
 fn compile_policy_qualified_core_machine_mode(
     qualified: &PolicyQualifiedCoreJitCompilationPlan,
     machine_rejection: &mut Option<CoreMachineProofRejection>,
-    peer_entry: Option<&str>,
+    entry_mode: CoreMachineEntryMode<'_>,
 ) -> Result<CoreMachineCompilationOutcome, CoreAddressFreeMachineCompilationError> {
+    // A recognized byte-entry label supplies no caller memory. Keep its
+    // unbound generic artifact/report path closed; only the consuming mode
+    // below can join genuine replay to actual initialized owned storage.
+    #[cfg(feature = "verify")]
+    if matches!(&entry_mode, CoreMachineEntryMode::Ordinary(_))
+        && qualified
+            .plan
+            .parts
+            .module
+            .proof_certificates
+            .iter()
+            .any(|certificate| {
+                certificate
+                    .evidence
+                    .clean_cic_kernel_recheck()
+                    .is_some_and(|directive| {
+                        directive.anchor
+                            == trust_ir::proof::KERNEL_ANCHOR_CLEAN_BACKEND_BYTE_ENTRY_V1
+                    })
+            })
+    {
+        return Err(CompileError::CoreInstallationContract(
+            "byte-entry source requires the owned context/output consumer".into(),
+        )
+        .into());
+    }
+    // A new source-family anchor is not an ordinary callable artifact. Its
+    // genuine compiler replay must be joined to the four live memory owners.
+    #[cfg(feature = "verify")]
+    if matches!(&entry_mode, CoreMachineEntryMode::Ordinary(_))
+        && qualified
+            .plan
+            .parts
+            .module
+            .proof_certificates
+            .iter()
+            .any(|certificate| {
+                certificate
+                    .evidence
+                    .clean_cic_kernel_recheck()
+                    .is_some_and(|directive| {
+                        directive.anchor
+                            == trust_ir::proof::KERNEL_ANCHOR_CLEAN_BACKEND_WORD_STATUS_ENTRY_V1
+                    })
+            })
+    {
+        return Err(CompileError::CoreInstallationContract(
+            "word/status source requires the owned four-pointer/status consumer".into(),
+        )
+        .into());
+    }
     #[cfg(not(feature = "verify"))]
-    let _ = (machine_rejection, peer_entry);
+    let _ = (machine_rejection, entry_mode);
+    #[cfg(feature = "verify")]
+    let peer_entry = match &entry_mode {
+        CoreMachineEntryMode::Peer(entry) => Some(*entry),
+        _ => None,
+    };
+    #[cfg(feature = "source-defined-call")]
+    let mut entry_mode = entry_mode;
     crate::resource_limits::admit_compilation_budget().map_err(CompileError::from)?;
     let rechecked_fast_regalloc = qualify_proof_grade_core_jit_plan(&qualified.plan)?;
     if rechecked_fast_regalloc != qualified.fast_regalloc {
@@ -7273,13 +7363,119 @@ fn compile_policy_qualified_core_machine_mode(
                         }
                     }
                 }
+                #[cfg(feature = "source-defined-call")]
+                let context_owner = if let CoreMachineEntryMode::ContextOutput(context) =
+                    &mut entry_mode
+                {
+                    if !functions.is_empty()
+                        || plan.parts.lir_functions.len() != 1
+                        || expected_fixup_count != 0
+                        || !fixup_entries.is_empty()
+                    {
+                        return Err(CompileError::CoreInstallationContract(
+                            "context/output requires complete empty fixup/call inventories".into(),
+                        )
+                        .into());
+                    }
+                    match context.bind(
+                        &plan.parts.module,
+                        &verification,
+                        lir_function,
+                        &machine_function,
+                        &code,
+                        &captured,
+                    ) {
+                        Ok(owner) => Some(owner),
+                        Err(reason) => {
+                            *machine_rejection = Some(CoreMachineProofRejection {
+                                source_function: caller,
+                                machine: machine_function,
+                                frame_layout: metrics.frame_layout,
+                                bytes: code,
+                                fixup_sites,
+                                prior_functions: std::mem::take(&mut functions),
+                                captured,
+                                request: verification.request.clone(),
+                            });
+                            return Err(CompileError::CoreInstallationContract(reason).into());
+                        }
+                    }
+                } else {
+                    None
+                };
+                #[cfg(feature = "source-defined-call")]
+                let status_owner =
+                    if let CoreMachineEntryMode::FourPointerStatus(status) = &mut entry_mode {
+                        if !functions.is_empty()
+                            || plan.parts.lir_functions.len() != 1
+                            || expected_fixup_count != 0
+                            || !fixup_entries.is_empty()
+                        {
+                            return Err(CompileError::CoreInstallationContract(
+                            "four-pointer/status requires complete empty fixup/call inventories"
+                                .into(),
+                        )
+                        .into());
+                        }
+                        match status.bind(
+                            &plan.parts.module,
+                            &verification,
+                            lir_function,
+                            &machine_function,
+                            &code,
+                            &captured,
+                        ) {
+                            Ok(owner) => Some(owner),
+                            Err(reason) => {
+                                *machine_rejection = Some(CoreMachineProofRejection {
+                                    source_function: caller,
+                                    machine: machine_function,
+                                    frame_layout: metrics.frame_layout,
+                                    bytes: code,
+                                    fixup_sites,
+                                    prior_functions: std::mem::take(&mut functions),
+                                    captured,
+                                    request: verification.request.clone(),
+                                });
+                                return Err(CompileError::CoreInstallationContract(reason).into());
+                            }
+                        }
+                    } else {
+                        None
+                    };
+                #[cfg(feature = "source-defined-call")]
+                let status_report = status_owner
+                    .as_ref()
+                    .map(|owner| owner.report(&machine_function))
+                    .transpose()
+                    .map_err(CompileError::CoreInstallationContract)?;
+                #[cfg(feature = "source-defined-call")]
+                let context_report = context_owner
+                    .as_ref()
+                    .map(|owner| owner.report(&machine_function))
+                    .transpose()
+                    .map_err(CompileError::CoreInstallationContract)?;
+                #[cfg(feature = "source-defined-call")]
+                let report = status_report
+                    .as_ref()
+                    .or(context_report.as_ref())
+                    .unwrap_or_else(|| captured.report());
+                #[cfg(not(feature = "source-defined-call"))]
                 let report = captured.report();
                 // `affine_bytes::encode_core_function` encodes through
                 // `encode_function_with_fixups_and_sites`, which runs ENC-5
                 // under the proof-grade policy (enforce) on every call.
+                #[cfg(feature = "source-defined-call")]
+                let selected_obligations = if context_owner.is_some() || status_owner.is_some() {
+                    &[][..]
+                } else {
+                    obligations.as_slice()
+                };
+                #[cfg(not(feature = "source-defined-call"))]
+                let selected_obligations = obligations.as_slice();
                 let mut function_proofs = proof_certificates_from_aarch64_report_with_obligations(
                     report,
-                    &obligations,
+                    selected_obligations,
                     crate::decode_check::DecodeCheckBacking::Enforced,
                 );
                 carry_request_ay_refusal_note(&mut function_proofs, captured.ay_refusal_note());
@@ -7320,6 +7516,14 @@ fn compile_policy_qualified_core_machine_mode(
                 )
                 .with_checked_structural_return(&captured, &machine_function, Some(lir_function))
                 .with_request_ay_refusal_note(captured.ay_refusal_note());
+                #[cfg(feature = "source-defined-call")]
+                let certificate = if let Some(owner) = &context_owner {
+                    certificate.with_physically_bound_context_output(owner)
+                } else if let Some(owner) = &status_owner {
+                    certificate.with_physically_bound_four_pointer_status(owner)
+                } else {
+                    certificate
+                };
                 let certificate_verified = certificate.has_checked_semantics();
                 let certificate_replayable = certificate.replay_check();
                 if !certificate_verified || !certificate_replayable {
@@ -16272,7 +16476,7 @@ impl Compiler {
         // this cache identity nor adds a second TrustIR scan or clone.
         let dialect_start = Instant::now();
         let Legalized {
-            module: lowered_module,
+            module: prepared_module,
             report: dialect_legalization,
         } = self.legalize_dialects(module, self.requires_verified_proof_promotion())?;
         if tracing {
@@ -16287,7 +16491,7 @@ impl Compiler {
                 )),
             });
         }
-        let lowered_module = lowered_module.as_ref();
+        let lowered_module = prepared_module.as_ref();
         // The dialect rewrite produced core IR nothing else checks: admit the
         // module that is LOWERED too (WS7.3). A borrowed (op-free) module is
         // the received one and keeps its admission.
@@ -17489,7 +17693,8 @@ impl Compiler {
             aarch64_frame_inputs: crate::aot_frame_inputs::observe_aarch64_frames(
                 &prepared_funcs,
                 &preparation_metrics,
-                lowered_module,
+                module,
+                prepared_module,
                 &lir_functions,
                 &obj_bytes,
             ),
@@ -17772,6 +17977,12 @@ impl Compiler {
                 output_format: X86OutputFormat::RawBytes,
                 emit_frame: true,
                 call_abi,
+                // The machine passes follow the same certificate policy as
+                // the object pipeline below (the O2 fixpoint bound reads it).
+                allocation_quality: x86_object_allocation_quality(
+                    self.config.emit_proofs,
+                    self.config.x86_certificate_free_allocation,
+                ),
                 ..X86PipelineConfig::default()
             });
             let mut total = 0usize;
@@ -20675,7 +20886,7 @@ impl Compiler {
     fn native_scalar_c_abi(
         &self,
         module: &trust_ir::Module,
-    ) -> Result<Option<trust_cg_lower::NativeScalarCAbi>, CompileError> {
+    ) -> Result<Option<trust_cg_lower::NativeAbiContext>, CompileError> {
         if !module
             .func_types
             .iter()
@@ -20685,12 +20896,12 @@ impl Compiler {
         }
         let triple = compiler_target_triple(self.target_spec);
         match self.config.target {
-            Target::Aarch64 => Ok(Some(trust_cg_lower::NativeScalarCAbi::aarch64(triple)?)),
+            Target::Aarch64 => Ok(Some(trust_cg_lower::NativeAbiContext::aarch64(triple)?)),
             Target::X86_64
                 if x86_call_abi_for_target_spec(self.target_spec)
                     == trust_cg_lower::x86_64_isel::X86CallAbi::SystemV =>
             {
-                Ok(Some(trust_cg_lower::NativeScalarCAbi::x86_system_v(
+                Ok(Some(trust_cg_lower::NativeAbiContext::x86_system_v(
                     triple,
                 )?))
             }
@@ -24862,10 +25073,11 @@ mod tests {
         let retained = plan.retained_lir_proof_context_digest();
         // The constant now has a source-bound owner. Source custody still
         // cannot substitute for the owner's independent proof replay, even
-        // with a favorable query retained in a warm process cache. Sealed
-        // Core is proof-grade, so the constant return keeps its FP/LR
-        // envelope on every host target (no Apple red zone): with AY
-        // withheld the first refused row is that envelope's unreplayed frame.
+        // with a favorable query retained in a warm process cache. This
+        // ordinary zero-storage Core JIT leaf uses its frameless body owner.
+        // With AY withheld, its actual body theorem must still refuse. A
+        // forced object frame is outside the Core JIT planning contract and
+        // would stop before exercising independent replay or owner recovery.
         let failure = crate::env_lock::with_env_overrides(
             &[("AY_SOLVER_PATH", "/nonexistent/source-custody-solver")],
             || {
@@ -24878,7 +25090,9 @@ mod tests {
         assert!(
             matches!(failure.reason(), CoreAddressFreeMachineCompilationError::Compile(
                 CompileError::ProofPromotionRejected { target: Target::Aarch64, reason }
-            ) if reason.contains(SOURCE_BOUND_FRAME_NOT_REPLAYED)),
+            ) if reason.contains("source-bound AArch64 body needs independently replayed proof")
+                && reason.contains("TCG-AY-IDENTITY-OVERRIDE-MISSING")
+                && reason.contains("AY_SOLVER_PATH=/nonexistent/source-custody-solver")),
             "withdrawn independent replay must refuse the compile: {failure:?}"
         );
         assert_eq!(failure.plan().identity(), identity);

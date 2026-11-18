@@ -17,11 +17,14 @@
 //! pipeline at O2 (`X86Pipeline::run_x86_optimization_passes`), which makes
 //! the SIB and RMW rows; [`slice25_pair`] asserts nothing, and
 //! `every_fixture_has_its_row` asserts each fixture's row is there (an
-//! inherited opt-out knob cannot hollow a fixture). Two fixtures are
-//! synthetic ([`Shape25::synthetic`]): [`Shape25::ByteMerge`] (no selector
+//! inherited opt-out knob cannot hollow a fixture). Synthetic edits are
+//! disclosed by [`Shape25::synthetic`]: [`Shape25::ByteMerge`] (no selector
 //! path emits `MovRM8`, so its `MovRM8Sib` is the real `MovzxRM8Sib` with
-//! its opcode edited) and [`Shape25::AddCarry`] (the fusion declines while
-//! the carry is live, so its three rows are fused by hand).
+//! its opcode edited), [`Shape25::AddCarry`] (the fusion declines while
+//! the carry is live, so its three rows are fused by hand), and the constant
+//! field/slot forms whose current O2 stream uses plain memory displacements.
+//! Those forms are independently checked on the unchanged production stream
+//! and reconstructed with the exact same address for the SIB-specific controls.
 //! Every test here runs without a solver (the
 //! `x86_source_bound_body::tests::slice25::` library gate); the replay on
 //! AY and Clean is in `slice25_qualification`.
@@ -67,10 +70,11 @@ pub(crate) enum Shape25 {
     U32Scaled,
     /// R5: `fn(p: *const u8, i: u64) -> u32 { *(p.add(i).add(16) as *const
     /// u32) }`: `LeaSib b, [p + i*1]`, the 16 in a register `c`, and
-    /// `MovRM32Sib [b + c*1]` (O2 folds no constant into a displacement).
+    /// `MovRM32 [b + 16]` at O2; the SIB control explicitly reconstructs
+    /// `MovRM32Sib [b + c*1]` with `c = 16`.
     FieldU32,
     /// R5': `fn(p: *const u8, i: u64) -> u32 { *(p.add(i).sub(16) as *const
-    /// u32) }`: R5's rows with `c = -16`.
+    /// u32) }`: R5's rows with displacement and reconstructed `c = -16`.
     FieldBelowU32,
     /// R5 with a later `add`: `fn(p: *const u8, i: u64, x: u32) -> u32 {
     /// *(p.add(16).add(i) as *const u32) + x }`.
@@ -103,7 +107,8 @@ pub(crate) enum Shape25 {
     /// S1: `fn(x: u64, y: u64) -> u64 { a: [u64; 4]; a[1] = x; a[2] = y;
     /// a[1] }`, every element `a.gep[k]` at a constant index: `[StackSlot +
     /// t*1]` with `t = imul k, 8` of a constant `k`, walked as a frame
-    /// address.
+    /// address. Current O2 folds these into plain displacements; the SIB
+    /// control explicitly reconstructs each exact constant-index address.
     SlotConstU64,
     /// S2: S1 with the constant index defined in the entry block and the
     /// accesses in its successors (a diamond).
@@ -113,7 +118,8 @@ pub(crate) enum Shape25 {
     /// names.
     SlotGuardedByte,
     /// S4: `fn(x: u32, y: u32) -> u32 { a: [u32; 4]; a[0] = x; a[3] = y;
-    /// a[0] + a[3] }`: SIB stores into a slot and their reloads.
+    /// a[0] + a[3] }`: plain constant-displacement stores and reloads at O2,
+    /// reconstructed as exact SIB accesses for this slice's controls.
     SlotStoreReloadU32,
     /// S5: `fn(i: u64) -> u32 { T: [u8; 16]; if i < 16 { *(i + &T) as u32 +
     /// 1 } else { panic } }`, the address `i + &T` (the index first): `[v +
@@ -239,8 +245,26 @@ impl Shape25 {
         match self {
             Shape25::ByteMerge => Some("MovzxRM8Sib edited to MovRM8Sib"),
             Shape25::AddCarry => Some("MovRM, AddRR and MovMR fused into AddMR by hand"),
+            Shape25::FieldU32
+            | Shape25::FieldBelowU32
+            | Shape25::SlotConstU64
+            | Shape25::SlotStoreReloadU32
+            | Shape25::AddIntoField => Some(
+                "plain constant-displacement accesses reconstructed as exact same-address SIB rows",
+            ),
             _ => None,
         }
+    }
+
+    fn constant_displacement(self) -> bool {
+        matches!(
+            self,
+            Self::FieldU32
+                | Self::FieldBelowU32
+                | Self::SlotConstU64
+                | Self::SlotStoreReloadU32
+                | Self::AddIntoField
+        )
     }
 }
 
@@ -627,6 +651,9 @@ pub(crate) const SLICE25_ROWS: [X86Opcode; 13] = [
 pub(crate) fn slice25_pair(shape: Shape25) -> (Function, X86ISelFunction) {
     let source = slice25_lir(shape);
     let mut machine = optimized(&source, trust_cg_opt::OptLevel::O2);
+    if shape.constant_displacement() {
+        reconstruct_constant_sib(shape, &mut machine);
+    }
     if shape == Shape25::ByteMerge {
         for row in rows_with(&machine, &[X86Opcode::MovzxRM8Sib]) {
             inst_mut(&mut machine, row).opcode = X86Opcode::MovRM8Sib;
@@ -636,6 +663,157 @@ pub(crate) fn slice25_pair(shape: Shape25) -> (Function, X86ISelFunction) {
         fuse_rmw_by_hand(&mut machine);
     }
     (source, machine)
+}
+
+/// A disclosed synthetic inverse of the constant-index address fold. Preserve
+/// the actual access width, value, metadata and base, and materialize its exact
+/// signed displacement as an index. A directly defined frame base is expressed
+/// as its identical stack slot, as the original slice's private-SIB controls
+/// require. No optimizer or model policy changes here.
+fn reconstruct_constant_sib(shape: Shape25, machine: &mut X86ISelFunction) {
+    use X86Opcode as Op;
+    let accesses = rows_with(
+        machine,
+        &[Op::MovRM, Op::MovMR, Op::MovRM32, Op::MovMR32, Op::AddMR],
+    );
+    assert!(
+        !accesses.is_empty(),
+        "{shape:?}: no production memory access"
+    );
+    // Walk backwards so insertions preserve each as-yet-unprocessed ordinal.
+    for row in accesses.into_iter().rev() {
+        let (opcode, operand) = match inst(machine, row).opcode {
+            Op::MovRM => (Op::MovRMSib, 1),
+            Op::MovMR => (Op::MovMRSib, 0),
+            Op::MovRM32 => (Op::MovRM32Sib, 1),
+            Op::MovMR32 => (Op::MovMR32Sib, 0),
+            Op::AddMR => (Op::AddMRSib, 0),
+            _ => unreachable!(),
+        };
+        let O::MemAddr { mut base, disp } = inst(machine, row).operands[operand].clone() else {
+            panic!("{shape:?}: plain memory operand\n{}", describe(machine));
+        };
+        if matches!(shape, Shape25::SlotConstU64 | Shape25::SlotStoreReloadU32) {
+            let definition = defining_row(machine, row, &base).expect("the actual frame base");
+            let [
+                _,
+                O::MemAddr {
+                    base: slot,
+                    disp: 0,
+                },
+            ] = inst(machine, definition).operands.as_slice()
+            else {
+                panic!("{shape:?}: frame base must be an exact zero-offset slot LEA");
+            };
+            assert_eq!(inst(machine, definition).opcode, Op::Lea);
+            assert!(matches!(slot.as_ref(), O::StackSlot(_)));
+            base = slot.clone();
+        }
+        let scale = if shape == Shape25::SlotConstU64 { 8 } else { 1 };
+        assert_eq!(i64::from(disp) % i64::from(scale), 0);
+        let constant = i64::from(disp) / i64::from(scale);
+        assert_eq!(constant * i64::from(scale), i64::from(disp));
+        let index = vreg(machine.next_vreg);
+        machine.next_vreg = machine
+            .next_vreg
+            .checked_add(1)
+            .expect("fresh fixture vreg");
+        let original = inst(machine, row).clone();
+        let rewritten = inst_mut(machine, row);
+        rewritten.opcode = opcode;
+        rewritten.operands[operand] = O::SibMemAddr {
+            base,
+            index: Box::new(index.clone()),
+            scale,
+            disp: 0,
+        };
+        assert_eq!(
+            rewritten.operands[1 - operand],
+            original.operands[1 - operand]
+        );
+        assert_eq!(rewritten.flags, opcode.default_flags());
+        insert_at(
+            machine,
+            row,
+            X86ISelInst::new(Op::MovRI, vec![index, O::Imm(constant)]),
+        );
+    }
+}
+
+/// Independently re-fold only actual constant-index memory operands for the
+/// fixture image comparison. Remove only complete default MovRI instructions
+/// defining the fresh register range; keep every other instruction and field.
+/// Canonicalize a frame base only through its actual zero-offset slot LEA.
+/// This is a machine-data check, not an SMT simplifier or proof authority.
+fn refold_fixture_image(machine: &X86ISelFunction, first_fresh: u32) -> String {
+    use X86Opcode as Op;
+    assert!(first_fresh <= machine.next_vreg);
+    let mut image = machine.clone();
+    let mut constants = Vec::new();
+    let mut fresh_ids = std::collections::BTreeSet::new();
+    for (row, _, _) in rows(machine) {
+        let node = inst(machine, row);
+        if let Some(O::VReg(register)) = node.operands.first()
+            && register.id >= first_fresh
+        {
+            assert_eq!(register.class, RegClass::Gpr64);
+            assert!(register.id < machine.next_vreg);
+            assert!(matches!(node.operands.as_slice(), [O::VReg(_), O::Imm(_)]));
+            let expected = X86ISelInst::new(Op::MovRI, node.operands.clone());
+            assert_eq!(format!("{node:?}"), format!("{expected:?}"));
+            assert!(fresh_ids.insert(register.id), "one fresh definition");
+            constants.push(row);
+            continue;
+        }
+        let (opcode, operand) = match node.opcode {
+            Op::MovRM | Op::MovRMSib => (Op::MovRM, 1),
+            Op::MovMR | Op::MovMRSib => (Op::MovMR, 0),
+            Op::MovRM32 | Op::MovRM32Sib => (Op::MovRM32, 1),
+            Op::MovMR32 | Op::MovMR32Sib => (Op::MovMR32, 0),
+            Op::AddMR | Op::AddMRSib => (Op::AddMR, 0),
+            _ => continue,
+        };
+        let (mut base, disp) = match &node.operands[operand] {
+            O::MemAddr { base, disp } => (base.clone(), *disp),
+            O::SibMemAddr {
+                base, scale, disp, ..
+            } => {
+                let constant = constant_of(machine, row, operand);
+                let offset = constant
+                    .checked_mul(i64::from(*scale))
+                    .and_then(|value| value.checked_add(i64::from(*disp)))
+                    .and_then(|value| i32::try_from(value).ok())
+                    .expect("the actual constant SIB address fits its displacement");
+                (base.clone(), offset)
+            }
+            _ => panic!("the fixture memory operand"),
+        };
+        if let Some(definition) = defining_row(machine, row, &base)
+            && inst(machine, definition).opcode == Op::Lea
+            && let [
+                _,
+                O::MemAddr {
+                    base: slot,
+                    disp: 0,
+                },
+            ] = inst(machine, definition).operands.as_slice()
+            && matches!(slot.as_ref(), O::StackSlot(_))
+        {
+            base = slot.clone();
+        }
+        let folded = inst_mut(&mut image, row);
+        folded.opcode = opcode;
+        folded.operands[operand] = O::MemAddr { base, disp };
+    }
+    assert_eq!(
+        fresh_ids,
+        (first_fresh..machine.next_vreg).collect::<std::collections::BTreeSet<_>>()
+    );
+    for row in constants.into_iter().rev() {
+        remove_at(&mut image, row);
+    }
+    image.next_vreg = first_fresh;
+    format!("{image:#?}")
 }
 
 /// [`Shape25::AddCarry`]'s synthetic edit: its `mov t, [m]; add s, t, x;
@@ -856,6 +1034,64 @@ fn every_fixture_has_its_row() {
         if let Err(why) = named_operand(shape, &machine) {
             panic!("{shape:?}: {why}\n{}", describe(&machine));
         }
+    }
+}
+
+/// Constant-index folding is exercised as real production output separately
+/// from this slice's explicitly reconstructed SIB forms. Keep the complete
+/// access widths and live displacements, and require both bodies to hold.
+#[test]
+fn constant_displacement_production_streams_and_synthetic_sib_are_both_checked() {
+    use Shape25::*;
+    use X86Opcode as Op;
+    for (shape, opcodes, expected_displacements) in [
+        (FieldU32, &[Op::MovRM32][..], &[16][..]),
+        (FieldBelowU32, &[Op::MovRM32][..], &[-16][..]),
+        (SlotConstU64, &[Op::MovMR, Op::MovRM][..], &[8, 16][..]),
+        (
+            SlotStoreReloadU32,
+            &[Op::MovMR32, Op::MovRM32][..],
+            &[0, 12][..],
+        ),
+        (AddIntoField, &[Op::AddMR][..], &[16][..]),
+    ] {
+        let source = slice25_lir(shape);
+        let production = optimized(&source, trust_cg_opt::OptLevel::O2);
+        let mut displacements = Vec::new();
+        for opcode in opcodes {
+            let accesses = rows_with(&production, &[*opcode]);
+            assert!(!accesses.is_empty(), "{shape:?}: no production {opcode:?}");
+            for row in accesses {
+                let address = inst(&production, row)
+                    .operands
+                    .iter()
+                    .find_map(|operand| {
+                        if let O::MemAddr { disp, .. } = operand {
+                            Some(*disp)
+                        } else {
+                            None
+                        }
+                    })
+                    .expect("the live production memory operand");
+                displacements.push(address);
+            }
+        }
+        displacements.sort_unstable();
+        displacements.dedup();
+        assert_eq!(displacements, expected_displacements, "{shape:?}");
+        holds25(&source, &production).unwrap_or_else(|why| panic!("{shape:?} production: {why}"));
+        let mut synthetic = production.clone();
+        reconstruct_constant_sib(shape, &mut synthetic);
+        holds25(&source, &synthetic).unwrap_or_else(|why| panic!("{shape:?} synthetic: {why}"));
+        assert!(shape.synthetic().is_some());
+        // Added initialized constants extend the SSA formula, so equal raw
+        // SMT text is not an invariant. Check the complete refolded machine
+        // image, including every non-memory row and all stored metadata.
+        assert_eq!(
+            refold_fixture_image(&production, production.next_vreg),
+            refold_fixture_image(&synthetic, production.next_vreg),
+            "{shape:?}: exact refolded machine image"
+        );
     }
 }
 
@@ -1183,6 +1419,36 @@ fn constant_of(machine: &X86ISelFunction, row: usize, operand: usize) -> i64 {
             describe(machine)
         ),
     }
+}
+
+/// Change every actual S1 access to element 1, through its live SIB index
+/// definition. A dead selector constant left after O2 folding is no mutant.
+fn change_live_slot_one_index(machine: &mut X86ISelFunction, replacement: i64) {
+    let mut changed = 0;
+    for row in rows_with(machine, &[X86Opcode::MovMRSib, X86Opcode::MovRMSib]) {
+        let operand = usize::from(inst(machine, row).opcode == X86Opcode::MovRMSib);
+        let O::SibMemAddr {
+            base,
+            index,
+            scale: 8,
+            disp: 0,
+        } = &inst(machine, row).operands[operand]
+        else {
+            panic!("S1 must use its live element-index SIB operand");
+        };
+        assert!(matches!(base.as_ref(), O::StackSlot(_)));
+        if constant_of(machine, row, operand) == 1 {
+            let definition =
+                defining_row(machine, row, index).expect("the live SIB index definition");
+            assert_eq!(inst(machine, definition).opcode, X86Opcode::MovRI);
+            inst_mut(machine, definition).operands[1] = O::Imm(replacement);
+            changed += 1;
+        }
+    }
+    assert_eq!(
+        changed, 2,
+        "the original element-1 store and reload must both change"
+    );
 }
 
 /// `shape`'s `MovRM32Sib [b + c*1]`, `b = LeaSib [x + y*1]` and `c` the
@@ -1792,11 +2058,7 @@ pub(crate) fn case25(label: &str) -> (Function, X86ISelFunction) {
         "R2 base and index swapped at scale 8" => sib_edit(U64Scaled, Op::MovRMSib, swap),
         "S1 constant index 1 to 2" => {
             let (source, mut machine) = slice25_pair(SlotConstU64);
-            let row = *rows_with(&machine, &[Op::MovRI])
-                .iter()
-                .find(|row| inst(&machine, **row).operands.get(1) == Some(&O::Imm(1)))
-                .unwrap_or_else(|| panic!("no MovRI 1\n{}", describe(&machine)));
-            inst_mut(&mut machine, row).operands[1] = O::Imm(2);
+            change_live_slot_one_index(&mut machine, 2);
             (source, machine)
         }
         "S2 scale 8 to 4" => {
@@ -2414,11 +2676,7 @@ pub(crate) fn case25(label: &str) -> (Function, X86ISelFunction) {
         }
         "S1 constant index 1 to 4" => {
             let (source, mut machine) = slice25_pair(SlotConstU64);
-            let row = *rows_with(&machine, &[Op::MovRI])
-                .iter()
-                .find(|row| inst(&machine, **row).operands.get(1) == Some(&O::Imm(1)))
-                .unwrap_or_else(|| panic!("no MovRI 1\n{}", describe(&machine)));
-            inst_mut(&mut machine, row).operands[1] = O::Imm(4);
+            change_live_slot_one_index(&mut machine, 4);
             (source, machine)
         }
         other => unreachable!("no control {other:?}"),
@@ -3189,7 +3447,12 @@ fn a_slice25_body_never_names_a_correct_machine_a_mismatch() {
             trust_cg_opt::OptLevel::O2,
             trust_cg_opt::OptLevel::O3,
         ] {
-            if shape.synthetic().is_some() && level != trust_cg_opt::OptLevel::O2 {
+            // Only these two shapes require an opcode/fusion that no real
+            // selector stream supplies. Constant-displacement forms still
+            // retain every original, unmodified O1/O3 production control.
+            if matches!(shape, Shape25::ByteMerge | Shape25::AddCarry)
+                && level != trust_cg_opt::OptLevel::O2
+            {
                 continue;
             }
             let machine = if level == trust_cg_opt::OptLevel::O2 {
@@ -3443,7 +3706,7 @@ pub(crate) fn slice_twenty_five_snapshots() -> String {
 
 /// The reviewed digest of the slice-25 golden text.
 const SLICE_TWENTY_FIVE_SNAPSHOT_SHA256: &str =
-    "2543c11979ce66f76228b89458eb4774944d4189fb5a571758053ee5d5791bae";
+    "c23b51fe0fcda9bd136225065ae671c27cbd720e8afcf4366f8201629a6403ef";
 
 /// The rendered theorems of every slice-25 fixture are the reviewed golden
 /// text, pinned by digest.

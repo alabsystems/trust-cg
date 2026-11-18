@@ -7,6 +7,7 @@
 //! temporal initialization, caller permission or native seal follows.
 
 use super::*;
+use crate::source_bound_frame::VoidMemorySourceQueries;
 use crate::source_bound_frame::{ScalarMemoryAccess, ScalarMemorySourceQueries};
 
 #[path = "scalar_return_target.rs"]
@@ -41,6 +42,56 @@ pub struct ScalarMemoryTargetQueries<'a> {
     reads: Vec<ScalarMemoryTargetAccess>,
     writes: Vec<ScalarMemoryTargetAccess>,
     definitions: Vec<E>,
+}
+
+/// A distinct void terminal observation; X0 is not a result lane.
+pub struct VoidMemoryTargetQueries<'a> {
+    source: &'a VoidMemorySourceQueries<'a>,
+    pub(crate) inner: ScalarMemoryTargetQueries<'a>,
+}
+impl<'a> VoidMemoryTargetQueries<'a> {
+    pub fn source(&self) -> &'a VoidMemorySourceQueries<'a> {
+        self.source
+    }
+    pub fn endpoint(&self) -> ScalarMemoryTargetEndpoint<'a> {
+        self.inner.endpoint()
+    }
+    pub fn normal_return_obligations(&self) -> &[ProofObligation] {
+        self.inner.return_obligations()
+    }
+    pub fn memory_obligations(&self) -> &[ProofObligation] {
+        self.inner.memory_obligations()
+    }
+    pub fn read_obligations(&self) -> &[ProofObligation] {
+        self.inner.read_obligations()
+    }
+    pub fn write_obligations(&self) -> &[ProofObligation] {
+        self.inner.write_obligations()
+    }
+    pub fn reads(&self) -> &[ScalarMemoryTargetAccess] {
+        self.inner.reads()
+    }
+    pub fn writes(&self) -> &[ScalarMemoryTargetAccess] {
+        self.inner.writes()
+    }
+}
+pub fn bind_void_memory_machine<'a>(
+    source: &'a VoidMemorySourceQueries<'a>,
+    target: &'a MachFunction,
+) -> Result<VoidMemoryTargetQueries<'a>, ReadOnlyTargetError> {
+    Ok(VoidMemoryTargetQueries {
+        source,
+        inner: bind_memory_machine(&source.inner, target)?,
+    })
+}
+pub fn bind_void_memory_bytes<'a>(
+    source: &'a VoidMemorySourceQueries<'a>,
+    code: &'a [u8],
+) -> Result<VoidMemoryTargetQueries<'a>, ReadOnlyTargetError> {
+    Ok(VoidMemoryTargetQueries {
+        source,
+        inner: bind_memory_bytes(&source.inner, code)?,
+    })
 }
 
 impl<'a> ScalarMemoryTargetQueries<'a> {
@@ -184,19 +235,36 @@ fn bind<'a>(
     };
     let mut returns = Vec::new();
     let mut memories = Vec::new();
-    for ((guard, value), memory) in observed.returns.iter().zip(&observed.memories) {
-        let nodes = bounded_sum(
-            [guard.nodes, source_status_nodes, value.nodes, 4],
+    if source.is_void() {
+        let mut normal = Term {
+            expr: E::BoolConst(false),
+            nodes: 1,
+        };
+        for (guard, _) in &observed.returns {
+            normal.nodes = bounded_sum([normal.nodes, guard.nodes, 1], MAX_QUERY_NODES)?;
+            normal.expr = normal.expr.or_expr(guard.expr.clone());
+        }
+        reserve(bounded_sum(
+            [normal.nodes, source_status_nodes, 1],
             MAX_QUERY_NODES,
-        )?;
-        reserve(nodes)?;
-        returns.push(
-            guard
-                .expr
-                .clone()
-                .not_expr()
-                .or_expr(source_status.clone().eq_expr(value.expr.clone())),
-        );
+        )?)?;
+        returns.push(source_status.clone().eq_expr(normal.expr));
+    }
+    for ((guard, value), memory) in observed.returns.iter().zip(&observed.memories) {
+        if !source.is_void() {
+            let nodes = bounded_sum(
+                [guard.nodes, source_status_nodes, value.nodes, 4],
+                MAX_QUERY_NODES,
+            )?;
+            reserve(nodes)?;
+            returns.push(
+                guard
+                    .expr
+                    .clone()
+                    .not_expr()
+                    .or_expr(source_status.clone().eq_expr(value.expr.clone())),
+            );
+        }
         let nodes = bounded_sum(
             [guard.nodes, source_byte_nodes, memory.nodes, 7],
             MAX_QUERY_NODES,
@@ -233,7 +301,14 @@ fn bind<'a>(
         ScalarMemoryTargetEndpoint::FinalBytes(_) => "independent final words",
     };
     let pending = |kind: &str, index: usize, expression: E| ProofObligation {
-        name: format!("Original scalar-memory Core -> {label} {kind} {index}"),
+        name: format!(
+            "Original {} Core -> {label} {kind} {index}",
+            if source.is_void() {
+                "void-memory"
+            } else {
+                "scalar-memory"
+            }
+        ),
         trust_ir_expr: E::BoolConst(true),
         aarch64_expr: expression,
         inputs: inputs.clone(),
@@ -252,7 +327,14 @@ fn bind<'a>(
     Ok(ScalarMemoryTargetQueries {
         source,
         endpoint,
-        returns: obligations("full status", returns),
+        returns: obligations(
+            if source.is_void() {
+                "normal void return"
+            } else {
+                "full status"
+            },
+            returns,
+        ),
         memory: obligations("all final bytes", memories),
         read_demands: obligations("read demand", reads),
         write_demands: obligations("write demand", writes),
@@ -268,6 +350,18 @@ pub fn bind_scalar_memory_machine<'a>(
     source: &'a ScalarMemorySourceQueries<'a>,
     target: &'a MachFunction,
 ) -> Result<ScalarMemoryTargetQueries<'a>, ReadOnlyTargetError> {
+    if source.is_void() {
+        return Err(ReadOnlyTargetError::Machine(
+            "void entry has no scalar status",
+        ));
+    }
+    bind_memory_machine(source, target)
+}
+
+pub(crate) fn bind_memory_machine<'a>(
+    source: &'a ScalarMemorySourceQueries<'a>,
+    target: &'a MachFunction,
+) -> Result<ScalarMemoryTargetQueries<'a>, ReadOnlyTargetError> {
     let signature: trust_cg_ir::function::Signature = (&source.lir().signature).into();
     if target.name != source.source().name || target.signature != signature {
         return Err(ReadOnlyTargetError::Machine(
@@ -277,7 +371,11 @@ pub fn bind_scalar_memory_machine<'a>(
     bind(
         source,
         ScalarMemoryTargetEndpoint::Machine(target),
-        machine::adapt_profile(target, Profile::ScalarMemory)?,
+        if source.is_void() {
+            machine::adapt_void(target)?
+        } else {
+            machine::adapt_profile(target, Profile::ScalarMemory)?
+        },
         Stage::Machine,
     )
 }
@@ -285,6 +383,18 @@ pub fn bind_scalar_memory_machine<'a>(
 /// `code` is the complete FINAL word stream. This neither authorizes nor
 /// applies relocations. No encoder/source/MachIR hint supplies decoded fields.
 pub fn bind_scalar_memory_bytes<'a>(
+    source: &'a ScalarMemorySourceQueries<'a>,
+    code: &'a [u8],
+) -> Result<ScalarMemoryTargetQueries<'a>, ReadOnlyTargetError> {
+    if source.is_void() {
+        return Err(ReadOnlyTargetError::Machine(
+            "void entry has no scalar status",
+        ));
+    }
+    bind_memory_bytes(source, code)
+}
+
+pub(crate) fn bind_memory_bytes<'a>(
     source: &'a ScalarMemorySourceQueries<'a>,
     code: &'a [u8],
 ) -> Result<ScalarMemoryTargetQueries<'a>, ReadOnlyTargetError> {

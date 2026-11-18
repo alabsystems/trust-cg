@@ -489,6 +489,8 @@ pub use relocatable_image::{
 #[cfg(feature = "verify")]
 pub(crate) use relocatable_image::{publish_core_artifact, publish_physically_bound_core_peer};
 
+#[cfg(feature = "verify")]
+pub mod context_output;
 mod data_image;
 #[cfg(feature = "verify")]
 pub mod entry_stack;

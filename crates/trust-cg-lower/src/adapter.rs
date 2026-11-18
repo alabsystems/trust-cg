@@ -829,7 +829,9 @@ pub enum AdapterError {
     /// ([`crate::box_deref::admit_box_derefs`]) did not admit: its carried
     /// validity fact is refused by a trust-ir rule, or backed below the
     /// lane's evidence floor ([`crate::box_deref::BoxValidityFloor`]; the
-    /// default refuses every `BoxDeref`), or the function reached a lowering
+    /// default refuses every `BoxDeref`, and an opted-in floor refuses one
+    /// whose below-floor conjunct this backend does not re-derive), or the
+    /// function reached a lowering
     /// entry without the module the fact is validated against. The same
     /// error on every target: no lane decides this itself.
     #[error(
@@ -3915,6 +3917,11 @@ pub(crate) fn translate_type_with_enum_tables_inner(
             "Ty::Tensor has no native layout or value ABI; tensor lowering is not implemented"
                 .into(),
         )),
+        Ty::FnItem(_) => Err(AdapterError::UnmodeledTrustIrConstruct {
+            location: format!("type {ty:?}"),
+            construct: "Ty::FnItem",
+            reason: FN_ITEM_UNMODELED,
+        }),
         Ty::Bool => Ok(Type::B1),
         Ty::I8 => Ok(Type::I8),
         Ty::I16 => Ok(Type::I16),
@@ -3959,13 +3966,6 @@ pub(crate) fn translate_type_with_enum_tables_inner(
         Ty::FatPtr(_) => Ok(Type::Struct(vec![Type::I64, Type::I64])),
         // A function pointer is a pointer-width value, not an aggregate.
         Ty::Func(_) => Ok(Type::I64),
-        // A function item is a nominal, zero-sized identity, not a function
-        // pointer.  Lowering it as `I64` would invent an address conversion
-        // that trust-ir does not grant, so keep the new v73 carrier closed
-        // until its coercion and ABI are modeled explicitly.
-        Ty::FnItem(func) => Err(AdapterError::UnsupportedType(format!(
-            "Ty::FnItem({func:?}) has no native value ABI; an explicit function-item coercion is required"
-        ))),
         Ty::Ref(_) | Ty::RefMut(_) | Ty::PtrConst(_) | Ty::PtrMut(_) => {
             translate_inline_pointer_type(ty)
         }
@@ -4050,6 +4050,11 @@ fn translate_complex_type_with_enum_tables(
             "Ty::Tensor has no native layout or value ABI; tensor lowering is not implemented"
                 .into(),
         )),
+        Ty::FnItem(_) => Err(AdapterError::UnmodeledTrustIrConstruct {
+            location: format!("type {ty:?}"),
+            construct: "Ty::FnItem",
+            reason: FN_ITEM_UNMODELED,
+        }),
         Ty::Dialect(ty) => Err(AdapterError::UnsupportedType(format!(
             "dialect type {}.{}@{} requires semantic legalization before native lowering",
             ty.namespace, ty.name, ty.version
@@ -4486,7 +4491,6 @@ fn translate_complex_type_with_enum_tables(
         | Ty::Ptr
         | Ty::FatPtr(_)
         | Ty::Func(_)
-        | Ty::FnItem(_)
         | Ty::Ref(_)
         | Ty::RefMut(_)
         | Ty::PtrConst(_)
@@ -5195,7 +5199,10 @@ struct TrustIrAdapter<'a> {
     dyld_coalesced_weak_definitions: bool,
 
     /// Only the compiler-owned native module entry supplies this context.
-    native_scalar_c_abi: Option<crate::NativeScalarCAbi>,
+    native_scalar_c_abi: Option<crate::NativeAbiContext>,
+    /// Exact typed source values with no machine carrier. Constructed only
+    /// by the native semantic consumer; targets never become Unit or integers.
+    native_nominal_values: Option<Rc<crate::native_nominal_values::ModuleValues<'a>>>,
 
     /// Reference to the trust_ir function being translated (for block lookups).
     trust_ir_func: Option<&'a TrustIrFunction>,
@@ -5631,6 +5638,7 @@ impl<'a> TrustIrAdapter<'a> {
             relocation_model: RelocationModel::default(),
             dyld_coalesced_weak_definitions: false,
             native_scalar_c_abi: None,
+            native_nominal_values: None,
             trust_ir_func: None,
             static_call_state: None,
             bfu_plan: None,
@@ -8347,6 +8355,7 @@ impl<'a> TrustIrAdapter<'a> {
                 })
                 .collect::<Result<Vec<_>, _>>()?;
             native.call(
+                module,
                 &actual_types,
                 &func_ty.returns,
                 func_ty.is_vararg,
@@ -8651,7 +8660,11 @@ impl<'a> TrustIrAdapter<'a> {
         // preparation, and a detached `func` is not one the module floor saw.
         // Refuse unsupported semantics before any projection, collection
         // census, intrinsic substitution or source reconstruction.
-        unmodeled_body_construct_floor(func, self.module)?;
+        unmodeled_body_construct_floor_with_nominals(
+            func,
+            self.module,
+            self.native_nominal_values.as_deref(),
+        )?;
         // trust-ir v74 `Inst::BoxDeref`: the same acceptance check the module
         // floor runs, for a function this entry was handed without that floor
         // having seen it. Without a module no rule of the fact can be
@@ -9290,6 +9303,14 @@ impl<'a> TrustIrAdapter<'a> {
             if !proof_metadata.proofs.is_empty() {
                 for proof in &proof_metadata.proofs {
                     for vid in proof_attachment_value_ids(node, proof) {
+                        if let (Some(values), Some(function)) =
+                            (&self.native_nominal_values, self.trust_ir_func)
+                            && values.is_semantic_value(function.id, vid)
+                        {
+                            return Err(AdapterError::UnsupportedInstruction(
+                                "[TCG-NOMINAL-VALUE] proof metadata requires a typed non-runtime nominal carrier".into(),
+                            ));
+                        }
                         let val = self.map_value(vid);
                         self.proof_ctx
                             .value_proofs
@@ -9310,6 +9331,14 @@ impl<'a> TrustIrAdapter<'a> {
                     }
 
                     for vid in carrier_ids {
+                        if let (Some(values), Some(function)) =
+                            (&self.native_nominal_values, self.trust_ir_func)
+                            && values.is_semantic_value(function.id, vid)
+                        {
+                            return Err(AdapterError::UnsupportedInstruction(
+                                "[TCG-NOMINAL-VALUE] proof fact requires a typed non-runtime nominal carrier".into(),
+                            ));
+                        }
                         let val = self.map_value(vid);
                         self.proof_ctx
                             .value_facts
@@ -11271,8 +11300,41 @@ impl<'a> TrustIrAdapter<'a> {
             self.refuse_collection_outside_value_positions(node)?;
         }
 
+        let nominal_action = match (&self.native_nominal_values, self.trust_ir_func) {
+            (Some(values), Some(function)) => {
+                values.action(function, trust_ir_block, instruction_index, node)?
+            }
+            _ => None,
+        };
+        let nominal_call;
+        let instruction = match nominal_action {
+            Some(crate::native_nominal_values::Action::Value { .. }) => return Ok(vec![]),
+            Some(crate::native_nominal_values::Action::PrivateMemory) => return Ok(vec![]),
+            Some(crate::native_nominal_values::Action::Reify { target, signature }) => {
+                return self.translate_function_symbol_const(
+                    &Ty::Func(signature),
+                    target,
+                    &node.results,
+                );
+            }
+            Some(crate::native_nominal_values::Action::Call { target }) => {
+                let Inst::CallIndirect { args, .. } = &node.inst else {
+                    return Err(AdapterError::UnsupportedInstruction(
+                        "nominal call transport lost its actual source operation".into(),
+                    ));
+                };
+                // Reuse the complete direct-call validator, argument/result
+                // marshalling, symbol binding and relocation path below.
+                nominal_call = Inst::Call {
+                    callee: target,
+                    args: args.clone(),
+                };
+                &nominal_call
+            }
+            None => &node.inst,
+        };
         // Real trust_ir uses block parameters for phi semantics, so there is no Inst::Phi arm here.
-        match &node.inst {
+        match instruction {
             // v47: the shared floor refuses a drop first; refused here too so
             // no entry that skips the floor lowers a destructor as nothing.
             Inst::Drop { .. } => Err(AdapterError::UnmodeledTrustIrConstruct {
@@ -13679,6 +13741,11 @@ impl<'a> TrustIrAdapter<'a> {
 
             Inst::Const { ty, value } => match value {
                 Constant::Ext(e) => e.unreachable(),
+                Constant::FnItem(_) => Err(AdapterError::UnmodeledTrustIrConstruct {
+                    location: "Const lowering".to_owned(),
+                    construct: "Constant::FnItem",
+                    reason: FN_ITEM_UNMODELED,
+                }),
                 Constant::TensorBlob { .. } => Err(AdapterError::UnmodeledTrustIrConstruct {
                     location: "Const lowering".to_owned(),
                     construct: "Constant::TensorBlob",
@@ -13728,10 +13795,6 @@ impl<'a> TrustIrAdapter<'a> {
                 Constant::Closure { func, captures } => {
                     self.translate_closure_const(ty, *func, captures, &node.results)
                 }
-                Constant::FnItem(func) => Err(AdapterError::UnsupportedInstruction(format!(
-                    "[TCG-FN-ITEM] Constant::FnItem({func:?}) is a nominal zero-sized identity; \
-                     native lowering requires an explicit coercion to Ty::Func"
-                ))),
                 Constant::FnDef(func) => {
                     self.translate_function_symbol_const(ty, *func, &node.results)
                 }
@@ -23510,6 +23573,9 @@ impl<'a> TrustIrAdapter<'a> {
                     self.trust_ir_func.and_then(crate::static_call_devirtualization::ClosureBlockParameterSources::new)
                 }).as_ref()?.get(value),
                 |closure| self.module?.closure_storage_binding(closure).ok().map(|binding| binding.target),
+                |value| crate::static_call_devirtualization::borrowed_closure_code_identity(
+                    self.module?, self.trust_ir_func?, value,
+                ),
                 callee,
             ).map_err(
                 |block| {
@@ -23529,7 +23595,7 @@ impl<'a> TrustIrAdapter<'a> {
                             "[TCG-CLOSURE] closure callee {callee:?} (closure.{}) is produced \
                              by Inst::{inst} at {at:?}: its code identity is not statically \
                              visible (only a Const/MakeClosure origin reached through \
-                             Copy/InsertField, same-code Select, acyclic block parameters or a checked stored-frame binding is), and a closure value carries no runtime code \
+                             Copy/InsertField, same-code Select, acyclic block parameters, a checked stored-frame binding or an original stored-cell borrowed readback is), and a closure value carries no runtime code \
                              pointer to call through",
                             closure_id.index()
                         ),
@@ -25758,6 +25824,13 @@ impl<'a> TrustIrAdapter<'a> {
             let scalar_val = self.fresh_value();
             match field_const {
                 Constant::Ext(e) => e.unreachable(),
+                Constant::FnItem(_) => {
+                    return Err(AdapterError::UnmodeledTrustIrConstruct {
+                        location: format!("aggregate constant field {idx}"),
+                        construct: "Constant::FnItem",
+                        reason: FN_ITEM_UNMODELED,
+                    });
+                }
                 Constant::Int(v) => {
                     let mut field_instrs =
                         self.translate_int_const_into(field_ty, *v, scalar_val)?;
@@ -25855,7 +25928,6 @@ impl<'a> TrustIrAdapter<'a> {
                 | Constant::Set(_)
                 | Constant::Record(_)
                 | Constant::TensorBlob { .. }
-                | Constant::FnItem(_)
                 | Constant::PhantomData => {
                     return Err(AdapterError::UnsupportedInstruction(format!(
                         "trust_ir#30 aggregate/closure constant as field is not \
@@ -28320,7 +28392,7 @@ fn reject_unconsumed_v41_surface_with_imports_and_native(
     arch: GuardCarrierArch,
     policy: ObjectSymbolPolicy,
     imports: Option<&crate::AuthenticatedImportSet>,
-    native: Option<&crate::NativeScalarCAbi>,
+    native: Option<&crate::NativeAbiContext>,
 ) -> Result<(), AdapterError> {
     reject_unconsumed_v41_target_neutral_surface_with_imports_and_native(
         module, policy, imports, native,
@@ -28455,7 +28527,7 @@ fn reject_unconsumed_v41_target_neutral_surface_with_imports_and_native(
     module: &TrustIrModule,
     policy: ObjectSymbolPolicy,
     imports: Option<&crate::AuthenticatedImportSet>,
-    native: Option<&crate::NativeScalarCAbi>,
+    native: Option<&crate::NativeAbiContext>,
 ) -> Result<(), AdapterError> {
     nominal_type_origin_floor(module)?;
     // One formula wherever the module states one, before any path-specific
@@ -28566,6 +28638,9 @@ fn reject_unconsumed_v41_target_neutral_surface_with_imports_and_native(
         Some(native) => native.admit_module(module)?,
         None => signature_abi_surface::refuse_recorded(module)?,
     }
+    let native_nominal_values = native
+        .map(|native| crate::native_nominal_values::ModuleValues::native(module, native))
+        .transpose()?;
     if completeness.is_some() {
         return Err(AdapterError::ModuleCompletenessUnsupported {
             module: name.clone(),
@@ -28616,10 +28691,25 @@ fn reject_unconsumed_v41_target_neutral_surface_with_imports_and_native(
     for func in functions {
         function_surface_floor(func, func_types, policy, panic_entries.contains(&func.id))?;
         assert_panics::function_floor(func)?;
-        unmodeled_body_construct_floor(func, Some(module))?;
+        unmodeled_body_construct_floor_with_nominals(
+            func,
+            Some(module),
+            native_nominal_values.as_ref(),
+        )?;
         uniform_array_spelling_floor(module, func)?;
     }
     for global in globals {
+        if global
+            .initializer
+            .as_ref()
+            .is_some_and(constant_carries_fn_item)
+        {
+            return Err(AdapterError::UnmodeledTrustIrConstruct {
+                location: format!("global `{}` initializer", global.name),
+                construct: "Constant::FnItem",
+                reason: FN_ITEM_UNMODELED,
+            });
+        }
         global_surface_floor(global, policy)?;
         if let Some(initializer) = &global.initializer {
             constant_uniform_array_spelling(
@@ -28702,6 +28792,10 @@ const TENSOR_REGION_UNMODELED: &str = "a tensor instruction computes a tensor va
 /// trust-ir v49 `Constant::Uninit`: why this backend refuses it.
 const UNINIT_UNMODELED: &str = "an unwritten aggregate lane holds no value; materializing any \
      bytes for it would be a value the program never wrote, and no lane models a lane without one";
+/// A nominal function item is not a pointer or the ordinary unit value.
+const FN_ITEM_UNMODELED: &str = "a nominal function item retains its exact target identity; \
+     this lowering entry has no checked nominal singleton transport and must not replace it with Unit, \
+     I64 or a function address";
 /// A runtime environment without observed offsets cannot borrow the natural-C
 /// image of a structurally equal closure type.
 const MAKE_CLOSURE_UNMODELED: &str = "runtime closure construction lacks a declared capture layout; \
@@ -28717,17 +28811,29 @@ const MAKE_CLOSURE_UNMODELED: &str = "runtime closure construction lacks a decla
 /// wildcard (dead-code removal that took a drop for pure, a rebuild that lost
 /// the `weak` flag) from ever seeing one. The lowering sites refuse them too,
 /// by name, and their matches over `Inst` and `Constant` have no wildcard.
+#[cfg(test)]
 fn unmodeled_body_construct_floor(
     func: &TrustIrFunction,
     module: Option<&TrustIrModule>,
 ) -> Result<(), AdapterError> {
+    unmodeled_body_construct_floor_with_nominals(func, module, None)
+}
+
+fn unmodeled_body_construct_floor_with_nominals(
+    func: &TrustIrFunction,
+    module: Option<&TrustIrModule>,
+    nominal: Option<&crate::native_nominal_values::ModuleValues<'_>>,
+) -> Result<(), AdapterError> {
+    if let Some(nominal) = nominal {
+        nominal.check_function(module.ok_or(AdapterError::ModuleNotSet)?, func)?;
+    }
     for block in &func.blocks {
         let refuse = |construct, reason| AdapterError::UnmodeledTrustIrConstruct {
             location: format!("function `{}` bb{}", func.name, block.id.index()),
             construct,
             reason,
         };
-        for node in &block.body {
+        for (instruction, node) in block.body.iter().enumerate() {
             if matches!(node.inst, Inst::Drop { .. }) {
                 return Err(refuse("Inst::Drop", DROP_UNMODELED));
             }
@@ -28793,6 +28899,25 @@ fn unmodeled_body_construct_floor(
             };
             if carries_uninit {
                 return Err(refuse("Constant::Uninit", UNINIT_UNMODELED));
+            }
+            let carries_item = match &node.inst {
+                Inst::Const { value, .. } => constant_carries_fn_item(value),
+                Inst::Switch { cases, .. } => cases
+                    .iter()
+                    .any(|case| constant_carries_fn_item(&case.value)),
+                _ => false,
+            };
+            if carries_item {
+                let action = nominal
+                    .map(|values| values.action(func, block.id, instruction, node))
+                    .transpose()?
+                    .flatten();
+                if !matches!(
+                    action,
+                    Some(crate::native_nominal_values::Action::Value { .. })
+                ) {
+                    return Err(refuse("Constant::FnItem", FN_ITEM_UNMODELED));
+                }
             }
             let carries_blob = match &node.inst {
                 Inst::Const { value, .. } => constant_carries_tensor_blob(value),
@@ -29034,6 +29159,20 @@ fn constant_uniform_array_spelling(
         }
     }
     Ok(())
+}
+
+/// Whether an actual stored constant carries a nominal item, without expanding
+/// a Splat's logical length or interpreting it as a function address.
+fn constant_carries_fn_item(constant: &Constant) -> bool {
+    constant
+        .try_visit_constants(|nested| {
+            if matches!(nested, Constant::FnItem(_)) {
+                std::ops::ControlFlow::Break(())
+            } else {
+                std::ops::ControlFlow::Continue(())
+            }
+        })
+        .is_break()
 }
 
 /// Whether `constant` is, or holds at any depth, a trust-ir v70
@@ -30931,8 +31070,23 @@ pub fn validate_codegen_prerequisites(module: &TrustIrModule) -> Result<(), Adap
         .flat_map(|f| &f.blocks)
         .flat_map(|b| &b.body)
         .any(|n| n.inst.panic_site().is_some());
+    let mut rederiver = crate::box_deref::ModuleRederiver::new(module);
     for error in trust_ir_build::validate_module_for_codegen_with(module, &admission) {
-        if let Some(refusal) = named_validation_refusal(module, &error) {
+        // A Box floor finding whose conjunct this backend re-derives is
+        // discharged at this entry's floor by the shared acceptance check's
+        // own predicate (the floor consults the re-derivation).
+        if crate::box_deref::discharged_by_rederivation(
+            &mut rederiver,
+            crate::box_deref::BoxValidityFloor::MOST_PERMISSIVE,
+            &error,
+        ) {
+            continue;
+        }
+        if let Some(refusal) = named_validation_refusal(
+            module,
+            crate::box_deref::BoxValidityFloor::MOST_PERMISSIVE,
+            &error,
+        ) {
             return Err(refusal);
         }
         // THE RESIDUAL, stated rather than hidden: every other finding
@@ -30977,13 +31131,14 @@ pub fn validate_codegen_prerequisites(module: &TrustIrModule) -> Result<(), Adap
 /// [`AdapterError::InvalidTrustIrModule`].
 pub(crate) fn named_validation_refusal(
     module: &TrustIrModule,
+    box_floor: crate::box_deref::BoxValidityFloor,
     error: &trust_ir_build::ValidationError,
 ) -> Option<AdapterError> {
     use trust_ir_build::ValidationError as V;
     // trust-ir v74: a finding about a `BoxDeref` (a rule of its validity
-    // fact, or the evidence floor) is never tolerated and has one spelling,
-    // decided by the shared classifier.
-    if let Some(refusal) = crate::box_deref::refusal_of_finding(error) {
+    // fact, or the evidence floor the caller read the findings at) is never
+    // tolerated and has one spelling, decided by the shared classifier.
+    if let Some(refusal) = crate::box_deref::refusal_of_finding(module, box_floor, error) {
         return Some(refusal);
     }
     match error {
@@ -31770,7 +31925,7 @@ pub fn translate_admitted_module_for_native_scalar_c_abi(
     guard_carrier_arch: GuardCarrierArch,
     access_model: ObjectAccessModel,
     policy: impl Into<ObjectSymbolPolicy>,
-    native: &crate::NativeScalarCAbi,
+    native: &crate::NativeAbiContext,
 ) -> Result<
     (
         Vec<(Function, ProofContext)>,
@@ -31872,7 +32027,7 @@ pub(crate) fn census_module_translation_with_native_context(
     access_model: ObjectAccessModel,
     license: &CodegenLicensePolicy,
     policy: ObjectSymbolPolicy,
-    native: Option<&crate::NativeScalarCAbi>,
+    native: Option<&crate::NativeAbiContext>,
 ) -> Result<Vec<(FuncId, AdapterError)>, AdapterError> {
     let mut rows = Vec::new();
     translate_module_with_backend_symbol_check(
@@ -32225,7 +32380,7 @@ fn translate_module_with_backend_symbol_check<'module>(
     license: &CodegenLicensePolicy,
     object_symbols: ObjectSymbolPolicy,
     backend_symbols: BackendSymbolCheck,
-    native_scalar_c_abi: Option<&crate::NativeScalarCAbi>,
+    native_scalar_c_abi: Option<&crate::NativeAbiContext>,
     mut refusals: FunctionRefusals<'_>,
 ) -> Result<ValidatedModuleTranslationWithOptionalStats<'module>, AdapterError> {
     if let Some(native) = native_scalar_c_abi {
@@ -32459,6 +32614,11 @@ fn translate_module_with_backend_symbol_check<'module>(
     // return LIR without a report.
     let enable_exact_module_calls =
         enable_exact_module_calls && std::ptr::eq(module, original_module);
+    let native_nominal_values = native_scalar_c_abi
+        .map(|native| crate::native_nominal_values::ModuleValues::native(module, native))
+        .transpose()?
+        .filter(|values| !values.is_empty())
+        .map(Rc::new);
 
     // Precompute the set of pure functions in the module. Each adapter
     // instance is seeded with this set so Call translation can tag
@@ -32486,6 +32646,7 @@ fn translate_module_with_backend_symbol_check<'module>(
         adapter.set_guard_carrier_arch(guard_carrier_arch);
         adapter.set_object_access_model(access_model);
         adapter.native_scalar_c_abi = native_scalar_c_abi.cloned();
+        adapter.native_nominal_values = native_nominal_values.clone();
         adapter.share_sequence_module_facts(Rc::clone(&sequence_module_facts));
         adapter.share_module_eh_type_table(Rc::clone(&eh_type_table_cell));
         if enable_exact_module_calls {
@@ -34158,6 +34319,10 @@ fn classify_direct_call(
 #[cfg(test)]
 #[path = "adapter_named_call_prototype_tests.rs"]
 mod named_call_prototype_tests;
+
+#[cfg(test)]
+#[path = "adapter_current_ir_compat_tests.rs"]
+mod current_ir_compat_tests;
 
 #[cfg(test)]
 #[path = "adapter_output_handoff_tests.rs"]
@@ -52162,6 +52327,17 @@ mod tests {
         assert!(matches!(
             adapter.translate(&func),
             Err(AdapterError::ModuleNotSet)
+        ));
+        assert!(adapter.value_producers.is_empty());
+
+        // The module/ABI floor now precedes SSA indexing. Supply a real
+        // module so this deliberately malformed function reaches the index;
+        // its absent signature then stops translation before code emission.
+        let module = TrustIrModule::new("producer_index_missing_signature");
+        adapter.module = Some(&module);
+        assert!(matches!(
+            adapter.translate(&func),
+            Err(AdapterError::InvalidFuncTyId(0))
         ));
 
         let first = &func.blocks[0].body[0];

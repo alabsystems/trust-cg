@@ -15,6 +15,7 @@ INPUTS = [
     "formal/lean/Trust/Model/EncoderStep.lean",
     "formal/lean/Trust/Model/MovabsGolden.lean",
     "formal/lean/scripts/MovabsChecks.lean",
+    "formal/lean/Trust/Model/RegisterBits.lean",
     "crates/trust-cg-codegen/tests/lean_encode_golden_binding.rs",
     "formal/lean/lean-toolchain",
     "formal/lean/Trust/Model/EncoderGolden.lean",
@@ -58,11 +59,11 @@ def campaign(out):
         if code:
             raise SystemExit(f"{label} failed; see {out / (label + '.log')}")
         print(f"MOVABS-STEP {label} passed", flush=True)
-    marker = "MOVABS-CHECKS axioms=foundational-only declarations=7 golden_vectors=96 truncated=16 nonwide=16 resident_execution=1"
+    marker = "MOVABS-CHECKS axioms=foundational-only declarations=8 golden_vectors=96 truncated=16 nonwide=16 resident_execution=1"
     if marker not in (out / "MovabsChecks.log").read_text() or before != hashes():
         raise SystemExit("missing audit marker or inputs changed")
     result = dict(status="passed", inputs=before, steps=steps,
-                  qualification="model and enumerated byte binding; NOT ATTESTED")
+                  qualification="model, shared prefix and enumerated byte binding; NOT ATTESTED")
     (out / "result.json").write_text(json.dumps(result, indent=2) + "\n")
     print("MOVABS-MODEL passed; NOT ATTESTED", flush=True)
 

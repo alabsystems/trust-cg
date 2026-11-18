@@ -29,13 +29,15 @@
   the integer comparison it lowers, for every width `w ≥ 1`.  In particular `SUBS`'s C flag is
   NOT-borrow (`C = 1 ↔ b ≤ a` unsigned), the opposite of x86's CF.
 
-  NOT YET HERE (named next steps of X-LEAN-P1): a forward simulation from a trust-cg source or
-  IR semantics to `step`, the AArch64 capstone, and any connection to the Rust emitter beyond
-  the golden corpus of `Trust/A64/EncoderGolden.lean`.  No `sorry`, no `axiom`.
+  The condition field proof connects to the Rust encoder and layout passes through the
+  Trust-compiled toggle and complementability functions. A forward simulation from trust-cg
+  source or IR semantics to `step` remains the X-LEAN-P1 capstone. No `sorry`, no `axiom`.
   ─────────────────────────────────────────────────────────────────────────────────────────────
 -/
 import Trust.A64.Encoding
 import Trust.A64.Bitmask
+import Trust.A64.ConditionBits
+import Trust.A64.ConditionalTrap
 
 namespace Trust
 namespace A64
@@ -107,8 +109,8 @@ def addWithCarry {w : Nat} (x y : BitVec w) (cin : Bool) : BitVec w × NZCV :=
   (result, { n := result.msb, z := result == 0#w, c := result.toNat != usum,
              v := result.toInt != ssum })
 
-/-- `ConditionHolds(cond)` (Arm ARM J1). -/
-def condHolds (cond : Fin 16) (f : NZCV) : Bool :=
+/-- The reference `ConditionHolds(cond)` pseudocode (Arm ARM J1). -/
+private def condHoldsSpec (cond : Fin 16) (f : NZCV) : Bool :=
   let base := match cond.val / 2 with
     | 0 => f.z
     | 1 => f.c
@@ -119,6 +121,21 @@ def condHolds (cond : Fin 16) (f : NZCV) : Bool :=
     | 6 => f.n == f.v && !f.z
     | _ => true
   if cond.val % 2 = 1 && cond.val != 15 then !base else base
+
+/-- `ConditionHolds` reads the condition's bit from the Trust-compiled truth mask. -/
+def condHolds (cond : Fin 16) (f : NZCV) : Bool :=
+  let mask := trust_cg_a64_cond_truth_mask f.n.toUInt32 f.z.toUInt32 f.c.toUInt32 f.v.toUInt32
+  mask.toBitVec.getLsbD cond.val
+
+private theorem condHolds_table_matches :
+    ∀ (cond : Fin 16) (n z c v : Bool),
+      condHolds cond ⟨n, z, c, v⟩ = condHoldsSpec cond ⟨n, z, c, v⟩ := by
+  decide +kernel
+
+theorem condHolds_matches_spec (cond : Fin 16) (f : NZCV) :
+    condHolds cond f = condHoldsSpec cond f := by
+  cases f with
+  | mk n z c v => exact condHolds_table_matches cond n z c v
 
 /-- The register width of `sf`. -/
 def datasize (sf : Fin 2) : Nat := if sf.val = 1 then 64 else 32
@@ -569,18 +586,20 @@ def IntCC.eval {w : Nat} : IntCC → BitVec w → BitVec w → Bool
   | .ule, a, b => decide (a.toNat ≤ b.toNat)
 
 /-- The flag expression `ConditionHolds` reads for each condition trust-cg emits. -/
-theorem condHolds_eq (f : NZCV) : condHolds 0 f = f.z := rfl
-theorem condHolds_ne (f : NZCV) : condHolds 1 f = !f.z := rfl
-theorem condHolds_hs (f : NZCV) : condHolds 2 f = f.c := rfl
-theorem condHolds_lo (f : NZCV) : condHolds 3 f = !f.c := rfl
-theorem condHolds_hi (f : NZCV) : condHolds 8 f = (f.c && !f.z) := rfl
-theorem condHolds_ls (f : NZCV) : condHolds 9 f = !(f.c && !f.z) := rfl
-theorem condHolds_mi (f : NZCV) : condHolds 4 f = f.n := rfl
-theorem condHolds_vs (f : NZCV) : condHolds 6 f = f.v := rfl
-theorem condHolds_ge (f : NZCV) : condHolds 10 f = (f.n == f.v) := rfl
-theorem condHolds_lt (f : NZCV) : condHolds 11 f = !(f.n == f.v) := rfl
-theorem condHolds_gt (f : NZCV) : condHolds 12 f = (f.n == f.v && !f.z) := rfl
-theorem condHolds_le (f : NZCV) : condHolds 13 f = !(f.n == f.v && !f.z) := rfl
+theorem condHolds_eq (f : NZCV) : condHolds 0 f = f.z := condHolds_matches_spec 0 f
+theorem condHolds_ne (f : NZCV) : condHolds 1 f = !f.z := condHolds_matches_spec 1 f
+theorem condHolds_hs (f : NZCV) : condHolds 2 f = f.c := condHolds_matches_spec 2 f
+theorem condHolds_lo (f : NZCV) : condHolds 3 f = !f.c := condHolds_matches_spec 3 f
+theorem condHolds_hi (f : NZCV) : condHolds 8 f = (f.c && !f.z) := condHolds_matches_spec 8 f
+theorem condHolds_ls (f : NZCV) : condHolds 9 f = !(f.c && !f.z) := condHolds_matches_spec 9 f
+theorem condHolds_mi (f : NZCV) : condHolds 4 f = f.n := condHolds_matches_spec 4 f
+theorem condHolds_vs (f : NZCV) : condHolds 6 f = f.v := condHolds_matches_spec 6 f
+theorem condHolds_ge (f : NZCV) : condHolds 10 f = (f.n == f.v) := condHolds_matches_spec 10 f
+theorem condHolds_lt (f : NZCV) : condHolds 11 f = !(f.n == f.v) := condHolds_matches_spec 11 f
+theorem condHolds_gt (f : NZCV) :
+    condHolds 12 f = (f.n == f.v && !f.z) := condHolds_matches_spec 12 f
+theorem condHolds_le (f : NZCV) :
+    condHolds 13 f = !(f.n == f.v && !f.z) := condHolds_matches_spec 13 f
 
 /-- **The condition certificate.**  After `CMP a, b` at any width `w ≥ 1`, the Arm ARM
     `ConditionHolds` of the condition trust-cg selects for an integer predicate is exactly that
@@ -631,6 +650,77 @@ theorem condHolds_invert :
     ∀ c, c < 14 → ∀ n z cf v : Bool,
       condHolds (fin4 (c ^^^ 1)) ⟨n, z, cf, v⟩ = !condHolds (fin4 c) ⟨n, z, cf, v⟩ := by
   decide +kernel
+
+theorem condToggle_toNat : ∀ cc : Fin 16,
+    (trust_cg_a64_cond_toggle (UInt32.ofNat cc.val)).toNat = cc.val ^^^ 1 := by
+  decide +kernel
+
+theorem condComplementable_iff : ∀ cc : Fin 16,
+    (trust_cg_a64_cond_complementable (UInt32.ofNat cc.val) = 1) ↔ cc.val < 14 := by
+  decide +kernel
+
+/-- The two condition encodings without a complement always take their edge. -/
+theorem condHolds_unconditional :
+    ∀ cc : Fin 16, trust_cg_a64_cond_complementable (UInt32.ofNat cc.val) ≠ 1 →
+      ∀ n z c v : Bool, condHolds cc ⟨n, z, c, v⟩ = true := by
+  decide +kernel
+
+/-- The exact encoding toggle negates the condition when a logical complement exists. -/
+theorem condHolds_compiled_invert (cc : Fin 16) (f : NZCV)
+    (complementable : trust_cg_a64_cond_complementable (UInt32.ofNat cc.val) = 1) :
+    condHolds (fin4 (trust_cg_a64_cond_toggle (UInt32.ofNat cc.val)).toNat) f = !condHolds cc f := by
+  have hc := (condComplementable_iff cc).mp complementable
+  have hfin : fin4 cc.val = cc := Fin.ext (Nat.mod_eq_of_lt cc.isLt)
+  rw [condToggle_toNat]
+  cases f with
+  | mk n z c v => simpa only [hfin] using condHolds_invert cc.val hc n z c v
+
+/-- Swapping branch and fallthrough destinations together with the condition preserves the edge. -/
+theorem condHolds_swap_edges {α : Type} (cc : Fin 16) (f : NZCV) (taken fallthrough : α)
+    (complementable : trust_cg_a64_cond_complementable (UInt32.ofNat cc.val) = 1) :
+    (if condHolds cc f then taken else fallthrough) =
+      (if condHolds (fin4 (trust_cg_a64_cond_toggle (UInt32.ofNat cc.val)).toNat) f
+        then fallthrough else taken) := by
+  rw [condHolds_compiled_invert cc f complementable]
+  cases condHolds cc f <;> rfl
+
+/-- A lowered integer comparison selects the same destination after the layout edge swap. -/
+theorem cmp_swap_edges {α : Type} {w : Nat} (hw : 0 < w)
+    (p : IntCC) (a b : BitVec w) (taken fallthrough : α) :
+    (if p.eval a b then taken else fallthrough) =
+      (if condHolds (fin4 (trust_cg_a64_cond_toggle (UInt32.ofNat p.cond.val)).toNat) (cmpFlags a b)
+        then fallthrough else taken) := by
+  rw [← cmp_condition_cert hw p a b]
+  exact condHolds_swap_edges p.cond (cmpFlags a b) taken fallthrough (by cases p <;> decide)
+
+/-- B.HS after CMP at 64 bits takes the exit opposite to the unsigned continuation. -/
+theorem cmp64_bhs_exit (counter bound : UInt64) :
+    condHolds 2 (cmpFlags counter.toBitVec bound.toBitVec) =
+      !(decide (counter < bound) : Bool) := by
+  have hs := cmp_condition_cert (by decide : 0 < 64) .uge counter.toBitVec bound.toBitVec
+  change condHolds 2 (cmpFlags counter.toBitVec bound.toBitVec) =
+    decide (bound.toNat ≤ counter.toNat) at hs
+  rw [hs, Bool.eq_iff_iff]
+  simp only [decide_eq_true_eq, Bool.not_eq_true', decide_eq_false_iff_not,
+    UInt64.lt_iff_toNat_lt]
+  exact Nat.not_lt.symm
+
+/-- At a matched finite header visit, CMP64 and B.HS select the source trap suffix.
+    The return events are observations of corresponding calls on the exit continuation. -/
+theorem cmp64_bhs_trap_after_matched_steps
+    (source machine sourceIncrement machineIncrement sourceBound machineBound : UInt64)
+    (steps : Nat) (sourceReturned machineReturned : Bool)
+    (entry : source = machine) (increment : sourceIncrement = machineIncrement)
+    (bound : sourceBound = machineBound) (returnMatches : sourceReturned = machineReturned) :
+    (if (decide (trust_cg_a64_trap_source_counter_after source sourceIncrement steps <
+      sourceBound) : Bool) then false else sourceReturned) =
+      trust_cg_a64_trap_after_return
+        (condHolds 2 (cmpFlags
+          (trust_cg_a64_trap_machine_counter_after machine machineIncrement steps).toBitVec
+          machineBound.toBitVec)) machineReturned := by
+  rw [cmp64_bhs_exit]
+  exact trust_cg_a64_trap_after_matched_steps source machine sourceIncrement machineIncrement
+    sourceBound machineBound steps sourceReturned machineReturned entry increment bound returnMatches
 
 /-! ## Alias semantics -/
 

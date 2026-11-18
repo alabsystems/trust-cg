@@ -24,6 +24,18 @@ use crate::source_bound_frame::ScalarMemorySourceQueries;
 use crate::verify::VerificationResult;
 use trust_cg_ir::MachFunction;
 
+#[cfg(feature = "source-defined-call")]
+#[path = "void_memory_receipt.rs"]
+mod void_receipt;
+#[cfg(feature = "source-defined-call")]
+pub use void_receipt::ReplayedVoidMemoryCompilation;
+
+#[cfg(feature = "source-defined-call")]
+#[path = "word_status_receipt.rs"]
+mod word_status_receipt;
+#[cfg(feature = "source-defined-call")]
+pub use word_status_receipt::ReplayedWordStatusCompilation;
+
 #[cfg(test)]
 #[path = "scalar_memory_replay_tests.rs"]
 mod tests;
@@ -78,8 +90,30 @@ impl<'a> ScalarMemoryCompilerRelations<'a> {
         machine: &'a MachFunction,
         final_bytes: &'a [u8],
     ) -> Result<Self, ReadOnlyTargetError> {
-        let machine_queries = bind_scalar_memory_machine(source, machine)?;
-        let byte_queries = bind_scalar_memory_bytes(source, final_bytes)?;
+        if source.is_void() {
+            return Err(ReadOnlyTargetError::Machine(
+                "void entry has no scalar result",
+            ));
+        }
+        Self::bind_memory(source, machine, final_bytes)
+    }
+
+    fn bind_memory(
+        source: &'a ScalarMemorySourceQueries<'a>,
+        machine: &'a MachFunction,
+        final_bytes: &'a [u8],
+    ) -> Result<Self, ReadOnlyTargetError> {
+        let (machine_queries, byte_queries) = if source.is_void() {
+            (
+                crate::read_only_target::bind_memory_machine(source, machine)?,
+                crate::read_only_target::bind_memory_bytes(source, final_bytes)?,
+            )
+        } else {
+            (
+                bind_scalar_memory_machine(source, machine)?,
+                bind_scalar_memory_bytes(source, final_bytes)?,
+            )
+        };
         let counts = [
             2,
             source.read_obligations().len(),
@@ -378,6 +412,25 @@ pub struct ScalarMemoryReplayReport<'r, 'a> {
     certificate: Option<ScalarMemoryReplayCertificate<'r, 'a>>,
 }
 impl<'r, 'a> ScalarMemoryReplayReport<'r, 'a> {
+    /// Exact diagnostic query for the first actually attempted non-Valid
+    /// original part, rendered inside this capture's existing policy. This
+    /// is data only and grants no replay, caller or installation authority.
+    pub fn first_failed_original_problem(&self) -> Option<String> {
+        let (_, part) = self
+            .outcomes
+            .iter()
+            .zip(self.relations.parts())
+            .find(|(outcome, _)| {
+                outcome.attempted() && !matches!(outcome.verdict(), Some(VerificationResult::Valid))
+            })?;
+        Some(self.request.with_policy(|| {
+            crate::ay_bridge::generate_smt2_query_raw(
+                part.obligation(),
+                &crate::verdict_db::live_source_bound_config(),
+            )
+        }))
+    }
+
     pub fn relations(&self) -> &'r ScalarMemoryCompilerRelations<'a> {
         self.relations
     }
@@ -392,5 +445,183 @@ impl<'r, 'a> ScalarMemoryReplayReport<'r, 'a> {
     }
     pub fn certificate(&self) -> Option<&ScalarMemoryReplayCertificate<'r, 'a>> {
         self.certificate.as_ref()
+    }
+    /// Consume the actual complete replay capability. Refused/partial
+    /// diagnostics remain retained and cannot mint a source/storage owner.
+    pub fn into_certificate(mut self) -> Result<ScalarMemoryReplayCertificate<'r, 'a>, Self> {
+        self.certificate.take().ok_or(self)
+    }
+}
+
+/// Exact void normal-return, final-byte and access inventory. The private
+/// shared protocol is reused; no scalar query owner/certificate is exported.
+/// A successful replay remains conditional on the real caller-memory owner.
+pub struct VoidMemoryCompilerRelations<'a> {
+    source: &'a crate::source_bound_frame::VoidMemorySourceQueries<'a>,
+    inner: ScalarMemoryCompilerRelations<'a>,
+}
+impl<'a> VoidMemoryCompilerRelations<'a> {
+    pub fn bind(
+        source: &'a crate::source_bound_frame::VoidMemorySourceQueries<'a>,
+        machine: &'a MachFunction,
+        final_bytes: &'a [u8],
+    ) -> Result<Self, ReadOnlyTargetError> {
+        if !source.inner.is_void() {
+            return Err(ReadOnlyTargetError::Machine(
+                "missing void terminal identity",
+            ));
+        }
+        Ok(Self {
+            source,
+            inner: ScalarMemoryCompilerRelations::bind_memory(&source.inner, machine, final_bytes)?,
+        })
+    }
+    pub fn source(&self) -> &'a crate::source_bound_frame::VoidMemorySourceQueries<'a> {
+        self.source
+    }
+    pub fn machine(&self) -> &'a MachFunction {
+        self.inner.machine
+    }
+    pub fn final_bytes(&self) -> &'a [u8] {
+        self.inner.final_bytes
+    }
+    pub fn len(&self) -> usize {
+        self.inner.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.inner.is_empty()
+    }
+    pub fn parts(
+        &self,
+    ) -> impl ExactSizeIterator<Item = VoidMemoryReplayPart<'_>> + DoubleEndedIterator {
+        self.inner
+            .parts()
+            .map(|inner| VoidMemoryReplayPart { inner })
+    }
+    pub fn replay<'r>(
+        &'r self,
+        request: &'r FunctionVerificationRequest,
+    ) -> VoidMemoryReplayReport<'r, 'a> {
+        VoidMemoryReplayReport {
+            relations: self,
+            inner: self.inner.replay(request),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VoidMemoryRelationKind {
+    NormalReturn,
+    FinalMemory,
+    Read,
+    Write,
+}
+fn void_kind(kind: ScalarMemoryRelationKind) -> VoidMemoryRelationKind {
+    match kind {
+        ScalarMemoryRelationKind::Status => VoidMemoryRelationKind::NormalReturn,
+        ScalarMemoryRelationKind::FinalMemory => VoidMemoryRelationKind::FinalMemory,
+        ScalarMemoryRelationKind::Read => VoidMemoryRelationKind::Read,
+        ScalarMemoryRelationKind::Write => VoidMemoryRelationKind::Write,
+    }
+}
+pub struct VoidMemoryReplayPart<'p> {
+    inner: ScalarMemoryReplayPart<'p>,
+}
+impl VoidMemoryReplayPart<'_> {
+    pub fn stage(&self) -> ScalarMemoryRelationStage {
+        self.inner.id.stage
+    }
+    pub fn kind(&self) -> VoidMemoryRelationKind {
+        void_kind(self.inner.id.kind)
+    }
+    pub fn index(&self) -> usize {
+        self.inner.id.index
+    }
+    pub fn obligation(&self) -> &ProofObligation {
+        self.inner.obligation
+    }
+}
+pub struct VoidMemoryReplayOutcome<'p> {
+    inner: &'p ScalarMemoryReplayOutcome,
+}
+impl VoidMemoryReplayOutcome<'_> {
+    pub fn stage(&self) -> ScalarMemoryRelationStage {
+        self.inner.id.stage
+    }
+    pub fn kind(&self) -> VoidMemoryRelationKind {
+        void_kind(self.inner.id.kind)
+    }
+    pub fn index(&self) -> usize {
+        self.inner.id.index
+    }
+    pub fn verdict(&self) -> Option<&VerificationResult> {
+        self.inner.verdict()
+    }
+    pub fn why(&self) -> Option<&str> {
+        self.inner.why()
+    }
+    pub fn attempted(&self) -> bool {
+        self.inner.attempted()
+    }
+}
+pub struct VoidMemoryReplayReport<'r, 'a> {
+    relations: &'r VoidMemoryCompilerRelations<'a>,
+    inner: ScalarMemoryReplayReport<'r, 'a>,
+}
+impl<'r, 'a> VoidMemoryReplayReport<'r, 'a> {
+    /// Diagnostic original problem for the first actual non-Valid part,
+    /// rendered under THIS capture's policy and the unchanged live raw-query
+    /// owner. It is neither a verdict nor a transferable replay capability.
+    pub fn first_failed_original_problem(&self) -> Option<String> {
+        let (_, part) = self
+            .outcomes()
+            .zip(self.relations.parts())
+            .find(|(outcome, _)| {
+                outcome.attempted() && !matches!(outcome.verdict(), Some(VerificationResult::Valid))
+            })?;
+        Some(self.inner.request.with_policy(|| {
+            crate::ay_bridge::generate_smt2_query_raw(
+                part.obligation(),
+                &crate::verdict_db::live_source_bound_config(),
+            )
+        }))
+    }
+    pub fn outcomes(&self) -> impl ExactSizeIterator<Item = VoidMemoryReplayOutcome<'_>> {
+        self.inner
+            .outcomes
+            .iter()
+            .map(|inner| VoidMemoryReplayOutcome { inner })
+    }
+    pub fn refusal(&self) -> Option<ScalarMemoryReplayRefusal> {
+        self.inner.refusal
+    }
+    pub fn is_complete(&self) -> bool {
+        self.inner.certificate.is_some()
+    }
+    /// Move the actual all-parts replay receipt. No hash/ID/DTO or generic
+    /// successful report can mint this typed conditional owner.
+    pub fn into_certificate(mut self) -> Result<VoidMemoryReplayCertificate<'r, 'a>, Self> {
+        match self.inner.certificate.take() {
+            Some(receipt) => Ok(VoidMemoryReplayCertificate {
+                relations: self.relations,
+                receipt,
+            }),
+            None => Err(self),
+        }
+    }
+}
+pub struct VoidMemoryReplayCertificate<'r, 'a> {
+    relations: &'r VoidMemoryCompilerRelations<'a>,
+    receipt: ScalarMemoryReplayCertificate<'r, 'a>,
+}
+impl<'r, 'a> VoidMemoryReplayCertificate<'r, 'a> {
+    pub fn relations(&self) -> &'r VoidMemoryCompilerRelations<'a> {
+        self.relations
+    }
+    pub fn request(&self) -> &'r FunctionVerificationRequest {
+        self.receipt.request
+    }
+    pub fn transport(&self) -> ScalarMemoryReplayTransport {
+        self.receipt.transport
     }
 }

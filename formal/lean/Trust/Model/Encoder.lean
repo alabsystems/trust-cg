@@ -19,8 +19,8 @@
       execInstr            — the architectural effect of one decoded `Instr` on `MachState`.
       BytesAt              — the bytes resident at an address.
 
-  HOW IT PLUGS INTO THE CONTRACT.  This module imports only `Model.Core`.  `Trust.Model` (the
-  link step) DEFINES `x86Step` as fetch∘decode∘execInstr over these definitions, and
+  HOW IT PLUGS INTO THE CONTRACT.  This module uses `Model.Core` and `Model.RegisterBits`.
+  `Trust.Model` (the link step) DEFINES `x86Step` as fetch∘decode∘execInstr over these definitions, and
   `Model.EncoderStep` proves the keystone `x86Step_decode` (formerly an axiom) and the
   `LoweredStep` builders from that definition.  The byte round trips here are kernel-checked;
   what stays trusted, outside Lean, is that `decode`/`execInstr` are what an x86-64 processor
@@ -43,7 +43,7 @@
 -/
 import Std.Tactic.BVDecide
 import Trust.Model.Core
-import Trust.Model.RegisterBits       -- the state vocabulary (Val, Loc, MachState, Flags, Event …)
+import Trust.Model.RegisterBits
 
 namespace Trust
 namespace Model
@@ -168,9 +168,34 @@ def rexRR (sz : OSize) (reg rm : GPR) : BitVec 8 :=
   rexByte (sz = OSize.b64) (gprHiBit reg) false (gprHiBit rm)
 
 def modrmByte (mode : BitVec 2) (reg rm : BitVec 3) : BitVec 8 :=
+  (trust_cg_x86_pack_fields
+    (UInt8.ofBitVec (mode.setWidth 8))
+    (UInt8.ofBitVec (reg.setWidth 8))
+    (UInt8.ofBitVec (rm.setWidth 8))).toBitVec
+
+/-- The emitted field packer implements the bitwise encoding at the architectural widths. -/
+theorem modrmByte_bits (mode : BitVec 2) (reg rm : BitVec 3) : modrmByte mode reg rm =
   (((mode.setWidth 8) <<< (6 : BitVec 8))
     ||| ((reg.setWidth 8) <<< (3 : BitVec 8))
-    ||| (rm.setWidth 8))
+    ||| (rm.setWidth 8)) := by
+  have packed : (mode ++ reg ++ rm : BitVec 8) =
+      ((mode.setWidth 8 <<< (6 : Nat)) ||| (reg.setWidth 8 <<< (3 : Nat)) ||| rm.setWidth 8) := by
+    simpa only [BitVec.setWidth_eq] using
+      (BitVec.setWidth_append_append_eq_shiftLeft_setWidth_or
+        (w''' := 8) (b := mode) (b' := reg) (b'' := rm))
+  change modrmByte mode reg rm =
+    ((mode.setWidth 8 <<< (6 : Nat)) ||| (reg.setWidth 8 <<< (3 : Nat)) ||| rm.setWidth 8)
+  rw [← packed]
+  apply BitVec.eq_of_toNat_eq
+  have hmode : mode.toNat < 4 := mode.isLt
+  have hreg : reg.toNat < 2^3 := reg.isLt
+  have hrm : rm.toNat < 2^3 := rm.isLt
+  simp only [modrmByte, trust_cg_x86_pack_fields, UInt8.toNat_toBitVec,
+    UInt8.toNat_add, UInt8.toNat_mul, UInt8.toNat_ofBitVec,
+    UInt8.toNat_ofNat, BitVec.toNat_setWidth, BitVec.toNat_append]
+  rw [← Nat.shiftLeft_add_eq_or_of_lt hrm, ← Nat.shiftLeft_add_eq_or_of_lt hreg]
+  simp only [Nat.shiftLeft_eq, Nat.reducePow]
+  omega
 
 def modrmRR (reg rm : GPR) : BitVec 8 := modrmByte 0b11 (gprLo3 reg) (gprLo3 rm)
 def modrmExtR (ext : BitVec 3) (rm : GPR) : BitVec 8 := modrmByte 0b11 ext (gprLo3 rm)
@@ -180,7 +205,7 @@ theorem modrmRR_fields (reg rm : GPR) :
     ((modrmRR reg rm) >>> (6 : BitVec 8)).truncate 2 = 0b11 ∧
     (((modrmRR reg rm) >>> (3 : BitVec 8)).truncate 3) = gprLo3 reg ∧
     ((modrmRR reg rm).truncate 3) = gprLo3 rm := by
-  simp only [modrmRR, modrmByte, gprLo3_bits]
+  simp only [modrmRR, modrmByte_bits, gprLo3_bits]
   refine ⟨?_, ?_, ?_⟩ <;> bv_decide
 
 /-! ## 4.  Little-endian immediate / displacement splitting. -/
@@ -190,6 +215,73 @@ def le32 (x : BitVec 32) : List UInt8 :=
   , b8 ((x >>> (8  : BitVec 32)).truncate 8)
   , b8 ((x >>> (16 : BitVec 32)).truncate 8)
   , b8 ((x >>> (24 : BitVec 32)).truncate 8) ]
+
+private theorem b8_truncate_shift (x : BitVec 32) (s : Nat) :
+    b8 ((x >>> s).truncate 8) = UInt8.ofNat (x.toNat / 2 ^ s) := by
+  apply UInt8.toNat_inj.mp
+  simp only [b8, BitVec.truncate, UInt8.toNat_ofNat', BitVec.toNat_setWidth,
+    BitVec.toNat_ushiftRight, Nat.shiftRight_eq_div_pow, Nat.mod_mod]
+
+private theorem split_byte (lo rest : Nat) (h : lo < 256) :
+    (lo + 256 * rest) % 256 = lo ∧ (lo + 256 * rest) / 256 = rest := by
+  simp [Nat.add_mul_div_left, Nat.div_eq_of_lt h, Nat.mod_eq_of_lt h]
+
+/-- Split the Trust-compiled word into the four architectural instruction bytes. -/
+theorem shr64Word_bytes (regHigh : BitVec 1) (regLow : BitVec 3) (imm : BitVec 8) :
+    le32 (trust_cg_x86_shr64_word (UInt32.ofNat regHigh.toNat) (UInt32.ofNat regLow.toNat)
+      (UInt32.ofNat imm.toNat)).toBitVec =
+    [UInt8.ofNat (0x48 + regHigh.toNat), 0xC1, UInt8.ofNat (0xE8 + regLow.toNat), b8 imm] := by
+  let packed := (trust_cg_x86_shr64_word (UInt32.ofNat regHigh.toNat) (UInt32.ofNat regLow.toNat)
+    (UInt32.ofNat imm.toNat)).toBitVec
+  have high_bound : regHigh.toNat < 2 := regHigh.isLt
+  have low_bound : regLow.toNat < 8 := regLow.isLt
+  have imm_bound : imm.toNat < 256 := imm.isLt
+  let upper := 0xE8 + regLow.toNat + 256 * imm.toNat
+  let tail := 0xC1 + 256 * upper
+  have pack_shape_mod : packed.toNat = ((0x48 + regHigh.toNat) + 256 * tail) % 2 ^ 32 := by
+    simp only [packed, trust_cg_x86_shr64_word, UInt32.toNat_toBitVec, UInt32.toNat_add,
+      UInt32.toNat_mul, UInt32.toNat_ofNat, UInt32.toNat_ofNat',
+      Nat.mod_add_mod, Nat.add_mod_mod, Nat.mod_mul_mod, Nat.mul_mod_mod,
+      upper, tail, Nat.mul_add, ← Nat.mul_assoc, Nat.reduceMul]
+    congr 1
+    rw [Nat.mul_comm 65536, Nat.mul_comm 16777216]
+    calc
+      _ = (72 + (49408 + 15204352)) + regHigh.toNat +
+          (regLow.toNat * 65536) + (imm.toNat * 16777216) := by rfl
+      _ = _ := by ac_rfl
+  have byte_bound (lo rest bound : Nat) (hlo : lo < 256) (hrest : rest < bound) :
+      lo + 256 * rest < 256 * bound := by omega
+  have upper_bound : upper < 65536 :=
+    byte_bound (0xE8 + regLow.toNat) imm.toNat 256 (by omega) imm_bound
+  have tail_bound : tail < 16777216 := byte_bound 0xC1 upper 65536 (by omega) upper_bound
+  have pack_shape : packed.toNat = (0x48 + regHigh.toNat) + 256 * tail := by
+    rw [pack_shape_mod, Nat.mod_eq_of_lt
+      (byte_bound (0x48 + regHigh.toNat) tail 16777216 (by omega) tail_bound)]
+  have b0 := split_byte (0x48 + regHigh.toNat) tail (by omega)
+  have b1 := split_byte 0xC1 upper (by decide)
+  have b2 := split_byte (0xE8 + regLow.toNat) imm.toNat (by omega)
+  have shift8 : packed.toNat / 256 = tail := pack_shape ▸ b0.2
+  have shift16 : packed.toNat / 65536 = upper := by
+    rw [← Nat.div_div_eq_div_mul packed.toNat 256 256, shift8]
+    exact b1.2
+  have shift24 : packed.toNat / 16777216 = imm.toNat := by
+    rw [← Nat.div_div_eq_div_mul packed.toNat 65536 256, shift16]
+    exact b2.2
+  change le32 packed = _
+  have byte_zero : b8 (packed.truncate 8) = UInt8.ofNat packed.toNat := by
+    simpa only [BitVec.ushiftRight_zero, Nat.pow_zero, Nat.div_one] using b8_truncate_shift packed 0
+  unfold le32
+  simp only [byte_zero, BitVec.ushiftRight_eq', BitVec.ofNat_eq_ofNat, BitVec.toNat_ofNat,
+    Nat.reducePow, Nat.reduceMod]
+  simp only [b8_truncate_shift, Nat.reducePow, shift8, shift16, shift24]
+  simp only [b8, List.cons.injEq, and_true]
+  refine ⟨UInt8.toNat_inj.mp ?_, UInt8.toNat_inj.mp ?_, UInt8.toNat_inj.mp ?_⟩
+  · rw [UInt8.toNat_ofNat', UInt8.toNat_ofNat', pack_shape, b0.1]
+    exact (Nat.mod_eq_of_lt (by omega)).symm
+  · rw [UInt8.toNat_ofNat']
+    exact b1.1
+  · rw [UInt8.toNat_ofNat', UInt8.toNat_ofNat', b2.1]
+    exact (Nat.mod_eq_of_lt (by omega)).symm
 
 def ofLe32 : List UInt8 → Option (BitVec 32 × List UInt8)
   | b0 :: b1 :: b2 :: b3 :: rest =>
@@ -273,9 +365,19 @@ def xmmNum : XMM → BitVec 4
   | .x8 => 8  | .x9 => 9  | .x10 => 10| .x11 => 11
   | .x12 => 12| .x13 => 13| .x14 => 14| .x15 => 15
 
+/-- The two opcode bytes of a full-width immediate register load. -/
+def movabsPrefix (dst : GPR) : List UInt8 :=
+  let word := (trust_cg_x86_movabs_prefix
+    (UInt16.ofNat (BitVec.ofBool (gprHiBit dst)).toNat)
+    (UInt16.ofNat (gprLo3 dst).toNat)).toBitVec
+  [b8 (word.truncate 8), b8 ((word >>> (8 : Nat)).truncate 8)]
+
+theorem movabsPrefix_bytes (dst : GPR) :
+    movabsPrefix dst = [b8 (rexRR .b64 .rax dst), b8 (0xB8 + (gprLo3 dst).setWidth 8)] := by
+  cases dst <;> rfl
+
 def encInstr : Instr → List UInt8
-  | .movabsRI dst imm =>
-      [b8 (rexRR .b64 .rax dst), b8 (0xB8 + (gprLo3 dst).setWidth 8)] ++ le64 imm
+  | .movabsRI dst imm => movabsPrefix dst ++ le64 imm
   | .movRR sz dst src =>
       osPrefix sz ++ [b8 (rexRR sz src dst), b8 0x89, b8 (modrmRR src dst)]
   | .movRI sz dst imm =>
@@ -314,6 +416,10 @@ def encInstr : Instr → List UInt8
       osPrefix sz ++ [b8 (rexRR sz .rax dst), b8 0xF7, b8 (modrmExtR 3 dst)]
   | .shlRI sz dst amt =>
       osPrefix sz ++ [b8 (rexRR sz .rax dst), b8 0xC1, b8 (modrmExtR 4 dst)] ++ le8 amt
+  | .shrRI .b64 dst amt =>
+      le32 (trust_cg_x86_shr64_word
+        (UInt32.ofNat (BitVec.ofBool (gprHiBit dst)).toNat)
+        (UInt32.ofNat (gprLo3 dst).toNat) (UInt32.ofNat amt.toNat)).toBitVec
   | .shrRI sz dst amt =>
       osPrefix sz ++ [b8 (rexRR sz .rax dst), b8 0xC1, b8 (modrmExtR 5 dst)] ++ le8 amt
   | .sarRI sz dst amt =>
@@ -412,26 +518,36 @@ theorem decode_encode_movabsRI (dst : GPR) (imm : BitVec 64) (tail : List UInt8)
   simp only [le64, le32, List.cons_append, List.nil_append] at hread
   simp only [BitVec.truncate, BitVec.setWidth_setWidth_of_le _ (by decide : 8 ≤ 32)] at hread
   cases dst <;>
-    simp [encode, encInstr, le64, le32, decode, u8ToBv_b8,
+    simp [encode, encInstr, movabsPrefix_bytes, le64, le32, decode, u8ToBv_b8,
       rexRR, rexByte_bits, gprHiBit_bits, gprLo3_bits, gprNum, gprOfNum] <;> exact hread
+
+/-- The shared SHR64 word has the model's REX, opcode and ModR/M fields. -/
+theorem encode_shrRI_bytes (dst : GPR) (amt : BitVec 8) :
+    encode (.shrRI .b64 dst amt) =
+      [b8 (rexRR .b64 .rax dst), b8 0xC1, b8 (modrmExtR 5 dst), b8 amt] := by
+  simp only [encode, encInstr]
+  rw [shr64Word_bytes]
+  cases dst <;> rfl
 
 /-- The entire imm8 domain shares the anchored three-byte prefix. -/
 theorem encode_shrRI_immediate (dst : GPR) (amt : BitVec 8) :
     encode (.shrRI .b64 dst amt) = (encode (.shrRI .b64 dst 0)).take 3 ++ [b8 amt] := by
+  rw [encode_shrRI_bytes dst amt, encode_shrRI_bytes dst 0]
   rfl
 
 /-- Register SHR decodes every raw imm8, preserving an arbitrary suffix. -/
 theorem decode_encode_shrRI (dst : GPR) (amt : BitVec 8) (tail : List UInt8) :
     decode (encode (.shrRI .b64 dst amt) ++ tail) = some (.shrRI .b64 dst amt, tail) := by
+  rw [encode_shrRI_bytes]
   cases dst <;>
-    simp [encode, encInstr, osPrefix, le8, decode, u8ToBv_b8, rexRR,
-      rexByte_bits, modrmExtR, modrmByte, gprHiBit_bits, gprLo3_bits, gprNum, decodeRR, gprOfNum]
+    simp [decode, u8ToBv_b8, rexRR, rexByte_bits, modrmExtR, modrmByte_bits, gprHiBit_bits,
+      gprLo3_bits, gprNum, decodeRR, gprOfNum]
 
 /-! ## 7.  `decode_encode` — the byte round-trip (left inverse). -/
 
 theorem decodeRR_roundtrip (reg rm : GPR) :
     decodeRR (rexRR OSize.b64 reg rm) (modrmRR reg rm) = (reg, rm) := by
-  simp only [decodeRR, rexRR, rexByte_bits, modrmRR, modrmByte, gprLo3_bits, gprHiBit_bits]
+  simp only [decodeRR, rexRR, rexByte_bits, modrmRR, modrmByte_bits, gprLo3_bits, gprHiBit_bits]
   have hreg : gprOfNum (gprNum reg) = reg := gprOfNum_gprNum reg
   have hrm  : gprOfNum (gprNum rm)  = rm  := gprOfNum_gprNum rm
   cases reg <;> cases rm <;>
@@ -722,7 +838,7 @@ theorem execInstrChoice_shrRI_frame (dst : GPR) (amt : BitVec 8)
     (execInstrChoice (.shrRI .b64 dst amt) m undefinedOF).xmms = m.xmms ∧
     (execInstrChoice (.shrRI .b64 dst amt) m undefinedOF).rip = m.rip + 4 := by
   simp only [execInstrChoice]
-  split <;> simp [execInstr, setReg, stepRip, encode, encInstr, osPrefix, le8]
+  split <;> simp [execInstr, setReg, stepRip, encode_shrRI_bytes]
 
 def eventOf : Instr → Event
   | .lockXaddMR _ _ _ _ => .tau
@@ -801,7 +917,7 @@ theorem execInstr_movabsRI_frame (dst : GPR) (imm : BitVec 64) (m : MachState) :
 
 @[simp] theorem execInstr_movabsRI_rip (dst : GPR) (imm : BitVec 64) (m : MachState) :
     (execInstr (.movabsRI dst imm) m).rip = m.rip + 10 := by
-  simp [execInstr, stepRip, encode, encInstr, le64, le32]
+  simp [execInstr, stepRip, encode, encInstr, movabsPrefix_bytes, le64, le32]
 
 /-! ## 12.  Sanity facts. -/
 

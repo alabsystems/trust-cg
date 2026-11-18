@@ -702,13 +702,30 @@ int main(void) {
 }
 
 fn record_native_execution(tag: &str, object: &[u8], driver: &str) {
-    // Keep each target's scratch lifetime bounded by the control. The native
-    // gate independently rejects temporary leftovers after a target exits.
-    let evidence_guard = tempfile::Builder::new()
-        .prefix(&format!("cg-closure-evidence-{tag}-"))
-        .tempdir()
-        .unwrap();
-    let evidence = evidence_guard.path();
+    // Ordinary runs discard scratch. An explicit evidence root retains the
+    // actual object and driver for both successful and failed native controls.
+    // This is test output only; the Cargo wrapper withholds this control from
+    // every compiler and restores it only for the executed test binary.
+    let evidence_root =
+        std::env::var_os("TRUST_CG_CLOSURE_EVIDENCE_DIR").map(std::path::PathBuf::from);
+    let prefix = format!("cg-closure-evidence-{tag}-");
+    let mut builder = tempfile::Builder::new();
+    builder.prefix(&prefix);
+    let evidence_guard = match evidence_root.as_deref() {
+        Some(root) => {
+            assert!(root.is_absolute() && root.is_dir());
+            builder.tempdir_in(root)
+        }
+        None => builder.tempdir(),
+    }
+    .unwrap();
+    let evidence = evidence_guard.path().to_owned();
+    let _cleanup = if evidence_root.is_some() {
+        let _ = evidence_guard.keep();
+        None
+    } else {
+        Some(evidence_guard)
+    };
     std::fs::write(evidence.join("module.o"), object).unwrap();
     std::fs::write(evidence.join("driver.c"), driver).unwrap();
     assert_eq!(native::link_run(tag, object, driver), Some(0));
@@ -1030,6 +1047,7 @@ int main(void) {
     }
     return 0;
 }
+
 "#;
     for opt in [OptLevel::O0, OptLevel::O1, OptLevel::O2, OptLevel::O3] {
         let object = native::compile(&module, opt);
@@ -1037,6 +1055,287 @@ int main(void) {
             &format!("zero_capture_stored_frame_{opt:?}"),
             &object,
             driver,
+        );
+    }
+}
+
+/// The environment crosses a real by-pointer callee, then supplies the
+/// indirect call's runtime capture. Its target is source-bound; its payload is
+/// not replaced by the earlier constructor's SSA operands.
+fn borrowed_readback_module(captured: bool, empty_result: i128) -> Module {
+    let mut module = sweep_module("borrowed_nominal_readback");
+    let apparent = module
+        .add_func_type(trust_ir::FuncTy {
+            params: vec![],
+            returns: vec![Ty::U64],
+            abi: None,
+            is_vararg: false,
+        })
+        .unwrap();
+    let nominal = trust_ir::ClosureTyId::new(0);
+    let captures = if captured { vec![Ty::U64] } else { vec![] };
+    module.closure_types.push(ClosureTy {
+        func: apparent,
+        captures: captures.clone(),
+    });
+    module.closure_layouts.push(ClosureLayoutDescriptor {
+        origin: None,
+        closure: nominal,
+        size: if captured { 8 } else { 0 },
+        align: if captured { 8 } else { 1 },
+        capture_offsets: if captured { vec![0] } else { vec![] },
+    });
+    let mut body = Body::new();
+    let returned = if captured {
+        body.param(Ty::U64)
+    } else {
+        constant(&mut body, empty_result)
+    };
+    body.effect(Inst::Return {
+        values: vec![returned],
+    });
+    let target = define(
+        &mut module,
+        "borrowed_target",
+        captures.clone(),
+        vec![Ty::U64],
+        body,
+    );
+    module.functions[target.as_usize()].linkage = trust_ir::Linkage::Internal;
+
+    let mut body = Body::new();
+    let pointer = body.param(Ty::Ptr);
+    let returned = body.emit(Inst::Load {
+        ty: Ty::Closure(nominal),
+        ptr: pointer,
+        volatile: false,
+        align: None,
+    });
+    body.effect(Inst::Return {
+        values: vec![returned],
+    });
+    let borrower = define(
+        &mut module,
+        "borrowed_load",
+        vec![Ty::Ptr],
+        vec![Ty::Closure(nominal)],
+        body,
+    );
+    module.functions[borrower.as_usize()].linkage = trust_ir::Linkage::Internal;
+
+    let mut body = Body::new();
+    let values = if captured {
+        vec![body.param(Ty::U64)]
+    } else {
+        vec![]
+    };
+    let closure = body.emit(Inst::MakeClosure {
+        ty: nominal,
+        func: target,
+        captures: values,
+    });
+    let slot = body.emit(Inst::Alloca {
+        ty: Ty::Closure(nominal),
+        count: None,
+        align: None,
+    });
+    body.effect(Inst::Store {
+        ty: Ty::Closure(nominal),
+        ptr: slot,
+        value: closure,
+        volatile: false,
+        align: None,
+    });
+    let readback = body.emit(Inst::Call {
+        callee: borrower,
+        args: vec![slot],
+    });
+    let result = body.emit(Inst::CallIndirect {
+        callee: readback,
+        sig: apparent,
+        args: vec![],
+        calling_conv: CallingConv::C,
+    });
+    body.effect(Inst::Return {
+        values: vec![result],
+    });
+    define(&mut module, "borrowed_entry", captures, vec![Ty::U64], body);
+    module
+}
+
+#[test]
+fn borrowed_nominal_readback_executes_actual_empty_and_runtime_capture_values() {
+    for captured in [false, true] {
+        for empty_result in [37, 42] {
+            let module = borrowed_readback_module(captured, empty_result);
+            assert!(trust_ir_build::validate_module(&module).is_empty());
+            for value in [37, 42, 0x1122334455667788] {
+                let args = if captured {
+                    vec![InterpretValue::int(Ty::U64, value).unwrap()]
+                } else {
+                    vec![]
+                };
+                let outcome = Interpreter::with_module(&module)
+                    .execute_function(module.function_by_name("borrowed_entry").unwrap(), args)
+                    .unwrap();
+                assert_eq!(outcome.host_calls, 0);
+                assert_eq!(
+                    outcome.returns[0].as_int().unwrap().as_signed(),
+                    if captured { value } else { empty_result }
+                );
+            }
+            let driver = if captured {
+                "#include <stdint.h>\nextern uint64_t borrowed_entry(uint64_t);\nint main(void) { const uint64_t v[]={37,42,0x1122334455667788ULL}; for(unsigned i=0;i<3;i++) if(borrowed_entry(v[i])!=v[i]) return 1; return 0; }\n".to_owned()
+            } else {
+                format!(
+                    "#include <stdint.h>\nextern uint64_t borrowed_entry(void);\nint main(void) {{ return borrowed_entry()!={empty_result}; }}\n"
+                )
+            };
+            for opt in [OptLevel::O0, OptLevel::O2] {
+                let object = native::compile(&module, opt);
+                record_native_execution(
+                    &format!("borrowed_nominal_{captured}_{empty_result}_{opt:?}"),
+                    &object,
+                    &driver,
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn borrowed_nominal_readback_keeps_actual_pointer_capture_and_pointee_bytes() {
+    let mut module = borrowed_readback_module(true, 0);
+    module.closure_types[0].captures[0] = Ty::Ptr;
+    let signature = module
+        .add_func_type(trust_ir::FuncTy {
+            params: vec![Ty::Ptr],
+            returns: vec![Ty::U64],
+            abi: None,
+            is_vararg: false,
+        })
+        .unwrap();
+    for name in ["borrowed_entry", "borrowed_target"] {
+        let id = module.function_by_name(name).unwrap().id;
+        module.functions[id.as_usize()].ty = signature;
+        module.functions[id.as_usize()].blocks[0].params[0].1 = Ty::Ptr;
+    }
+    let target = module.function_by_name("borrowed_target").unwrap().id;
+    module.functions[target.as_usize()].blocks[0].body = vec![
+        trust_ir::InstrNode::new(Inst::Load {
+            ty: Ty::U64,
+            ptr: ValueId::new(0),
+            volatile: false,
+            align: Some(8),
+        })
+        .with_result(ValueId::new(1)),
+        trust_ir::InstrNode::new(Inst::Return {
+            values: vec![ValueId::new(1)],
+        }),
+    ];
+    assert!(trust_ir_build::validate_module(&module).is_empty());
+    let driver = r#"
+#include <stdint.h>
+extern uint64_t borrowed_entry(const uint64_t *);
+int main(void) {
+    uint64_t first=37, other=42;
+    const uint64_t *alias=&first;
+    if (borrowed_entry(alias)!=37 || first!=37 || other!=42) return 1;
+    first=42;
+    if (borrowed_entry(alias)!=42 || first!=42 || other!=42) return 2;
+    if (borrowed_entry(&other)!=42 || first!=42 || other!=42) return 3;
+    return 0;
+}
+"#;
+    for opt in [OptLevel::O0, OptLevel::O2] {
+        let object = native::compile(&module, opt);
+        record_native_execution(
+            &format!("borrowed_nominal_pointer_{opt:?}"),
+            &object,
+            driver,
+        );
+    }
+}
+
+#[test]
+fn borrowed_nominal_readback_refuses_imported_values_writers_and_other_memory_origins() {
+    let nominal = trust_ir::ClosureTyId::new(0);
+    for mutant in 0..6 {
+        let mut module = borrowed_readback_module(true, 0);
+        match mutant {
+            0 | 1 => {
+                let function = module
+                    .function_by_name(if mutant == 0 {
+                        "borrowed_load"
+                    } else {
+                        "borrowed_target"
+                    })
+                    .unwrap()
+                    .id;
+                module.functions[function.as_usize()].linkage = trust_ir::Linkage::External;
+            }
+            2 => {
+                let borrower = module.function_by_name("borrowed_load").unwrap().id;
+                let body = &mut module.functions[borrower.as_usize()].blocks[0].body;
+                body.insert(
+                    1,
+                    trust_ir::InstrNode::new(Inst::Store {
+                        ty: Ty::Closure(nominal),
+                        ptr: ValueId::new(0),
+                        value: ValueId::new(1),
+                        volatile: false,
+                        align: None,
+                    }),
+                );
+            }
+            3 => {
+                let signature = module
+                    .add_func_type(trust_ir::FuncTy {
+                        params: vec![Ty::U64, Ty::Closure(nominal)],
+                        returns: vec![Ty::U64],
+                        abi: None,
+                        is_vararg: false,
+                    })
+                    .unwrap();
+                let entry = module.function_by_name("borrowed_entry").unwrap().id;
+                let function = &mut module.functions[entry.as_usize()];
+                function.ty = signature;
+                function.blocks[0]
+                    .params
+                    .push((ValueId::new(9), Ty::Closure(nominal)));
+                if let Inst::Store { value, .. } = &mut function.blocks[0].body[2].inst {
+                    *value = ValueId::new(9);
+                }
+            }
+            4 => {
+                let entry = module.function_by_name("borrowed_entry").unwrap().id;
+                let body = &mut module.functions[entry.as_usize()].blocks[0].body;
+                body.insert(
+                    2,
+                    trust_ir::InstrNode::new(Inst::Alloca {
+                        ty: Ty::Closure(nominal),
+                        count: None,
+                        align: None,
+                    })
+                    .with_result(ValueId::new(9)),
+                );
+                if let Inst::Call { args, .. } = &mut body[4].inst {
+                    args[0] = ValueId::new(9);
+                }
+            }
+            5 => {
+                let entry = module.function_by_name("borrowed_entry").unwrap().id;
+                module.functions[entry.as_usize()].blocks[0].body.remove(2);
+            }
+            _ => unreachable!(),
+        }
+        assert!(
+            trust_ir_build::validate_module(&module).is_empty(),
+            "mutant {mutant}"
+        );
+        assert!(
+            native::try_compile(&module, OptLevel::O0).is_err(),
+            "mutant {mutant} must not acquire a borrowed target identity"
         );
     }
 }

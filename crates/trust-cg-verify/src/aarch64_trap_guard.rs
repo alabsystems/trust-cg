@@ -125,12 +125,12 @@
 //! A stamp alone accounts for nothing: the stack-limit trap, the `BRK` after a
 //! noreturn call, a degraded bare trap, a refuted, displaced or mismatched
 //! window, a stamped instruction that is not a trap, and a trap outside the
-//! executed code account for no source trap. The one exemption is a
-//! `GuardDivZero` whose divisor the LIR defines as an `Iconst` that is nonzero
-//! at its width, which instruction selection elides because it can never
-//! trap. Any other source trap left unaccounted was removed by a pass whose
-//! evidence this verifier does not check, dropped, moved out of the executed
-//! code, or carried only by a row that does not implement it: refused. The
+//! executed code account for no source trap. Two omission checks cover
+//! a `GuardDivZero` with a constant-nonzero divisor at its LIR width and
+//! a plain `Trap` on a contradictory retest of the nonzero switch edge.
+//! The latter requires an unchanged typed source value, the omitted block
+//! absent from the final layout, and live machine guards at the remainder
+//! entrances. Any other unaccounted source trap refuses the function. The
 //! function verifier reports either finding as a function precondition
 //! failure (`TrapGuardAccounting`), so the function cannot be promoted, and
 //! keeps the instruction rows.
@@ -1862,6 +1862,7 @@ fn recorded_carriers(func: &MachFunction) -> impl Iterator<Item = (InstId, &Mach
 struct WindowContext<'a> {
     func: &'a MachFunction,
     lir: Option<&'a LirSourceIndex>,
+    retained_source: Option<&'a trust_cg_lower::Function>,
     config: &'a VerificationConfig,
     /// The first instruction of every recorded window: no window's scan may
     /// run into another's.
@@ -1890,6 +1891,7 @@ impl<'a> WindowContext<'a> {
     fn new(
         func: &'a MachFunction,
         lir: Option<&'a LirSourceIndex>,
+        retained_source: Option<&'a trust_cg_lower::Function>,
         config: &'a VerificationConfig,
     ) -> Self {
         let mut block_word = HashMap::new();
@@ -1938,6 +1940,7 @@ impl<'a> WindowContext<'a> {
         Self {
             func,
             lir,
+            retained_source,
             config,
             starts: recorded_carriers(func).map(|(id, _)| id).collect(),
             block_word,
@@ -2367,10 +2370,9 @@ fn classify_unrecorded(
 /// where its placement is exact: the source `Trap` closes the LIR entry
 /// block, and the `BRK` closes the machine entry block with no control
 /// transfer before it, so both trap exactly when the function runs its entry
-/// block to the end. Anywhere else the branches that reach it decide when it
-/// runs, and this module does not check their polarity against the source's
-/// (an inverted branch or a trap swapped onto another path would still bind
-/// here), so the row is refused.
+/// block to the end. A counted-loop terminal can also expose checked local
+/// premises for a later source-bound proof. Its row still needs
+/// correspondence of header visits and of the normal call continuation.
 fn classify_source_trap(
     ctx: &WindowContext<'_>,
     block: usize,
@@ -2412,6 +2414,12 @@ fn classify_source_trap(
              the A64 decode-check)"
                 .to_string(),
         )
+    } else if let Some(reason) = ctx
+        .retained_source
+        .filter(|_| ctx.config.replays_source_bound_obligations())
+        .and_then(|lir| crate::aarch64_terminal_trap::describe(lir, func, insts[pos], source))
+    {
+        refused(reason)
     } else {
         refused(
             "BRK is the source `Trap` terminator its TV-1 stamp names and executes, but it is \
@@ -2479,6 +2487,7 @@ impl TrapAnalysis {
 pub(crate) fn analyze(
     func: &MachFunction,
     lir: Option<&LirSourceIndex>,
+    retained_source: Option<&trust_cg_lower::Function>,
     config: &VerificationConfig,
 ) -> TrapAnalysis {
     let mut rows = HashMap::new();
@@ -2497,7 +2506,7 @@ pub(crate) fn analyze(
         .iter()
         .flat_map(|record| record.insts.iter().copied())
         .collect();
-    let ctx = WindowContext::new(func, lir, config);
+    let ctx = WindowContext::new(func, lir, retained_source, config);
     for (id0, carrier) in recorded_carriers(func) {
         // A record whose window is in no block has no row to carry its
         // missing trap: [`account`] fails the function for it.
@@ -2547,7 +2556,7 @@ pub(crate) fn analyze(
     }
     TrapAnalysis {
         rows,
-        accounting: accounting(func, lir, &position, &accounted),
+        accounting: accounting(func, lir, retained_source, &position, &accounted),
     }
 }
 
@@ -2651,19 +2660,21 @@ pub fn account(
     lir: Option<&LirSourceIndex>,
     config: &VerificationConfig,
 ) -> Result<(), TrapGuardAccountingFailure> {
-    analyze(func, lir, config).accounting()
+    analyze(func, lir, None, config).accounting()
 }
 
 /// Every recorded expansion's first instruction is in a block of the
 /// function, and, with the replayed LIR, every source guard, `Assert` and
-/// `Trap` (but an exempt constant-divisor guard) is in `accounted`: an
-/// executing trap row whose judgement read its stamp and implements it
-/// accounted for it. A stamp alone accounts for nothing: neither the
+/// `Trap` must have an executing carrier or an exact omission proof. The
+/// latter covers constant-nonzero division guards and one retained-source
+/// contradictory branch shape with independently checked machine guards.
+/// A stamp alone accounts for nothing: neither the
 /// stack-limit trap, nor the `BRK` after a noreturn call, nor any row that
 /// does not implement the source trap it names.
 fn accounting(
     func: &MachFunction,
     lir: Option<&LirSourceIndex>,
+    retained_source: Option<&trust_cg_lower::Function>,
     position: &HashMap<InstId, (usize, usize)>,
     accounted: &HashSet<SourceInstId>,
 ) -> Result<(), TrapGuardAccountingFailure> {
@@ -2682,6 +2693,10 @@ fn accounting(
             if !needs_emitted_trap(&source.opcode)
                 || accounted.contains(&id)
                 || statically_untrapping_div_zero(index, source)
+                || (matches!(source.opcode, LirOpcode::Trap)
+                    && retained_source.is_some_and(|lir| {
+                        crate::aarch64_omitted_trap::allows_omission(lir, func, id)
+                    }))
             {
                 continue;
             }
@@ -3140,7 +3155,7 @@ pub fn trap_guard_credit_with(
         let func = catalog_function(&shape.carrier, &shape.window);
         let id0 = func.blocks[0].insts[0];
         let judgement = judge_window(
-            &WindowContext::new(&func, None, config),
+            &WindowContext::new(&func, None, None, config),
             0,
             0,
             id0,
@@ -3168,7 +3183,13 @@ pub fn trap_guard_credit_with(
             .ok_or_else(|| format!("control for unknown shape `{}`", control.shape))?;
         let func = catalog_function(carrier, &control.window);
         let id0 = func.blocks[0].insts[0];
-        let judgement = judge_window(&WindowContext::new(&func, None, config), 0, 0, id0, carrier);
+        let judgement = judge_window(
+            &WindowContext::new(&func, None, None, config),
+            0,
+            0,
+            id0,
+            carrier,
+        );
         match &judgement.check {
             WindowCheck::Refuted(_) | WindowCheck::Missing(_) => controls_refuted += 1,
             other => {

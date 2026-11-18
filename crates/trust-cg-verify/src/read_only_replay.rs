@@ -27,11 +27,21 @@ mod result;
 
 #[path = "scalar_memory_replay.rs"]
 mod scalar_memory;
+#[cfg(feature = "source-defined-call")]
+pub use crate::void_memory_observation::{ReplayedVoidWordMemoryClaim, VoidWordMemoryClaim};
+#[cfg(feature = "source-defined-call")]
+pub use crate::word_status_observation::{
+    FourWordStatusClaim, FourWordStatusReplayRefusal, ReplayedFourWordStatusClaim,
+};
+#[cfg(feature = "source-defined-call")]
+pub use scalar_memory::{ReplayedVoidMemoryCompilation, ReplayedWordStatusCompilation};
 pub use scalar_memory::{
     ScalarMemoryCompilerRelations, ScalarMemoryRelationId, ScalarMemoryRelationKind,
     ScalarMemoryRelationStage, ScalarMemoryReplayCertificate, ScalarMemoryReplayOutcome,
     ScalarMemoryReplayPart, ScalarMemoryReplayRefusal, ScalarMemoryReplayReport,
-    ScalarMemoryReplayTransport,
+    ScalarMemoryReplayTransport, VoidMemoryCompilerRelations, VoidMemoryRelationKind,
+    VoidMemoryReplayCertificate, VoidMemoryReplayOutcome, VoidMemoryReplayPart,
+    VoidMemoryReplayReport,
 };
 
 #[path = "scalar_return_replay.rs"]

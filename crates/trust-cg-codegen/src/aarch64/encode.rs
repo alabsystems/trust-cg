@@ -12,6 +12,7 @@
 //! Design: the encoder takes an `IrMachInst` (post-regalloc, physical registers
 //! only) and returns a 32-bit encoded instruction word.
 
+use trust_cg_ir::CondCode;
 use trust_cg_ir::inst::{AArch64Opcode, MachInst};
 use trust_cg_ir::operand::MachOperand;
 use trust_cg_ir::regs::{RegClass, SP, SpecialReg, WSP, WZR, XZR, preg_class};
@@ -22,6 +23,9 @@ use super::encoding_mem;
 use super::encoding_neon;
 
 use thiserror::Error;
+
+#[path = "../../../../formal/lean/Trust/A64/LogicalImmBits.lean"]
+clean mod logical_imm_bits;
 
 /// AArch64 NOP encoding (used as fallback for pseudos).
 const NOP: u32 = 0xD503201F;
@@ -548,18 +552,22 @@ fn conditional_select_fields(inst: &MachInst, set_alias: bool) -> Result<(u32, u
             });
         }
     }
-    let maximum = if set_alias { 13 } else { 15 };
-    let cond = match inst.operands[registers] {
-        MachOperand::Imm(value) if (0..=maximum).contains(&value) => value as u32,
-        ref other => {
-            return Err(EncodeError::InvalidOperand {
-                opcode: inst.opcode,
-                index: registers,
-                desc: format!("condition must be an immediate in 0..={maximum}, got {other:?}"),
-            });
-        }
+    let operand = &inst.operands[registers];
+    let condition = operand.as_imm().and_then(CondCode::from_encoding);
+    let encoded = if set_alias {
+        condition.and_then(CondCode::logical_complement)
+    } else {
+        condition
     };
-    Ok((u32::from(width == 64), cond))
+    let encoded = encoded.ok_or_else(|| {
+        let maximum = if set_alias { 13 } else { 15 };
+        EncodeError::InvalidOperand {
+            opcode: inst.opcode,
+            index: registers,
+            desc: format!("condition must be an immediate in 0..={maximum}, got {operand:?}"),
+        }
+    })?;
+    Ok((u32::from(width == 64), u32::from(encoded.encoding())))
 }
 
 /// Scalar integer/FP conversions derive sf from the integer operand, which is
@@ -996,33 +1004,38 @@ fn imm12_operand(inst: &MachInst, idx: usize) -> Result<u32, EncodeError> {
     Ok(imm as u32)
 }
 
-fn low_mask(bits: u32) -> u64 {
-    if bits == 64 {
-        u64::MAX
-    } else {
-        (1u64 << bits) - 1
+// The entry for exponent 64 is zero in the wrapping UInt64 carrier.
+const LOGICAL_IMM_POWERS: [u64; 65] = {
+    let mut powers = [0; 65];
+    let mut exponent = 0;
+    while exponent < powers.len() {
+        let lo =
+            trust_cg_a64_logical_imm_pow_lo(trust_cg_a64_logical_imm_pow_index(exponent as u64));
+        let hi =
+            trust_cg_a64_logical_imm_pow_hi(trust_cg_a64_logical_imm_pow_group(exponent as u64));
+        powers[exponent] = trust_cg_a64_logical_imm_mul(lo, hi);
+        exponent += 1;
     }
+    powers
+};
+
+const fn logical_imm_elements<const N: usize>(register_width: u32) -> [(u32, u64, u64); N] {
+    let mut elements = [(0, 0, 0); N];
+    let mut index = 0;
+    while index < N {
+        let width = 2 << index;
+        elements[index] = (
+            width,
+            trust_cg_a64_logical_imm_mask(LOGICAL_IMM_POWERS[width as usize]),
+            trust_cg_a64_logical_imm_repeat_factor(register_width as u64, width as u64),
+        );
+        index += 1;
+    }
+    elements
 }
 
-fn rotate_right_within(value: u64, rot: u32, width: u32) -> u64 {
-    let mask = low_mask(width);
-    let value = value & mask;
-    if rot == 0 {
-        value
-    } else {
-        ((value >> rot) | (value << (width - rot))) & mask
-    }
-}
-
-fn replicate_logical_element(pattern: u64, element_width: u32, register_width: u32) -> u64 {
-    let mut out = 0;
-    let mut shift = 0;
-    while shift < register_width {
-        out |= pattern << shift;
-        shift += element_width;
-    }
-    out & low_mask(register_width)
-}
+const W_LOGICAL_IMM_ELEMENTS: [(u32, u64, u64); 5] = logical_imm_elements(32);
+const X_LOGICAL_IMM_ELEMENTS: [(u32, u64, u64); 6] = logical_imm_elements(64);
 
 fn encode_logical_imm_fields(
     raw: i64,
@@ -1030,35 +1043,41 @@ fn encode_logical_imm_fields(
     opcode: AArch64Opcode,
     index: usize,
 ) -> Result<(u32, u32, u32), EncodeError> {
-    let register_mask = low_mask(register_width);
-    let raw_mask = (raw as u64) & register_mask;
-    if raw_mask == 0 || raw_mask == register_mask {
-        return Err(EncodeError::InvalidOperand {
-            opcode,
-            index,
-            desc: format!("logical immediate {raw:#x} is not encodable"),
-        });
-    }
-
-    let element_widths: &[u32] = if register_width == 64 {
-        &[2, 4, 8, 16, 32, 64]
+    let elements: &[(u32, u64, u64)] = if register_width == 64 {
+        &X_LOGICAL_IMM_ELEMENTS
     } else {
-        &[2, 4, 8, 16, 32]
+        &W_LOGICAL_IMM_ELEMENTS
     };
+    let register_mask = trust_cg_a64_logical_imm_mask(LOGICAL_IMM_POWERS[register_width as usize]);
+    let raw_mask = trust_cg_a64_logical_imm_extract(raw as u64, register_mask);
 
-    for &element_width in element_widths {
-        for ones_len in 1..element_width {
-            let ones = low_mask(ones_len);
-            for rotation in 0..element_width {
-                let element = rotate_right_within(ones, rotation, element_width);
-                let candidate = replicate_logical_element(element, element_width, register_width);
-                if candidate == raw_mask {
-                    let n = u32::from(element_width == 64);
-                    let immr = rotation & 0x3f;
-                    let imms_prefix = (!((element_width << 1) - 1)) & 0x3f;
-                    let imms = imms_prefix | (ones_len - 1);
-                    return Ok((n, immr, imms));
-                }
+    if raw_mask != 0 && raw_mask != register_mask {
+        for &(element_width, element_mask, repeat_factor) in elements {
+            let element = trust_cg_a64_logical_imm_extract(raw_mask, element_mask);
+            if trust_cg_a64_logical_imm_mul(element, repeat_factor) != raw_mask {
+                continue;
+            }
+
+            // A circular run has one set bit with an unset predecessor.
+            // Its position and population give the only rotation and run length.
+            let predecessors = (element << 1) | (element >> (element_width - 1));
+            let starts = element & !predecessors;
+            if !starts.is_power_of_two() {
+                continue;
+            }
+            let rotation = (element_width - starts.trailing_zeros()) & (element_width - 1);
+            let ones_len = element.count_ones();
+            let wrap =
+                trust_cg_a64_logical_imm_wrap_count(u64::from(ones_len), u64::from(rotation));
+            let candidate = trust_cg_a64_logical_imm_rotate(
+                LOGICAL_IMM_POWERS[ones_len as usize - wrap as usize],
+                LOGICAL_IMM_POWERS[wrap as usize],
+                LOGICAL_IMM_POWERS[(element_width - rotation) as usize],
+            );
+            if candidate == element {
+                let n = trust_cg_a64_logical_imm_n(element_width);
+                let imms = trust_cg_a64_logical_imm_imms(element_width, n, ones_len);
+                return Ok((n, rotation, imms));
             }
         }
     }
@@ -1093,14 +1112,9 @@ fn encode_logical_immediate(inst: &MachInst, opc: u32) -> Result<u32, EncodeErro
     let rd = preg_hw(inst, 0)?;
     let rn = preg_hw(inst, 1)?;
     let (n, immr, imms) = logical_imm_operands(inst, sf)?;
-    Ok((sf << 31)
-        | (opc << 29)
-        | (0b100100 << 23)
-        | (n << 22)
-        | (immr << 16)
-        | (imms << 10)
-        | (rn << 5)
-        | rd)
+    Ok(trust_cg_a64_logical_imm_word(
+        sf, opc, n, immr, imms, rn, rd,
+    ))
 }
 
 /// Extract base register hw encoding and offset from a load/store instruction.
@@ -3016,10 +3030,8 @@ aarch64_encoder_families! {
         //   TST Rn, #imm = ANDS XZR, Rn, #imm   (logical immediate, opc=11)
         //   TST Rn, Rm   = ANDS XZR, Rn, Rm     (shifted register, opc=11)
         //
-        // Both write NZCV and discard the result, so Rd is always XZR (31). Note
-        // this is NOT `encode_logical_immediate`: that helper takes Rd at operand
-        // 0 and Rn at operand 1, whereas TST has no destination operand at all —
-        // operand 0 IS Rn.
+        // TST reads Rn at operand 0. Both forms write NZCV and put 31 in
+        // the destination field to discard the result.
         AArch64Opcode::Tst => {
             if inst.operands.len() != 2 {
                 return if inst.operands.len() < 2 {
@@ -3050,14 +3062,9 @@ aarch64_encoder_families! {
                     // rather than a silently different instruction.
                     let (n, immr, imms) =
                         encode_logical_imm_fields(raw, register_width, inst.opcode, 1)?;
-                    Ok((sf << 31)
-                        | (0b11 << 29)
-                        | (0b100100 << 23)
-                        | (n << 22)
-                        | (immr << 16)
-                        | (imms << 10)
-                        | (preg_hw(inst, 0)? << 5)
-                        | 31)
+                    Ok(trust_cg_a64_logical_imm_word(
+                        sf, 0b11, n, immr, imms, preg_hw(inst, 0)?, 31,
+                    ))
                 }
                 _ => {
                     let rm_width = non_sp_gpr_width(inst, 1)?;
@@ -3101,10 +3108,8 @@ aarch64_encoder_families! {
         // ARM ARM C6.2.70: sf | 0 | 0 | 11010100 | Rm(=XZR) | inv_cond | 0 | 1 | Rn(=XZR) | Rd
         // Operands: [PReg(Rd), Imm(cond_encoding)]
         AArch64Opcode::CSet => {
-            let (sf, cond) = conditional_select_fields(inst, true)?;
+            let (sf, inv_cond) = conditional_select_fields(inst, true)?;
             let rd = preg_hw(inst, 0)?;
-            // Invert condition code: flip bit 0 (ARM ARM C6.2.70)
-            let inv_cond = cond ^ 1;
             let rn = 31u32; // XZR/WZR
             let rm = 31u32; // XZR/WZR
             Ok((sf << 31)

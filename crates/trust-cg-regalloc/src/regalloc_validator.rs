@@ -1889,7 +1889,7 @@ fn check_slot_init_dominance(post: &MachFunction, report: &mut ValidationReport)
 
 /// The symbolic register/slot file at one program point. Absent key = lattice
 /// `Top`; a present [`Sym`] is `Defined(v)` or `Conflict(set)`.
-type LocState = BTreeMap<Location, Sym>;
+type LocState = crate::sorted_map::SortedVecMap<Location, Sym>;
 
 /// Walk every block of the post-alloc code in program order, threading a
 /// per-block entry state derived from predecessors. Records value-flow
@@ -3593,25 +3593,12 @@ fn post_live_out_locations(
 /// * `meet(Conflict(S), x)    = Conflict(S ∪ ids(x))` — bottom is absorbing but the
 ///   set grows monotonically, preserving termination over the finite id universe.
 fn intersect_agreement(a: &LocState, b: &LocState) -> LocState {
-    let mut out = LocState::new();
-    // Iterate the union of keys; a key absent in one side is Top there.
-    for (loc, va) in a {
-        match b.get(loc) {
-            // Present in both: information-meet of the two lattice elements.
-            Some(vb) => {
-                out.insert(*loc, va.meet(vb));
-            }
-            // Top in `b`: meet(va, Top) = va.
-            None => {
-                out.insert(*loc, va.clone());
-            }
-        }
-    }
-    // Locations present only in `b` are Top in `a`: meet(Top, vb) = vb.
-    for (loc, vb) in b {
-        out.entry(*loc).or_insert_with(|| vb.clone());
-    }
-    out
+    // The union of keys; a key absent in one side is Top there. Present in
+    // both: information-meet of the two lattice elements; Top in `b`:
+    // meet(va, Top) = va; present only in `b` (Top in `a`): meet(Top, vb) = vb.
+    // One merge of the two ascending key sequences (`union_with` states its
+    // equality with the per-key insert/`or_insert_with` construction).
+    LocState::union_with(a, b, Sym::meet)
 }
 
 /// Whether `pre` contains any phi instruction. The value-flow property (a) is an
@@ -3634,7 +3621,7 @@ fn pre_has_phis(pre: &MachFunction) -> bool {
 /// every vreg IS its own home, so `pre_state[v]` is the [`Sym`] the SPEC's
 /// value-flow currently assigns to `v` (`Defined(w)` = "v holds w's value here",
 /// `Conflict(set)` = paths disagree over `set`, absent = TOP).
-type PreState = BTreeMap<VReg, Sym>;
+type PreState = crate::sorted_map::SortedVecMap<VReg, Sym>;
 
 /// The expected (spec) symbolic value at each ORIGINAL use, keyed by the use's
 /// (instruction, vreg). This is the value-flow IDENTITY the POST allocation must
@@ -3728,7 +3715,7 @@ fn pre_meet_preds(
             }
         }
         for (v, vb) in *s {
-            out.entry(*v).or_insert_with(|| vb.clone());
+            out.get_or_insert_with(*v, || vb.clone());
         }
         result = out;
     }
@@ -3777,21 +3764,9 @@ fn pre_block_entry_state(
 fn pre_meet_owned(known: &[&PreState]) -> PreState {
     let mut result: PreState = known[0].clone();
     for s in &known[1..] {
-        let mut out = PreState::new();
-        for (v, va) in &result {
-            match s.get(v) {
-                Some(vb) => {
-                    out.insert(*v, va.meet(vb));
-                }
-                None => {
-                    out.insert(*v, va.clone());
-                }
-            }
-        }
-        for (v, vb) in *s {
-            out.entry(*v).or_insert_with(|| vb.clone());
-        }
-        result = out;
+        // The same union-with-pointwise-meet as [`pre_meet_preds`], as one
+        // merge of the two ascending key sequences (see `union_with`).
+        result = PreState::union_with(&result, s, Sym::meet);
     }
     result
 }

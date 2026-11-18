@@ -287,3 +287,116 @@ fn cert_store_process_complete_mint_and_replay_accept_the_exact_binding() {
         bytes
     );
 }
+
+/// A reader in a process of its own: it opens the certificate at `$1`, says
+/// so with `$2.ready`, waits (a minute at most) for `$2.go`, then copies what
+/// its open file holds to `$2.out`.
+const HELD_READER: &str = r#"exec 3< "$1" || exit 3
+: > "$2.ready"
+waited=0
+while test ! -f "$2.go"; do
+  waited=$((waited + 1))
+  test "$waited" -le 6000 || exit 4
+  sleep 0.01
+done
+cat <&3 > "$2.out""#;
+
+#[test]
+fn cert_store_eviction_beside_a_reader_costs_a_miss_only() {
+    use super::tests::{EVICTION_OBLIGATION, EVICTION_PROOF, eviction_query, stored_for_eviction};
+    let dir = tempfile::tempdir().unwrap();
+    let store = dir.path().join("store");
+    let solver = dir.path().join("solver");
+    std::fs::write(&solver, b"eviction-fixture-solver").unwrap();
+    let solver = solver.to_str().unwrap();
+    let identity = crate::ay_bridge::solver_identity_hash(solver).unwrap();
+    let checker = script(dir.path(), "clean", &success());
+    let checker_identity = crate::lrat_cert::checker_binary_sha256(&checker).unwrap();
+    let binding = Some((checker, checker_identity.clone()));
+    let keys: Vec<String> = (0..3)
+        .map(|index| {
+            stored_for_eviction(
+                &store,
+                &identity,
+                &checker_identity,
+                &eviction_query(index),
+                10 - index as u64,
+            )
+        })
+        .collect();
+    let held = cert_path(&store, &keys[0]);
+    let original = std::fs::read(&held).unwrap();
+    let signal = dir.path().join("reader");
+    let mut reader = Command::new("/bin/sh")
+        .arg("-c")
+        .arg(HELD_READER)
+        .arg("reader")
+        .arg(&held)
+        .arg(&signal)
+        .spawn()
+        .unwrap();
+    let ready = signal.with_extension("ready");
+    let start = Instant::now();
+    while !ready.exists() {
+        if let Some(status) = reader.try_wait().unwrap() {
+            panic!("the reader ended before it opened the certificate: {status}");
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(60),
+            "the reader did not open the certificate in a minute"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    // The certificate the other process holds open is the least recently
+    // used: a fourth published over a cap of three evicts it.
+    let size = original.len() as u64;
+    let cap = (3 * size).to_string();
+    let publish = |index: usize| {
+        persist_verified_alethe_into(
+            &store,
+            solver,
+            &eviction_query(index),
+            EVICTION_OBLIGATION,
+            EVICTION_PROOF,
+            &checker_identity,
+        )
+    };
+    assert!(trust_cg_process_env::with_env_overrides(
+        &[(STORE_CAP_ENV, &cap)],
+        || publish(3)
+    ));
+    wait_for_sweep_for_test(&store);
+    assert!(!held.exists(), "the held certificate was evicted");
+    std::fs::write(signal.with_extension("go"), "").unwrap();
+    assert!(reader.wait().unwrap().success());
+    // The reader still read every byte it opened, and its hit stands on the
+    // same re-check.
+    let read = std::fs::read(signal.with_extension("out")).unwrap();
+    assert_eq!(read, original);
+    assert!(consume_verified_text(
+        &String::from_utf8(read).unwrap(),
+        &keys[0],
+        solver,
+        &eviction_query(0),
+        binding.clone(),
+        &SanitizedChildEnv::capture_verifier(),
+        0
+    ));
+    // A reader after the eviction misses; the miss is solved, published
+    // again and credited at its next read.
+    assert!(!consume_verified_in(
+        &store,
+        &keys[0],
+        solver,
+        &eviction_query(0),
+        binding.clone()
+    ));
+    assert!(publish(0));
+    assert!(consume_verified_in(
+        &store,
+        &keys[0],
+        solver,
+        &eviction_query(0),
+        binding
+    ));
+}

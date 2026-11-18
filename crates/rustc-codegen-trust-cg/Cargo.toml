@@ -53,7 +53,7 @@ trust-cg-verify = { path = "../trust-cg-verify", default-features = false }
 # Trust Codegen workspace. The git source + features mirror the root workspace's
 # `workspace.dependencies.trust-ir` so feature unification with the
 # trust-cg-codegen/trust-cg-lower path deps stays consistent.
-trust-ir = { git = "https://github.com/alabsystems/trust-ir.git", rev = "8bae728257b123d6394b2dc049b3573ad885049f", features = ["serde", "parser", "binary", "dialect-verif-example", "clean-expr"] }
+trust-ir = { git = "https://github.com/alabsystems/trust-ir.git", rev = "899d46e7a303fad2b706a88a7a8eda41ec47dcfe", features = ["serde", "parser", "binary", "dialect-verif-example", "clean-expr"] }
 
 [dev-dependencies]
 # Test-only: construct every `CompileError` / `PipelineError` payload so each
@@ -69,12 +69,12 @@ trust-cg-opt = { path = "../trust-cg-opt" }
 # `ay --incremental` server discards stderr, where AY publishes its decisive
 # `(:reason-unknown …)` diagnostics, so through it a certification gap
 # truncates to a bare `unknown` that no guard may exempt.
-trust-cg-process-env = { path = "../trust-cg-process-env" }
+trust-cg-process-env = { path = "../trust-cg-process-env", features = ["trust-child-resources"] }
 # Test-only: the WS7.3-pre regression (`tests/mir_lane_valid_trust_ir.rs`)
 # holds the MIR lane's emitted modules to trust-ir's own validator. Same rev
 # and features as the root workspace's pin, and already in this crate's graph
 # through trust-cg-codegen / trust-cg-lower, so no new package is built.
-trust-ir-build = { git = "https://github.com/alabsystems/trust-ir.git", rev = "8bae728257b123d6394b2dc049b3573ad885049f", features = ["binary"] }
+trust-ir-build = { git = "https://github.com/alabsystems/trust-ir.git", rev = "899d46e7a303fad2b706a88a7a8eda41ec47dcfe", features = ["binary"] }
 
 [package.metadata.rust-analyzer]
 # Tell rust-analyzer to enable `rustc_private` so it indexes our

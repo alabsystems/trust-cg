@@ -90,16 +90,43 @@ def replace_once(text, old, new):
 
 def rust_emitter(stem, fields):
     names = [f"u{index}" for index in range(len(TRANSPORT))] + list(fields)
-    pattern = "TCG-BENCH-OUTPUT-V1 " + stem + " " + " ".join(name + "={:016x}" for name in names)
     values = [f"0x{value:016x}u64" for value in TRANSPORT]
     values.extend(f"values[{index}]" for index in range(len(fields)))
+    # Generate a fixed byte layout so the diagnostic needs no Rust formatting
+    # machinery or runtime index calculations. Each u64 uses the same encoder.
+    record = f"TCG-BENCH-OUTPUT-V1 {stem}"
+    assignments = []
+    for name, value in zip(names, values):
+        record += f" {name}="
+        offset = len(record)
+        record += "0" * 16
+        for digit in range(16):
+            shift = (15 - digit) * 4
+            assignments.append(f"    record[{offset + digit}] = oracle_hex_digit({value} >> {shift});\n")
+    record_literal = json.dumps(record + "\n")
     return ("#[cfg(not(target_endian = \"little\"))]\n"
             "compile_error!(\"full-output scope requires little endian\");\n"
             "const _: [(); 8] = [(); std::mem::size_of::<u64>()];\n"
             "const _: [(); 8] = [(); std::mem::size_of::<usize>()];\n"
+            "unsafe extern \"C\" {\n"
+            "    fn write(fd: i32, buf: *const u8, len: usize) -> isize;\n"
+            "}\n"
+            "#[inline(always)]\n"
+            "fn oracle_hex_digit(value: u64) -> u8 {\n"
+            "    let digit = (value & 15) as u8;\n"
+            "    let letter = (digit.wrapping_add(6) >> 4).wrapping_mul(b'a' - b'0' - 10);\n"
+            "    b'0'.wrapping_add(digit).wrapping_add(letter)\n"
+            "}\n"
+            "#[inline(never)]\n"
             f"fn oracle_output(code: u64, values: [u64; {len(fields)}]) -> ! {{\n"
-            f"    println!(\"{pattern}\", {', '.join(values)});\n"
-            "    std::process::exit((code % 126) as i32)\n}")
+            f"    let mut record = *b{record_literal};\n{''.join(assignments)}"
+            "    // SAFETY: The initialized array stays live for write's entire read.\n"
+            "    let written = unsafe { write(1, record.as_ptr(), record.len()) };\n"
+            "    let success = (written == record.len() as isize) as u32;\n"
+            "    let residue = (code % 126) as u32;\n"
+            "    // Status 127 records a short or failed write.\n"
+            "    let status = residue.wrapping_mul(success).wrapping_add(127u32.wrapping_mul(1u32.wrapping_sub(success)));\n"
+            "    std::process::exit(status as i32)\n}")
 
 
 def c_emitter(stem, fields):

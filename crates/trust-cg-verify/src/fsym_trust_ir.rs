@@ -59,7 +59,8 @@
 //! A verdict is about the runs of [`FSYM_RUN_MODEL`], and
 //! [`FsymRunModel::breach`] decides whether a run is one: an entry
 //! function's execution from fresh memory whose fuel is below 2^50 steps,
-//! on entry arguments that name no allocation and no runtime handle.
+//! on entry arguments that name no allocation, runtime handle or nominal
+//! function item outside the bounded value model.
 //! Everything such a run allocates is allocated by the module's own code (an
 //! `Alloca` / `HeapAlloc`, a `SeqMap` element cell, a global's first
 //! materialization, at most once a global), in whatever function the entry
@@ -214,7 +215,8 @@ impl FsymRunModel {
     /// bound, or an entry argument carrying an allocation pointer or a
     /// runtime handle (a run starts from fresh memory and host state, so an
     /// embedder made it) or a trust-ir v49 unwritten aggregate lane (fsym
-    /// models none). Past the fuel bound a run makes placements the BUDGET
+    /// models none), or a nominal function item whose target semantics are
+    /// outside the bounded value model. Past the fuel bound a run makes placements the BUDGET
     /// premise does not count, and a forged pointer or handle may name what
     /// the run never made: no verdict covers such a run. The run model is
     /// also the panic=abort projection (trust-ir v56,
@@ -251,9 +253,10 @@ impl FsymRunModel {
     }
 }
 
-/// An allocation pointer, runtime handle or unwritten aggregate lane inside
-/// an entry argument. EXHAUSTIVE on purpose: a value kind added to trust-ir
-/// fails to compile here until it is placed.
+/// A part of an entry argument outside the bounded run model, including an
+/// allocation pointer, runtime handle, nominal item or unwritten aggregate lane.
+/// EXHAUSTIVE on purpose: a value kind added to trust-ir fails to compile here
+/// until it is placed.
 fn forged_part(value: &trust_ir::InterpretValue) -> Option<&'static str> {
     use trust_ir::InterpretValueKind as V;
     match &value.kind {
@@ -1893,10 +1896,10 @@ fn validate_supported_nonterminator(
 
 /// The layout refusal of `inst`, if any: an instruction whose execution lays
 /// out a type — an allocation's element, an access's value, a GEP's stride —
-/// that the reference interpreter's layout (`fsym_layout`, the only one fsym
-/// reasons with) cannot lay out. The interpreter faults on it with a type
-/// error; fsym refuses the function by name rather than reason about a size
-/// it does not have.
+/// that the bounded reference-layout port (`fsym_layout`, the only one fsym
+/// reasons with) cannot lay out. Some forms are also interpreter type errors;
+/// newer storage-profile forms have interpreter semantics outside this port.
+/// Both are refused by name rather than assigned a guessed size or layout.
 pub(crate) fn layout_refusal(module: &Module, inst: &Inst) -> Option<String> {
     let ty = match inst {
         Inst::Alloca { ty, .. }
@@ -2087,6 +2090,18 @@ fn type_may_contain_enum_by_value(module: &Module, ty: &Ty) -> bool {
     walk(module, ty, 0)
 }
 
+fn carries_fn_item(value: &Constant) -> bool {
+    value
+        .try_visit_constants(|nested| {
+            if matches!(nested, Constant::FnItem(_)) {
+                std::ops::ControlFlow::Break(())
+            } else {
+                std::ops::ControlFlow::Continue(())
+            }
+        })
+        .is_break()
+}
+
 fn unsupported_nonterminator_detail(module: &Module, inst: &Inst) -> Option<String> {
     match inst {
         Inst::MakeClosure { ty, func, captures } => {
@@ -2235,6 +2250,9 @@ fn unsupported_nonterminator_detail(module: &Module, inst: &Inst) -> Option<Stri
         | Inst::CmpXchg { weak: false, .. }
         | Inst::MemCopy { .. }
         | Inst::MemSet { .. } => None,
+        Inst::Const { value, .. } if carries_fn_item(value) => Some(
+            "Const of Constant::FnItem requires nominal target semantics outside bounded fsym support".into(),
+        ),
         // trust-ir v70: a weight-blob constant (at any depth of the constant)
         // is a tensor value read from the module's blob table, which fsym does
         // not model: refused by name, never left to `constant_expr`'s decline.
@@ -7632,6 +7650,10 @@ fn eval_concrete_u64(expr: &SmtExpr) -> Option<u64> {
         | EvalResult::Poison => None,
     }
 }
+
+#[cfg(test)]
+#[path = "fsym_trust_ir_current_ir_tests.rs"]
+mod current_ir_boundary_tests;
 
 #[cfg(test)]
 mod tests {

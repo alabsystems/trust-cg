@@ -597,20 +597,20 @@ const CENSUS: &[CensusRow] = &[
     (
         Dir::Refuse,
         Format::Tmbc,
-        147,
-        119,
+        152,
+        123,
         &[
-            ("reader: manifest Binary verdict (poisoned bytes row)", 27),
+            ("reader: manifest Binary verdict (poisoned bytes row)", 28),
             ("reader: producer omission (v41+ header, unstamped body)", 1),
         ],
     ),
-    (Dir::Refuse, Format::Json, 120, 120, &[]),
+    (Dir::Refuse, Format::Json, 124, 124, &[]),
     (
         Dir::Refuse,
         Format::Msgpack,
-        120,
+        124,
         0,
-        &[("not a trust-cg input format (MessagePack)", 120)],
+        &[("not a trust-cg input format (MessagePack)", 124)],
     ),
     (Dir::FrameCfg, Format::Text, 5, 5, &[]),
 ];

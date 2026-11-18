@@ -143,7 +143,8 @@ pub fn select(c: u128, a: u128, b: u128) -> Option<u128> {
 
 /// Evaluate the term operator `desc` on residues `args`, with the module's
 /// widths. `None` when an operand is not a residue of its type, the arity is
-/// wrong, a type is not a graph type here, or the operator is not admitted.
+/// wrong, a type is not a graph type here, the operator is not admitted, or
+/// the operator is a pinned reduction (uninterpreted).
 #[must_use]
 pub fn op(widths: GraphWidths, desc: OpDesc, args: &[u128]) -> Option<u128> {
     if !desc.admitted() || args.len() != desc.arity() {
@@ -166,6 +167,9 @@ pub fn op(widths: GraphWidths, desc: OpDesc, args: &[u128]) -> Option<u128> {
             }
             select(c, a, b)
         }
+        // A pinned reduction is uninterpreted here: it is a function of its
+        // operand, and nothing in this crate evaluates it.
+        OpDesc::Pinned(..) => None,
     }
 }
 

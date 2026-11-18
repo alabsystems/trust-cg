@@ -795,6 +795,24 @@ impl<'a> FunctionDischargeContext<'a> {
             })
             .collect()
     }
+    #[cfg(feature = "source-defined-call")]
+    pub(crate) fn void_word_memory<'part>(
+        &self,
+        parts: impl Iterator<Item = crate::void_memory_observation::Part<'part>>,
+    ) -> Vec<(Option<VerificationResult>, Option<String>, bool)> {
+        self.original_parts(parts, None, |_, verdict, why, attempted| {
+            (verdict, why, attempted)
+        })
+    }
+    #[cfg(feature = "source-defined-call")]
+    pub(crate) fn four_word_status<'part>(
+        &self,
+        parts: impl Iterator<Item = crate::word_status_observation::Part<'part>>,
+    ) -> Vec<(Option<VerificationResult>, Option<String>, bool)> {
+        self.original_parts(parts, None, |_, verdict, why, attempted| {
+            (verdict, why, attempted)
+        })
+    }
     /// All original-Core read-only relations use the same exact raw replay
     /// path and captured authority as the other sealed source-bound owners.
     /// A policy mismatch runs no part; a non-Valid replay stops all later

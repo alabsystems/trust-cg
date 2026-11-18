@@ -817,6 +817,14 @@ impl GreedyAllocator {
         let stats_on = greedy_stats_enabled();
         let initial_vregs = self.intervals.len();
         let t_all = stats_on.then(Instant::now);
+        // `func` changes below only through the splits `try_split_with_ids`
+        // makes with this cache: the precondition of `split::SplitIdCache`.
+        // `try_assign`, `try_evict` and `do_spill` do not take `func`. Any new
+        // edit of `func` inside this loop must replace `split_ids` with a
+        // fresh `SplitIdCache::default()` right after it; release builds do
+        // not re-check the cached ID against a scan (only test and debug
+        // builds do, in `SplitIdCache::plan`).
+        let mut split_ids = split::SplitIdCache::default();
         while let Some(entry) = self.worklist.pop() {
             let vreg = entry.vreg;
             if stats_on {
@@ -879,7 +887,7 @@ impl GreedyAllocator {
                 .is_some_and(|cap| self.split_depth.get(&vreg).copied().unwrap_or(0) >= cap);
             if current_stage == Stage::Split && !depth_exhausted {
                 let t = stats_on.then(Instant::now);
-                let split = self.try_split(vreg, func);
+                let split = self.try_split_with_ids(vreg, func, &mut split_ids);
                 if let Some(t) = t {
                     self.stats.t_try_split += t.elapsed();
                     self.stats.try_split_calls += 1;
@@ -1460,7 +1468,19 @@ impl GreedyAllocator {
     /// If any strategy succeeds, both halves are inserted into the
     /// interval map and enqueued on the worklist.  Returns `true` if
     /// a split was performed.
+    #[cfg(test)]
     fn try_split(&mut self, vreg: VReg, func: &mut MachFunction) -> bool {
+        self.try_split_with_ids(vreg, func, &mut split::SplitIdCache::default())
+    }
+
+    /// [`Self::try_split`] with the function's register-ID cache, which the
+    /// caller keeps across every split it makes on `func`.
+    fn try_split_with_ids(
+        &mut self,
+        vreg: VReg,
+        func: &mut MachFunction,
+        split_ids: &mut split::SplitIdCache,
+    ) -> bool {
         let interval = match self.intervals.get(&vreg) {
             Some(iv) => iv.clone(),
             None => return false,
@@ -1473,7 +1493,7 @@ impl GreedyAllocator {
         for split_point in Self::gap_split_points_by_quality(&interval) {
             if attempted.insert(split_point) {
                 let t = stats_on.then(Instant::now);
-                let ok = self.try_split_at(vreg, &interval, split_point, func);
+                let ok = self.try_split_at(vreg, &interval, split_point, func, split_ids);
                 if let Some(t) = t {
                     self.stats.t_split_attempts += t.elapsed();
                     self.stats.split_attempts += 1;
@@ -1497,7 +1517,7 @@ impl GreedyAllocator {
             && attempted.insert(split_point)
         {
             let t = stats_on.then(Instant::now);
-            let ok = self.try_split_at(vreg, &interval, split_point, func);
+            let ok = self.try_split_at(vreg, &interval, split_point, func, split_ids);
             if let Some(t) = t {
                 self.stats.t_split_attempts += t.elapsed();
                 self.stats.split_attempts += 1;
@@ -1512,7 +1532,7 @@ impl GreedyAllocator {
         for (split_point, _weight) in per_use_splits {
             if attempted.insert(split_point) {
                 let t = stats_on.then(Instant::now);
-                let ok = self.try_split_at(vreg, &interval, split_point, func);
+                let ok = self.try_split_at(vreg, &interval, split_point, func, split_ids);
                 if let Some(t) = t {
                     self.stats.t_split_attempts += t.elapsed();
                     self.stats.split_attempts += 1;
@@ -1564,8 +1584,9 @@ impl GreedyAllocator {
         interval: &LiveInterval,
         split_point: u32,
         func: &mut MachFunction,
+        split_ids: &mut split::SplitIdCache,
     ) -> bool {
-        match split::split_interval_checked(interval, split_point, func) {
+        match split::split_interval_checked_cached(interval, split_point, func, split_ids) {
             Ok(result) => {
                 if self.killcommit_recording {
                     // Stats-only (docs/archive/per-use-splitting-plan.md): remember the

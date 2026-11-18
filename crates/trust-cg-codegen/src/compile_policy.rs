@@ -124,7 +124,13 @@ const TAG_COMPILER_AARCH64_FORCE_FRAME_POINTERS: u16 = 0x1015;
 /// The x86-64 certificate-free allocation request
 /// (`CompilerConfig::x86_certificate_free_allocation`), present only when on
 /// so every default-policy digest is unchanged. It changes emitted bytes:
-/// Artifact.
+/// Artifact. Despite the name, the request covers every certificate-free
+/// x86-64 code-quality change (`X86AllocationQuality::CertificateFree`):
+/// the allocation changes, frameless leaves, the O2 machine-pass fixpoint
+/// and the certificate-free IMUL reductions. The tag and field name are kept
+/// so existing artifact identities stay valid; the field states a policy
+/// (certificate-free code quality requested), not a list of transforms, and
+/// a transform added under it changes the bytes such an identity names.
 const TAG_COMPILER_X86_CERTIFICATE_FREE_ALLOCATION: u16 = 0x1016;
 
 // JitConfig fields.  Profile hooks and emit_entry_counters intentionally share
@@ -807,8 +813,8 @@ fn push_compiler_fields(
             &link_unit_definitions_sha256(link_unit_definitions),
         );
     }
-    // The certificate-free allocation request changes which registers and
-    // copies an x86-64 object compile emits. Absent when off.
+    // The certificate-free request changes which registers, copies, frames
+    // and instructions an x86-64 object compile emits. Absent when off.
     if *x86_certificate_free_allocation {
         push_field(
             fields,

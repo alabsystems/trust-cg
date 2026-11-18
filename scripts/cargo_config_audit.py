@@ -13,10 +13,11 @@ Targo or rustc command, version probes included, and again at the end.
 Files. It enumerates the config files Cargo reads for a working directory:
 `.cargo/config` and `.cargo/config.toml` in that directory and each ancestor,
 then `config` and `config.toml` in Cargo's home unless the ancestor walk
-already visited it. The home is resolved as Cargo resolves it (a non-empty
-CARGO_HOME, joined to the working directory when relative; else HOME/.cargo,
-where an empty or missing HOME is the password-database home), by the one
-resolver scripts/dependency_identity.py also uses. Each existing regular file
+already visited it. The caller selects native Targo or stock Cargo home
+semantics explicitly. Targo imports TARGO_HOME only when CARGO_HOME is absent;
+an explicitly empty CARGO_HOME still selects HOME/.cargo. Stock Cargo ignores
+TARGO_HOME. Relative paths join the actual working directory. Both use the
+shared scripts/dependency_identity.py resolver. Each existing regular file
 is recorded with its SHA-256 and length. These are problems:
 - any existing config path that is not a regular file. A FIFO or a symlink to
   /dev/stdin would hand Cargo bytes this audit never read. A symlink is
@@ -50,9 +51,10 @@ Variables. Cargo maps `CARGO_<KEY>` onto config keys. A Cargo build under
 another name also maps its own prefix: Trust's `targo` reads `TARGO_<KEY>`
 (TARGO_BUILD_RUSTFLAGS, TARGO_ALIAS_*, TARGO_ENCODED_RUSTFLAGS,
 TARGO_TARGET_<triple>_RUSTFLAGS...) as well as `CARGO_<KEY>`, under any name
-it is installed as, while it reads no `.targo/` config directory, no
-TARGO_HOME and no TRUST_*RUSTFLAGS. `environment_prefixes` derives the set
-from the selected tool, and every prefix follows the same key allowlist. Keys
+it is installed as, while it reads no `.targo/` config directory and no
+TRUST_*RUSTFLAGS. Native home selection is a separate explicit caller context;
+a tool basename or a variable prefix does not prove which executable will run.
+`environment_prefixes` derives the set from the selected tool, and every prefix follows the same key allowlist. Keys
 Cargo itself sets for build scripts, rustc and tests (`CHILD_KEYS`, e.g.
 CARGO_MANIFEST_DIR, CARGO_PKG_*, CARGO_CFG_*, CARGO_FEATURE_*,
 CARGO_MAKEFLAGS) are not config keys: they are recorded, and both runners
@@ -133,9 +135,9 @@ def _dependency_identity():
 _RESOLVER = _dependency_identity()
 
 
-def cargo_home(environment: Mapping[str, str], cwd: Path) -> Path:
+def cargo_home(environment: Mapping[str, str], cwd: Path, *, native_targo: bool = False) -> Path:
     """The Cargo home a Cargo started in `cwd` uses (the shared resolver)."""
-    return _RESOLVER.cargo_home_from(environment, Path(os.path.abspath(cwd)))[0]
+    return _RESOLVER.cargo_home_from(environment, Path(os.path.abspath(cwd)), native_targo=native_targo)[0]
 
 
 def environment_prefixes(tool: str | os.PathLike = "cargo") -> tuple[str, ...]:
@@ -197,11 +199,11 @@ def environment_problems(environment: Mapping[str, str], prefixes: Sequence[str]
     return sorted(problems)
 
 
-def config_directories(cwd: Path, environment: Mapping[str, str]) -> list[tuple[Path, str]]:
+def config_directories(cwd: Path, environment: Mapping[str, str], *, native_targo: bool = False) -> list[tuple[Path, str]]:
     """Every directory Cargo looks in for config files, in its search order."""
     directory = Path(os.path.abspath(cwd))
     found = [(base / ".cargo", "ancestor") for base in (directory, *directory.parents)]
-    home = Path(os.path.abspath(cargo_home(environment, directory)))
+    home = Path(os.path.abspath(cargo_home(environment, directory, native_targo=native_targo)))
     visited = {os.path.realpath(path) for path, _ in found}
     if os.path.realpath(home) not in visited:
         found.append((home, "home"))
@@ -236,11 +238,11 @@ def read_regular(path: Path) -> bytes:
         os.close(descriptor)
 
 
-def config_files(cwd: Path, environment: Mapping[str, str]) -> list[dict]:
+def config_files(cwd: Path, environment: Mapping[str, str], *, native_targo: bool = False) -> list[dict]:
     """Every existing config path Cargo would consult from `cwd`, in its search
     order, with the path problems of each (see the module docstring)."""
     entries = []
-    for directory, origin in config_directories(cwd, environment):
+    for directory, origin in config_directories(cwd, environment, native_targo=native_targo):
         present = [directory / name for name in CONFIG_NAMES if os.path.lexists(directory / name)]
         for path in present:
             entry = {"path": path, "origin": origin, "problems": []}
@@ -274,18 +276,20 @@ def table_problems(document: Mapping) -> list[str]:
 
 def audit(
     cwd: Path, environment: Mapping[str, str], committed: bytes | None = None, tool: str | os.PathLike = "cargo",
+    *, native_targo: bool = False,
 ) -> dict:
     """Record every config path and config variable, and name each problem.
 
     `committed` is the repository's committed `.cargo/config.toml`, exempt
     wherever the ancestor walk finds a byte-identical copy. `tool` is the
     build tool the caller will run (see `environment_prefixes`).
+    `native_targo` selects its home semantics explicitly, independent of names.
     """
     directory = Path(os.path.abspath(cwd))
     own = directory / ".cargo" / "config.toml"
     prefixes = environment_prefixes(tool)
     files, problems = [], []
-    for entry in config_files(directory, environment):
+    for entry in config_files(directory, environment, native_targo=native_targo):
         path = entry.pop("path")
         record = {"path": str(path), **entry}
         found = record["problems"]
@@ -316,7 +320,8 @@ def audit(
     problems.extend(f"environment {name}={environment[name]!r}" for name in variables)
     return {
         "cwd": str(directory), "tool": str(tool), "environment_prefixes": list(prefixes),
-        "cargo_home": str(cargo_home(environment, directory)), "files": files,
+        "cargo_home": str(cargo_home(environment, directory, native_targo=native_targo)),
+        "native_targo_home": native_targo, "files": files,
         "environment": {
             name: environment[name] for name in sorted(environment)
             if variable_key(name, prefixes) is not None and not child_variable(name, prefixes)
@@ -349,7 +354,7 @@ def changes(before: dict, after: dict) -> list[str]:
     for path in sorted(set(old) | set(new)):
         if old.get(path) != new.get(path):
             found.append(f"{path}: {old.get(path)} -> {new.get(path)}")
-    for key in ("environment", "child_variables", "environment_prefixes", "cargo_home"):
+    for key in ("environment", "child_variables", "environment_prefixes", "cargo_home", "native_targo_home"):
         if before.get(key) != after.get(key):
             found.append(f"{key} changed")
     return found
@@ -363,9 +368,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--cwd", type=Path, default=Path.cwd())
     parser.add_argument("--tool", default="targo",
                         help="the build tool that will run (default: targo, the Trust package's)")
+    parser.add_argument("--home-context", choices=("targo", "cargo"), default="targo",
+                        help="selected frontend home semantics, independent of the tool filename")
     args = parser.parse_args(argv)
     root = Path(__file__).resolve().parents[1]
-    record = audit(args.cwd, os.environ, committed_config(root), args.tool)
+    record = audit(args.cwd, os.environ, committed_config(root), args.tool,
+                   native_targo=args.home_context == "targo")
     print(json.dumps(record, indent=2))
     return 1 if record["problems"] else 0
 

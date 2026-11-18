@@ -567,6 +567,36 @@ const EXPECTED_REASON: &[(&str, &str, &str)] = &[
     ),
     ("blob_box_deref_below_its_version", "*", "invalid tag: 77"),
     ("blob_box_deref_premise_root_unknown", "*", "invalid tag: 9"),
+    (
+        "box_deref_unestablished_parameter",
+        "*",
+        "BoxDerefConjunctUnestablished",
+    ),
+    (
+        "box_deref_unestablished_null_operand",
+        "*",
+        "BoxDerefConjunctUnestablished",
+    ),
+    (
+        "box_deref_unestablished_freed_operand",
+        "*",
+        "BoxDerefConjunctUnestablished",
+    ),
+    (
+        "box_deref_unestablished_loaded_operand",
+        "*",
+        "BoxDerefConjunctUnestablished",
+    ),
+    (
+        "blob_box_deref_unestablished_below_its_version",
+        "*",
+        "invalid tag: 3",
+    ),
+    (
+        "blob_box_deref_unestablished_below_its_version",
+        "decode",
+        "invalid tag: 3",
+    ),
 ];
 
 /// Whether an [`EXPECTED_REASON`] lane spec covers `lane`.

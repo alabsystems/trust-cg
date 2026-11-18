@@ -334,6 +334,44 @@ class DependencyIdentityTests(unittest.TestCase):
         self.assertEqual(DEPS.cargo_home_from({}, cwd), (account / ".cargo", "default"))
         self.assertEqual(DEPS.cargo_home_from({"HOME": "rel"}, cwd), (cwd / "rel" / ".cargo", "default"))
 
+    def test_native_home_precedence_and_stock_context_are_distinct(self):
+        cwd = Path(self.temp.name)
+        cases = [
+            ({"TARGO_HOME": "/native", "HOME": "/h"}, Path("/native"), "TARGO_HOME"),
+            ({"TARGO_HOME": "relative", "HOME": "/h"}, cwd / "relative", "TARGO_HOME"),
+            ({"CARGO_HOME": "/compat", "TARGO_HOME": "/native"}, Path("/compat"), "CARGO_HOME"),
+            ({"CARGO_HOME": "", "TARGO_HOME": "/native", "HOME": "/h"}, Path("/h/.cargo"), "default"),
+            ({"TARGO_HOME": "", "HOME": "/h"}, Path("/h/.cargo"), "default"),
+        ]
+        for environment, expected, origin in cases:
+            with self.subTest(environment=environment):
+                self.assertEqual(DEPS.cargo_home_from(environment, cwd, native_targo=True), (expected, origin))
+        self.assertEqual(DEPS.cargo_home_from({"TARGO_HOME": "/native", "HOME": "/h"}, cwd),
+                         (Path("/h/.cargo"), "default"))
+
+    def test_native_cli_records_the_actual_cache_without_falling_back_to_a_ready_other_home(self):
+        # The only ready cache is the fixture's native home. Recording HOME/.cargo
+        # would claim absence for the wrong directory; falling back to it after
+        # an explicit compatibility selection would grant false readiness.
+        environment = {"TARGO_HOME": str(self.fixture.cargo_home), "HOME": str(self.fixture.home)}
+        args = ("--lock", str(self.fixture.lock), "--json", "--require-offline")
+        for extra, context, expected, origin in [
+            ({}, "targo", 0, "TARGO_HOME"),
+            ({}, "cargo", 1, "default"),
+            ({"CARGO_HOME": ""}, "targo", 1, "default"),
+            ({"CARGO_HOME": str(self.fixture.home / "absent")}, "targo", 1, "CARGO_HOME"),
+        ]:
+            with self.subTest(extra=extra, context=context), mock.patch.dict(os.environ, {**environment, **extra}, clear=True):
+                code, stdout, _ = run_cli(*args, "--home-context", context)
+                record = json.loads(stdout)
+                self.assertEqual(code, expected)
+                self.assertEqual(record["cargo_home_source"], origin)
+                self.assertEqual(record["offline_ready"], expected == 0)
+        with mock.patch.dict(os.environ, {"CARGO_HOME": "/missing", "TARGO_HOME": "/also-missing"}, clear=True):
+            code, stdout, _ = run_cli(*args, "--cargo-home", str(self.fixture.cargo_home))
+        self.assertEqual(code, 0)
+        self.assertEqual(json.loads(stdout)["cargo_home_source"], "argument")
+
     def test_identity_changes_name_what_moved_during_a_run(self):
         before = self.fixture.collect()
         self.assertEqual(DEPS.identity_changes(before, self.fixture.collect()), [])

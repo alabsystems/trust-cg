@@ -90,6 +90,8 @@
 //! name.
 
 mod abi;
+mod closed_call;
+pub use closed_call::{CheckedClosedCallPlacement, CheckedClosedCallSite, check_closed_call_placement};
 mod image;
 mod object;
 mod replay;

@@ -22,6 +22,23 @@ assert SPEC is not None and SPEC.loader is not None
 TOOLCHAIN = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(TOOLCHAIN)
 
+class ProbeResourceTests(unittest.TestCase):
+    def test_direct_and_scheduled_probes_keep_advertised_descriptors(self):
+        read_fd, write_fd = os.pipe()
+        env = {"MAKEFLAGS": f"--jobserver-auth={read_fd},{write_fd}"}
+        command = [sys.executable, "-I", "-B", "-c",
+                   f"import os; os.fstat({read_fd}); os.fstat({write_fd}); print('live')"]
+        try:
+            for subtree in (False, True):
+                with self.subTest(subtree=subtree):
+                    self.assertEqual(TOOLCHAIN._probe(command, environment=env, subtree=subtree),
+                                     "live\n")
+        finally:
+            os.close(read_fd)
+            os.close(write_fd)
+
+
+
 COMMIT = "3" * 40
 # Match the certificate gate's shell/Python fixture trampoline: a managed
 # interpreter may live under Application Support, which a shebang splits.

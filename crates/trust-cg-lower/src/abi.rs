@@ -138,8 +138,8 @@ pub mod gpr {
 /// Where a single argument or return value is placed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ArgLocation {
-    /// A logical empty aggregate with no physical argument bytes or slot.
-    /// Later arguments retain their register/stack positions; this value
+    /// A logical empty aggregate with no physical argument/result bytes or slot.
+    /// Later values retain their register/stack positions; this value
     /// remains present in the original signature.
     Ignore,
     /// In a register. Integer parameters use X0-X7; I8/I16/I32 returns use
@@ -1006,6 +1006,10 @@ impl AppleAArch64ABI {
 
         for ty in returns {
             match ty {
+                // The same logical empty-record carrier already ignored by
+                // parameter classification. It has no result register or sret
+                // buffer, but remains a result in the typed IR signature.
+                Type::Struct(fields) if fields.is_empty() => result.push(ArgLocation::Ignore),
                 Type::I8 | Type::I16 | Type::I32 => {
                     if gpr_idx < GPR32_RETURN_REGS.len() {
                         result.push(ArgLocation::Reg(GPR32_RETURN_REGS[gpr_idx]));
@@ -3042,6 +3046,33 @@ mod tests {
     fn classify_no_returns() {
         let locs = AppleAArch64ABI::classify_returns(&[]);
         assert!(locs.is_empty());
+    }
+
+    #[test]
+    fn empty_aggregate_return_does_not_consume_scalar_registers() {
+        let empty = Type::Struct(vec![]);
+        let returns = vec![
+            empty.clone(),
+            Type::I64,
+            empty.clone(),
+            Type::F64,
+            Type::I64,
+        ];
+        assert_eq!(
+            AppleAArch64ABI::classify_returns(&returns),
+            vec![
+                ArgLocation::Ignore,
+                ArgLocation::Reg(gpr::X0),
+                ArgLocation::Ignore,
+                ArgLocation::Reg(gpr::D0),
+                ArgLocation::Reg(gpr::X1),
+            ]
+        );
+        assert_eq!(
+            AppleAArch64ABI::classify_returns(&[empty.clone()]),
+            vec![ArgLocation::Ignore]
+        );
+        assert!(AppleAArch64ABI::required_return_pregs(&[empty]).is_empty());
     }
 
     #[test]

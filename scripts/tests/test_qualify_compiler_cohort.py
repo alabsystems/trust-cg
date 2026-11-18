@@ -105,16 +105,20 @@ class VersionSelectionTests(unittest.TestCase):
                 "--clean-source", "/source/clean", "--evidence-dir", "/evidence"]
 
     def test_reviewed_versions_reach_the_canonical_pin_owner(self):
-        args = q.parse_args([*self.arguments(), "--ir-version", IR_TARGET,
-                             "--clean-version", CLEAN_TARGET])
-        self.assertEqual(q.pin_owner_command(args), [
-            sys.executable, "scripts/bump_trust_ir_pin.py", ROOT,
-            "--ay-revision", AY, "--targo", "/selected/targo",
-            "--ir-version", IR_TARGET, "--clean-version", CLEAN_TARGET])
+        selections = [(IR_TARGET, CLEAN_TARGET), (IR_TARGET, "0.9.3"),
+                      (IR_TARGET, "0.9.4"), ("0.16.0", "0.9.4")]
+        for ir_version, clean_version in selections:
+            with self.subTest(ir_version=ir_version, clean_version=clean_version):
+                args = q.parse_args([*self.arguments(), "--ir-version", ir_version,
+                                     "--clean-version", clean_version])
+                self.assertEqual(q.pin_owner_command(args), [
+                    sys.executable, "scripts/bump_trust_ir_pin.py", ROOT,
+                    "--ay-revision", AY, "--targo", "/selected/targo",
+                    "--ir-version", ir_version, "--clean-version", clean_version])
 
     def test_unsupported_versions_refuse_at_the_cli_boundary(self):
-        for option, version in (("--ir-version", "0.16.0"),
-                                ("--clean-version", "0.9.3")):
+        for option, version in (("--ir-version", "0.17.0"),
+                                ("--clean-version", "0.9.5")):
             with self.subTest(option=option), redirect_stderr(io.StringIO()), \
                     self.assertRaises(SystemExit) as refused:
                 q.parse_args([*self.arguments(), option, version])

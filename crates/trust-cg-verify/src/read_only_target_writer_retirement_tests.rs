@@ -20,21 +20,27 @@ fn assert_original_module_image(restored: &trust_ir::Module, capture: &serde_jso
         restored.drop_glue.is_empty(),
         "original capture has no drop glue"
     );
-    // The immutable pre-v58 JSON omitted an empty drop_glue table. Since
-    // v58 appended closure_layouts, serde always emits drop_glue: [] (the
-    // positional MessagePack contract cannot skip a nontrailing field).
-    // Add ONLY this documented empty expected field. Do not round-trip the
+    assert!(
+        restored.closure_layouts.is_empty(),
+        "original capture has no closure layouts"
+    );
+    // The immutable pre-v58 JSON omitted both empty tables; the current
+    // serializer emits them. Add ONLY these empty expected fields. Keep
+    // the original capture's omission precondition for each table, too.
+    // Do not round-trip the
     // expected JSON through Module or drop fields from the actual image:
     // either would conceal unrelated schema/source changes.
     let mut expected = capture["module"].clone();
-    assert!(
-        expected
-            .as_object_mut()
-            .unwrap()
-            .insert("drop_glue".to_owned(), serde_json::Value::Array(vec![]))
-            .is_none(),
-        "legacy capture must omit drop_glue"
-    );
+    for table in ["drop_glue", "closure_layouts"] {
+        assert!(
+            expected
+                .as_object_mut()
+                .unwrap()
+                .insert(table.to_owned(), serde_json::Value::Array(vec![]))
+                .is_none(),
+            "legacy capture must omit {table}"
+        );
+    }
     assert_eq!(
         serde_json::to_value(restored).unwrap(),
         expected,
@@ -57,7 +63,7 @@ fn original() -> trust_ir::Module {
 }
 
 #[test]
-fn legacy_empty_drop_glue_is_the_only_original_image_compatibility() {
+fn legacy_empty_schema_tables_are_the_only_original_image_compatibility() {
     let capture = original_capture();
     let module: trust_ir::Module = serde_json::from_value(capture["module"].clone()).unwrap();
     assert_original_module_image(&module, &capture);
@@ -81,6 +87,32 @@ fn original_image_never_overwrites_an_authored_drop_glue_field() {
     let mut capture = original_capture();
     let module: trust_ir::Module = serde_json::from_value(capture["module"].clone()).unwrap();
     capture["module"]["drop_glue"] = serde_json::json!([{"glue": 60_002, "ty": "I64"}]);
+    assert_original_module_image(&module, &capture);
+}
+
+#[test]
+#[should_panic(expected = "legacy capture must omit closure_layouts")]
+fn original_image_never_overwrites_an_authored_closure_layout_field() {
+    let mut capture = original_capture();
+    let module: trust_ir::Module = serde_json::from_value(capture["module"].clone()).unwrap();
+    capture["module"]["closure_layouts"] = serde_json::json!([{"unknown": true}]);
+    assert_original_module_image(&module, &capture);
+}
+
+#[test]
+#[should_panic(expected = "original capture has no closure layouts")]
+fn original_image_refuses_nonempty_actual_closure_layouts() {
+    let capture = original_capture();
+    let mut module: trust_ir::Module = serde_json::from_value(capture["module"].clone()).unwrap();
+    module
+        .closure_layouts
+        .push(trust_ir::ClosureLayoutDescriptor {
+            closure: trust_ir::ClosureTyId::new(0),
+            size: 0,
+            align: 1,
+            capture_offsets: vec![],
+            origin: None,
+        });
     assert_original_module_image(&module, &capture);
 }
 

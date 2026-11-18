@@ -418,6 +418,19 @@ class DarwinAarch64GateTests(unittest.TestCase):
         self.assertIn(Path(temp) / "config.toml", files)
         self.assertEqual(len({path.resolve() for path in files}), len(files))
 
+    def test_native_home_and_empty_compatibility_selection_cover_the_actual_config(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            native = root / "native"
+            native.mkdir()
+            config = native / "config.toml"
+            config.write_text('[build]\nrustc = "/wrong/compiler"\n')
+            environment = {"TARGO_HOME": str(native), "HOME": temp}
+            self.assertIn(config, GATE.cargo_config_files(environment))
+            with self.assertRaises(RuntimeError):
+                GATE.cargo_config_identity(environment)
+            self.assertNotIn(config, GATE.cargo_config_files({**environment, "CARGO_HOME": ""}))
+
     def test_missing_host_tool_is_refused(self):
         with self.fake_toolchain():
             with mock.patch.object(GATE.shutil, "which", side_effect=lambda name, path=None: None):

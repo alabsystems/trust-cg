@@ -1,0 +1,93 @@
+; trust-cg-eqsat: the PKG-U4 Tier S integer rule set (docs/eqsat-tier-s.md section 4.4).
+;
+; Author: Andrew Yates <andrewyates.name@gmail.com>
+; Copyright 2026 Andrew Yates | License: Apache-2.0
+;
+; Used by tests/eqsat_saturation_differential.rs only. These are statements,
+; not theorems: no rule here has a discharge record, and a Tier S rule grants
+; no proof authority until PKG-U2's registry discharges it. The syntax is the
+; rule language of docs/eqsat-tier-e.md section 5; every rule names only total
+; operators, and variables range over defined values of the instance type.
+;
+; Associativity, commutativity and distribution make the graph grow fast, and
+; together with the identities they do not saturate on every term (a product
+; with a zero factor never does). They run only under a match budget
+; (docs/eqsat-tier-s.md section 4.3).
+
+; ---- commutativity ----------------------------------------------------------
+
+(rule add_comm
+  (direction equiv)
+  (domain i8 i16 i32 i64 i128 isize u8 u16 u32 u64 u128 usize)
+  (lhs (add ?x ?y))
+  (rhs (add ?y ?x))
+  (where))
+
+(rule mul_comm
+  (direction equiv)
+  (domain i8 i16 i32 i64 i128 isize u8 u16 u32 u64 u128 usize)
+  (lhs (mul ?x ?y))
+  (rhs (mul ?y ?x))
+  (where))
+
+; ---- associativity, both ways -----------------------------------------------
+
+(rule add_assoc_right
+  (direction equiv)
+  (domain i8 i16 i32 i64 i128 isize u8 u16 u32 u64 u128 usize)
+  (lhs (add (add ?x ?y) ?z))
+  (rhs (add ?x (add ?y ?z)))
+  (where))
+
+(rule add_assoc_left
+  (direction equiv)
+  (domain i8 i16 i32 i64 i128 isize u8 u16 u32 u64 u128 usize)
+  (lhs (add ?x (add ?y ?z)))
+  (rhs (add (add ?x ?y) ?z))
+  (where))
+
+(rule mul_assoc_right
+  (direction equiv)
+  (domain i8 i16 i32 i64 i128 isize u8 u16 u32 u64 u128 usize)
+  (lhs (mul (mul ?x ?y) ?z))
+  (rhs (mul ?x (mul ?y ?z)))
+  (where))
+
+(rule mul_assoc_left
+  (direction equiv)
+  (domain i8 i16 i32 i64 i128 isize u8 u16 u32 u64 u128 usize)
+  (lhs (mul ?x (mul ?y ?z)))
+  (rhs (mul (mul ?x ?y) ?z))
+  (where))
+
+; ---- identities --------------------------------------------------------------
+
+(rule add_zero
+  (direction equiv)
+  (domain i8 i16 i32 i64 i128 isize u8 u16 u32 u64 u128 usize)
+  (lhs (add ?x (const 0)))
+  (rhs ?x)
+  (where))
+
+(rule mul_one
+  (direction equiv)
+  (domain i8 i16 i32 i64 i128 isize u8 u16 u32 u64 u128 usize)
+  (lhs (mul ?x (const 1)))
+  (rhs ?x)
+  (where))
+
+; ---- distribution, both ways ---------------------------------------------------
+
+(rule distribute
+  (direction equiv)
+  (domain i8 i16 i32 i64 i128 isize u8 u16 u32 u64 u128 usize)
+  (lhs (mul (add ?x ?y) ?z))
+  (rhs (add (mul ?x ?z) (mul ?y ?z)))
+  (where))
+
+(rule factor
+  (direction equiv)
+  (domain i8 i16 i32 i64 i128 isize u8 u16 u32 u64 u128 usize)
+  (lhs (add (mul ?x ?z) (mul ?y ?z)))
+  (rhs (mul (add ?x ?y) ?z))
+  (where))

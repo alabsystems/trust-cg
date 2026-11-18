@@ -188,7 +188,10 @@ pub fn probe(session: &EarlySession) -> &EarlySession { session }
 /// `[TCG-BOX-DEREF]` refusal matches. With it present the retained probe pins
 /// every name the fact translation reads, so a compiler that has the query
 /// under another fact schema fails this build instead of selecting the
-/// emission path.
+/// emission path. Schema 4 is pinned: it is the first that marks a root
+/// reached through a proved returned-reference summary
+/// (`BoxValidityFact::derivation`), which the translation must see to refuse.
+/// A schema-3 producer exported such facts unmarked, so it is not accepted.
 fn probe_box_deref_facts(compiler: &Path, flags: &[&str]) -> bool {
     let facts = probe::compile_probe(
         compiler,
@@ -210,7 +213,7 @@ extern crate rustc_middle;
 extern crate rustc_span;
 use rustc_middle::mir::{self, trust_box_deref as facts};
 use rustc_middle::ty::TyCtxt;
-const _: () = assert!(facts::BOX_DEREF_FACT_SCHEMA == 3);
+const _: () = assert!(facts::BOX_DEREF_FACT_SCHEMA == 4);
 pub fn site(kind: &mir::CastKind) -> Option<mir::BoxDerefSite> {
     match kind { mir::CastKind::BoxDerefTransmute(site) => Some(*site), _ => None }
 }
@@ -233,6 +236,12 @@ pub fn roots(root: facts::BoxValidityRoot) -> u8 {
 }
 pub fn evidence(evidence: &facts::BoxValidityEvidence) -> Option<&facts::BoxValidityPremise> {
     match evidence { facts::BoxValidityEvidence::Premise(premise) => Some(premise), facts::BoxValidityEvidence::ZeroSized => None }
+}
+pub fn derivation(fact: &facts::BoxValidityFact) -> u8 {
+    match fact.derivation {
+        facts::BoxRootDerivation::JudgedBody => 0,
+        facts::BoxRootDerivation::ProvedReferenceReturn => 1,
+    }
 }
 "#
     } else {

@@ -747,6 +747,13 @@ pub(super) fn adapt_returns(
     adapt_profile_returning(machine, Profile::ScalarMemory, Some(registers))
 }
 
+pub(super) fn adapt_void(machine: &MachFunction) -> Result<Vec<Step>, ReadOnlyTargetError> {
+    if machine.signature.params != [Type::I64, Type::I64] || !machine.signature.returns.is_empty() {
+        return Err(invalid("requires exact two-word/void ABI"));
+    }
+    adapt_profile_returning(machine, Profile::ScalarMemory, Some(&[]))
+}
+
 fn adapt_profile_returning(
     machine: &MachFunction,
     profile: Profile,

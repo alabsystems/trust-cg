@@ -70,8 +70,6 @@ TOOLCHAIN_FILE = ROOT / "rust-toolchain.toml"
 CODEGEN_TESTS = ROOT / "crates" / "trust-cg-codegen" / "tests"
 HOST = "aarch64-apple-darwin"
 MACHINE = "arm64"
-# Cargo's default home (its config and Git database), with no CARGO_HOME set.
-DEFAULT_CARGO_HOME = Path.home() / ".cargo"
 # Every host tool the required targets invoke, with its identity probe.
 HOST_TOOL_PROBES = {
     "git": ("--version",), "cc": ("--version",), "c++": ("--version",),
@@ -1358,7 +1356,7 @@ def probe(command: Sequence[str], environment: dict | None = None, *, stdout_onl
 
 def cargo_config_files(environment: dict) -> list[Path]:
     """Config files Cargo loads for a command started in ROOT, nearest first."""
-    home = Path(environment.get("CARGO_HOME") or DEFAULT_CARGO_HOME).expanduser()
+    home, _ = dependency_recorder().cargo_home_from(environment, ROOT, native_targo=True)
     candidates = [
         directory / ".cargo" / name
         for directory in (ROOT, *ROOT.parents) for name in ("config.toml", "config")

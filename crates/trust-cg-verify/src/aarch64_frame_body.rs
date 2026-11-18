@@ -102,6 +102,18 @@ impl std::fmt::Debug for BodyCallee<'_, '_> {
     }
 }
 impl<'a> BodyCallee<'_, 'a> {
+    pub(super) fn normal_return_memory_effect(
+        &self,
+    ) -> crate::aarch64_affine_lowering::NormalReturnMemoryEffect {
+        match self {
+            Self::Affine(c) => c.normal_return_memory_effect(),
+            // This complete byte profile refuses all stores, SP/FP/LR writes
+            // and nested calls; its retained reads still demand real access.
+            Self::Readonly(_) => {
+                crate::aarch64_affine_lowering::NormalReturnMemoryEffect::Unchanged
+            }
+        }
+    }
     fn module(&self) -> &'a trust_ir::Module {
         match self {
             Self::Affine(c) => c.module(),
@@ -138,7 +150,7 @@ impl<'a> BodyCallee<'_, 'a> {
 }
 #[derive(Debug)]
 pub(super) struct BodyCall<'c, 'a> {
-    instruction: InstId,
+    pub(super) instruction: InstId,
     lir_instruction: usize,
     callee_offset: usize,
     pub(super) callee: BodyCallee<'c, 'a>,
@@ -152,6 +164,7 @@ pub struct CheckedFrameBody<'g, 'c, 'a> {
     pub(super) calls: Vec<BodyCall<'c, 'a>>,
     pub(super) required_entry_bytes: u32,
     linked_image: &'a [u8],
+    pub(super) caller_offset: usize,
 }
 
 impl CheckedFrameBody<'_, '_, '_> {
@@ -601,6 +614,7 @@ fn check_frame_body_calls<'g, 'c, 'a>(
         calls,
         required_entry_bytes,
         linked_image,
+        caller_offset,
     })
 }
 

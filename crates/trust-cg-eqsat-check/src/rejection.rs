@@ -34,7 +34,8 @@ pub enum DecodeError {
     Truncated { needed: usize },
     /// The first eight bytes are not `TCGEQSAT`.
     BadMagic,
-    /// The version is not 1.
+    /// The version is not the one the check reads (1 for a function, 2 for
+    /// a region).
     BadVersion { version: u32 },
     /// An unknown term, proof or opdesc tag.
     BadTag { what: &'static str, tag: u8 },
@@ -59,7 +60,10 @@ impl fmt::Display for DecodeError {
                 write!(f, "truncated: {needed} more byte(s) needed")
             }
             DecodeError::BadMagic => f.write_str("bad magic (expected TCGEQSAT)"),
-            DecodeError::BadVersion { version } => write!(f, "bad version {version} (expected 1)"),
+            DecodeError::BadVersion { version } => write!(
+                f,
+                "bad version {version} (a function derivation is version 1, a region derivation version 2)"
+            ),
             DecodeError::BadTag { what, tag } => write!(f, "bad {what} tag {tag:#04x}"),
             DecodeError::BadCode { what, code } => write!(f, "bad {what} code {code:#04x}"),
             DecodeError::BadUtf8 => f.write_str("string is not UTF-8"),
@@ -273,6 +277,9 @@ pub enum Rejection {
     },
     /// `Congr` whose children do not fit its operator.
     CongrMismatch { proof: usize, detail: String },
+    /// An `Impl` step (a region derivation only) that names no order-free
+    /// node of the input region, or an order outside that node's family.
+    ImplementMismatch { proof: usize, detail: String },
     /// A literal-sensitive operand (section 2.5: the lane index of
     /// `ExtractElement` / `InsertElement`, either `PtrFromParts` operand, a
     /// `Resume` operand) is defined by a `Const` in the output, and the input
@@ -341,6 +348,7 @@ impl Rejection {
             Rejection::SymOfRefines { .. } => "sym_of_refines",
             Rejection::TransMiddleMismatch { .. } => "trans_middle_mismatch",
             Rejection::CongrMismatch { .. } => "congr_mismatch",
+            Rejection::ImplementMismatch { .. } => "implement_mismatch",
             Rejection::LiteralIntroduced { .. } => "literal_introduced",
             Rejection::TagProvenanceChanged { .. } => "tag_provenance_changed",
             Rejection::RefinementPredicates { .. } => "refinement_predicates",
@@ -502,7 +510,10 @@ impl fmt::Display for Rejection {
                 f,
                 "proof {proof}: Trans middle terms differ ({left_rhs} vs {right_lhs})"
             ),
-            Rejection::CongrMismatch { proof, detail } => write!(f, "proof {proof}: {detail}"),
+            Rejection::CongrMismatch { proof, detail }
+            | Rejection::ImplementMismatch { proof, detail } => {
+                write!(f, "proof {proof}: {detail}")
+            }
             Rejection::LiteralIntroduced {
                 block,
                 ordinal,

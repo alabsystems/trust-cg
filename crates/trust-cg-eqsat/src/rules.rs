@@ -23,6 +23,7 @@
 use std::fmt;
 
 use crate::eval;
+use crate::proof::{EngineResult, invariant};
 use crate::vocab::{BinOpCode, CmpPred, GraphWidths, OpDesc, ScalarTy, UnOpCode};
 
 /// The PKG-U1 integer identity rule set (used by the tests).
@@ -646,6 +647,21 @@ impl Rule {
         &self.conds
     }
 
+    /// Whether every side condition holds at `width`, where `constant(var)`
+    /// is the residue variable `var` is bound to and `None` when it is
+    /// bound to anything but a constant. A condition on such a variable
+    /// never holds (fail-closed; the rule parser already refuses it). Both
+    /// tiers decide side conditions here.
+    pub(crate) fn side_conditions_hold(
+        &self,
+        width: u32,
+        constant: impl Fn(usize) -> Option<u128>,
+    ) -> bool {
+        self.conds
+            .iter()
+            .all(|cond| constant(cond.var()).is_some_and(|residue| cond.holds(residue, width)))
+    }
+
     /// The instance types at which the lhs root can match a node whose
     /// operator is `desc`, in domain order, restricted to graph types of the
     /// module.
@@ -658,6 +674,34 @@ impl Rule {
             .copied()
             .filter(|&ty| widths.admits(ty) && root.desc(ty) == desc)
             .collect()
+    }
+}
+
+/// `(eval OP ?c ...)` at instance type `ty` (section 5.1): the operator and
+/// the residue it folds to, where `constant(var)` is the residue variable
+/// `var` is bound to. Both tiers fold an `eval` here.
+///
+/// # Errors
+/// An argument that is not bound to a constant, or an operator that is not
+/// defined on the residues (the rule parser admits neither).
+pub(crate) fn eval_instance(
+    widths: GraphWidths,
+    ty: ScalarTy,
+    op: RuleOp,
+    vars: &[usize],
+    constant: impl Fn(usize) -> Option<u128>,
+) -> EngineResult<(OpDesc, u128)> {
+    let desc = op.desc(ty);
+    let mut residues = Vec::with_capacity(vars.len());
+    for var in vars {
+        match constant(*var) {
+            Some(residue) => residues.push(residue),
+            None => return invariant("an eval argument without a constant binding"),
+        }
+    }
+    match eval::op(widths, desc, &residues) {
+        Some(value) => Ok((desc, value)),
+        None => invariant("eval of an operator outside its domain"),
     }
 }
 
@@ -701,6 +745,48 @@ impl RuleSet {
     #[must_use]
     pub fn rules(&self) -> &[Rule] {
         &self.rules
+    }
+
+    /// The rules `admit` accepts, in this set's order. This is how a caller
+    /// fires only the rules it admits (PKG-U2: the rules whose statement
+    /// digest has a discharge record).
+    #[must_use]
+    pub fn restricted(&self, admit: impl Fn(&Rule) -> bool) -> RuleSet {
+        RuleSet {
+            rules: self
+                .rules
+                .iter()
+                .filter(|rule| admit(rule))
+                .cloned()
+                .collect(),
+        }
+    }
+
+    /// This set followed by the rules of `other` it does not hold. A rule
+    /// of `other` whose name this set uses is taken once when it is the
+    /// same statement (equal statement digest), so two rule files that
+    /// state one rule in the same words compose.
+    ///
+    /// # Errors
+    /// A name the two sets give to different statements
+    /// ([`RuleErrorKind::DuplicateName`], line 0: no file line names it).
+    pub fn merged(&self, other: &RuleSet) -> Result<RuleSet, RuleError> {
+        let mut rules = self.rules.clone();
+        for rule in &other.rules {
+            match self.rules.iter().find(|ours| ours.name == rule.name) {
+                None => rules.push(rule.clone()),
+                Some(ours) if ours.digest == rule.digest => {}
+                Some(_) => {
+                    return Err(err(
+                        RuleErrorKind::DuplicateName,
+                        Some(&rule.name),
+                        0,
+                        "the two rule sets give the name to different statements",
+                    ));
+                }
+            }
+        }
+        Ok(RuleSet { rules })
     }
 }
 

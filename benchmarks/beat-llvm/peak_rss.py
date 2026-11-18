@@ -37,19 +37,22 @@ measurement; it never silently falls back to the old high-floor Linux path.
 Darwin retains the Python wrapper and byte-valued kernel accounting.
 
 Wrapper:
-    python3 peak_rss.py --out FILE [--timeout S] -- CMD ARGS...
+    python3 peak_rss.py --out FILE [--timeout S] [--inherit-resources] -- CMD ARGS...
   The child's stdout/stderr are inherited (not captured). Exit status is the
   child's; 128+N when the child is killed by signal N; TIMEOUT_EXIT (124) when
   --timeout expires (the direct child is killed and reaped); 127 when CMD
   cannot be executed. FILE receives one JSON object (see `wrapper_record`).
 
 Module:
-    measure(cmd, env=None, timeout=None) -> Sample
+    measure(cmd, env=None, timeout=None, *, inherit_resources=False) -> Sample
   Sample.peak_rss_bytes is None unless the child ran to completion and exited
   normally (any exit status): a killed, timed-out or unexecutable child has no
   meaningful peak. Sample.wall_s is the child's wall time as seen by the
   wrapper (fork/exec/wait of the child only; the wrapper's own start-up is
   excluded).
+
+Compiler callers can forward the original scheduler and resource descriptions
+with `inherit_resources=True`. The native compiler authenticates them.
 """
 
 import argparse
@@ -83,6 +86,24 @@ METHOD = ("getrusage(RUSAGE_CHILDREN).ru_maxrss read by a single-child "
 
 _BSD_TIME = re.compile(r"(\d+)\s+maximum resident set size")
 _GNU_TIME = re.compile(r"Maximum resident set size \(kbytes\):\s*(\d+)")
+
+
+class ResourceRefusal(RuntimeError):
+    """A requested resource description could not be forwarded."""
+
+
+def resource_fds(environment):
+    # Only compiler launches need this helper. Keep its imports out of the RSS
+    # sampler process for ordinary programs and for the calibration probes.
+    scripts = str(WRAPPER.parents[2] / "scripts")
+    if scripts not in sys.path:
+        sys.path.insert(0, scripts)
+    import trust_toolchain
+
+    try:
+        return trust_toolchain.resource_fds(environment)
+    except trust_toolchain.ToolchainError as error:
+        raise ResourceRefusal(str(error)) from error
 
 
 def maxrss_unit(platform=None):
@@ -165,18 +186,26 @@ def wrapper_main(argv):
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--out", required=True, help="file that receives the JSON record")
     ap.add_argument("--timeout", type=float, default=None, help="kill the child after S seconds")
+    ap.add_argument("--inherit-resources", action="store_true",
+                    help="forward the original advertised resource descriptors to the command")
     ap.add_argument("cmd", nargs=argparse.REMAINDER, help="-- CMD ARGS...")
     args = ap.parse_args(argv)
     cmd = args.cmd[1:] if args.cmd and args.cmd[0] == "--" else args.cmd
     if not cmd:
         ap.error("no command given after --")
+    try:
+        inherited = resource_fds(os.environ) if args.inherit_resources else ()
+    except ResourceRefusal as error:
+        print(f"peak_rss: {error}", file=sys.stderr)
+        Path(args.out).write_text(json.dumps(wrapper_record(None, EXEC_FAILED_EXIT, "wrapper-failed")))
+        return EXEC_FAILED_EXIT
     if sys.platform == "linux":
         try:
             native = native_sampler()[1]
             command = [str(native), "--out", args.out]
             if args.timeout is not None:
                 command += ["--timeout", str(args.timeout)]
-            return subprocess.run([*command, "--", *cmd]).returncode
+            return subprocess.run([*command, "--", *cmd], pass_fds=inherited).returncode
         except (OSError, ValueError) as error:
             print(f"peak_rss: {error}", file=sys.stderr)
             Path(args.out).write_text(json.dumps(wrapper_record(None, EXEC_FAILED_EXIT, "wrapper-failed")))
@@ -187,7 +216,7 @@ def wrapper_main(argv):
         # subprocess.run kills AND reaps the child on timeout, so its partial
         # peak is already folded into RUSAGE_CHILDREN when it is read below; the
         # record reports the timeout so the consumer discards that value.
-        rc = subprocess.run(cmd, timeout=args.timeout).returncode
+        rc = subprocess.run(cmd, timeout=args.timeout, pass_fds=inherited).returncode
         wall = round(time.perf_counter() - t0, 6)
     except subprocess.TimeoutExpired:
         rc, status = TIMEOUT_EXIT, "timeout"
@@ -202,12 +231,18 @@ def wrapper_main(argv):
     return rc
 
 
-def measure(cmd, env=None, timeout=None, python=None):
+def measure(cmd, env=None, timeout=None, python=None, *, inherit_resources=False):
     """Run `cmd` under the wrapper and return its Sample (output captured as text).
 
     The wrapper enforces `timeout` itself so the measured child is the process
     it kills; the outer bound below only guards against a wedged wrapper.
     """
+    environment = os.environ if env is None else env
+    try:
+        inherited = resource_fds(environment) if inherit_resources else ()
+    except ResourceRefusal as error:
+        return Sample(EXEC_FAILED_EXIT, "wrapper-failed", None, None, "", str(error))
+
     fd, out = tempfile.mkstemp(prefix="peak-rss-", suffix=".json")
     os.close(fd)
     try:
@@ -215,8 +250,12 @@ def measure(cmd, env=None, timeout=None, python=None):
             # A supplied Python path remains an explicit wrapper override (and
             # must fail if missing). The normal Linux harness launches the
             # already-built native image directly, with no Python child image.
-            wrapper = ([str(native_sampler(env)[1])] if sys.platform == "linux" and python is None
-                       else [python or sys.executable, str(WRAPPER)])
+            if sys.platform == "linux" and python is None:
+                wrapper = [str(native_sampler(env)[1])]
+            else:
+                wrapper = [python or sys.executable, str(WRAPPER)]
+                if inherit_resources:
+                    wrapper.append("--inherit-resources")
         except (OSError, ValueError) as error:
             return Sample(EXEC_FAILED_EXIT, "wrapper-failed", None, None, "", str(error))
         wrapper += ["--out", out]
@@ -224,7 +263,7 @@ def measure(cmd, env=None, timeout=None, python=None):
             wrapper += ["--timeout", str(timeout)]
         wrapper += ["--", *cmd]
         try:
-            r = subprocess.run(wrapper, capture_output=True, text=True, env=env,
+            r = subprocess.run(wrapper, capture_output=True, text=True, env=env, pass_fds=inherited,
                                timeout=None if timeout is None else timeout + 60)
         except subprocess.TimeoutExpired:
             return Sample(TIMEOUT_EXIT, "timeout", None, None, "", "")

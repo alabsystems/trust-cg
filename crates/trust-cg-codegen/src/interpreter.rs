@@ -1247,14 +1247,16 @@ mod tests {
         let module = TrustIrModule::new("vector_constant");
         let interp = Interpreter::new(&module, InterpreterConfig::default());
 
-        let value = interp.eval_constant(&Constant::Vector(vec![
-            Constant::Int(-1),
-            Constant::Int(0),
-            Constant::Int(-1),
-            Constant::Int(0),
-        ]));
+        let value = interp
+            .eval_constant(&Constant::Vector(vec![
+                Constant::Int(-1),
+                Constant::Int(0),
+                Constant::Int(-1),
+                Constant::Int(0),
+            ]))
+            .unwrap();
 
-        assert!(matches!(value, Ok(InterpreterValue::Undef)));
+        assert!(matches!(value, InterpreterValue::Undef));
     }
 
     #[test]
@@ -1270,6 +1272,59 @@ mod tests {
                     matches!(interp.eval_constant(&value), Err(InterpreterError::Unsupported(reason)) if reason.contains("FnItem"))
                 );
             }
+        }
+    }
+
+    #[test]
+    fn nominal_constants_report_unsupported_instead_of_succeeding_with_an_undef_value() {
+        use trust_ir::{Block, BlockId, FuncTy, FuncTyId, Function, InstrNode, TyId};
+        let id = FuncId::new(1);
+        for (ty, value) in [
+            (Ty::FnItem(id), Constant::FnItem(id)),
+            (
+                Ty::Tuple(vec![Ty::FnItem(id)]),
+                Constant::Aggregate(vec![Constant::FnItem(id)]),
+            ),
+            (
+                Ty::Array(TyId::new(0), u64::MAX),
+                Constant::Splat {
+                    elem: Box::new(Constant::FnItem(id)),
+                    len: u64::MAX,
+                },
+            ),
+        ] {
+            let mut module = TrustIrModule::new("nominal_is_not_undef");
+            module
+                .func_types
+                .push(FuncTy::unrecorded(vec![], vec![], false));
+            module.types.push(Ty::FnItem(id));
+            let mut function =
+                Function::new(FuncId::new(0), "subject", FuncTyId::new(0), BlockId::new(0));
+            let mut block = Block::new(BlockId::new(0));
+            block
+                .body
+                .push(InstrNode::new(Inst::Const { ty, value }).with_result(ValueId::new(0)));
+            // The result is deliberately unused: returning [] cannot hide a
+            // new unsupported nominal constant behind the old Undef fallback.
+            block
+                .body
+                .push(InstrNode::new(Inst::Return { values: vec![] }));
+            function.blocks.push(block);
+            module.functions.push(function);
+            module.functions.push(Function::new(
+                id,
+                "nominal_target",
+                FuncTyId::new(0),
+                BlockId::new(0),
+            ));
+            let mut interpreter = Interpreter::new(&module, InterpreterConfig::default());
+            let error = interpreter.call_func(FuncId::new(0), &[]).unwrap_err();
+            assert!(matches!(error, InterpreterError::Unsupported(detail)
+                if detail.contains("Constant::FnItem")));
+            assert!(matches!(
+                interpreter.eval_constant(&Constant::Int(7)).unwrap(),
+                InterpreterValue::Int(7)
+            ));
         }
     }
 

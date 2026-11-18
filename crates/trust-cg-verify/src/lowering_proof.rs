@@ -28,6 +28,8 @@ mod canonical_conjunction_tests;
 mod checked_fcmp;
 mod checked_fp_values;
 #[cfg(test)]
+mod exhaustive_block_tests;
+#[cfg(test)]
 mod exhaustive_domain_tests;
 
 /// Canonical original-query construction, shared by every serializer and
@@ -1699,10 +1701,275 @@ fn multi_input_edge_battery(
     Ok(satisfied)
 }
 
-/// Enumerate the complete Cartesian input domain with a mixed-radix counter.
-/// The last coordinate changes fastest; only carry-affected bindings are
-/// updated. Scratch and the environment are allocated once, not per tuple.
+/// Enumerate the complete Cartesian input domain: every tuple of the declared
+/// inputs, once, in mixed-radix order (the last coordinate changes fastest),
+/// stopping at the first tuple whose sides differ.
+///
+/// A compiled obligation takes [`verify_exhaustive_blocked`], which visits
+/// the same tuples in the same order and decides each one the way
+/// [`check_single_point`] does; an uncompiled one takes the per-tuple
+/// [`verify_exhaustive_scalar`] loop.
 fn verify_exhaustive(
+    obligation: &ProofObligation,
+    compiled: Option<&CompiledObligation>,
+    input_count: u64,
+) -> VerificationResult {
+    match compiled {
+        Some(co) => verify_exhaustive_blocked(obligation, co, input_count),
+        None => verify_exhaustive_scalar(obligation, None, input_count),
+    }
+}
+
+/// Tuples evaluated per tape pass by [`verify_exhaustive_blocked`].
+const EXHAUSTIVE_BLOCK: usize = 256;
+
+/// [`verify_exhaustive`] for a compiled obligation, [`EXHAUSTIVE_BLOCK`]
+/// tuples per tape pass, on untagged lanes ([`FlatProg::eval_lanes`]).
+///
+/// What it checks is exactly what [`verify_exhaustive_scalar`] checks:
+///
+/// - **The tuples.** The same mixed-radix counter, started at all-zero and
+///   advanced once per tuple, fills the lanes of consecutive blocks until
+///   `input_count` tuples have been filled; the last block is partial when
+///   `input_count` is not a multiple of the block. Lane `l` of input slot `s`
+///   is `vars[s * EXHAUSTIVE_BLOCK + l]`, the value the scalar loop's
+///   environment holds at slot `s` for that tuple. (Input `s` is environment
+///   slot `s` because an exhaustive domain has no repeated input name:
+///   [`exhaustive_input_count`] refuses one.)
+/// - **The values.** [`FlatProg::eval_lanes`] computes every tape node with
+///   the same `smt::eval_flat_op` that [`FlatProg::eval`] uses, and checks
+///   that every computed value is stored without loss, so each lane's root,
+///   decoded, is the `SVal` the scalar evaluator returns for that tuple.
+/// - **The decision.** Lanes are decided in tuple order with
+///   [`check_single_point`]'s compiled-path rule on the same `EvalResult`s:
+///   a tuple at which any precondition is not `as_bool` is unmet, otherwise
+///   the sides are compared with `semantically_equal`.
+/// - **The failure.** The first lane, in tuple order, that is not equal is
+///   decided by [`check_single_point`] itself at an environment built exactly
+///   as the scalar loop builds it, so a counterexample is the same tuple with
+///   the same text. If that scalar decision does not confirm the
+///   disagreement, the two evaluators disagree, which their shared node
+///   semantics rules out; the sweep then stops with `Unknown` rather than
+///   choosing between them.
+///
+/// A tape with a value the lanes cannot hold (a `Bv128` or `Poison` at the
+/// first tuple, or at any later tuple a value of another variant than its
+/// node held at the first) sends the whole sweep, from its first tuple, to
+/// [`verify_exhaustive_scalar`]; no decision taken before that is kept.
+fn verify_exhaustive_blocked(
+    obligation: &ProofObligation,
+    co: &CompiledObligation,
+    input_count: u64,
+) -> VerificationResult {
+    const B: usize = EXHAUSTIVE_BLOCK;
+    let per_tuple = || {
+        #[cfg(test)]
+        exhaustive_visit_probe::restart();
+        verify_exhaustive_scalar(obligation, Some(co), input_count)
+    };
+    let mut first = EvalEnv::default();
+    for (name, _) in &obligation.inputs {
+        first.insert(name.clone(), 0);
+    }
+    let Some(pre_kinds) = co
+        .preconds
+        .iter()
+        .map(|pc| pc.lane_kinds(&first))
+        .collect::<Option<Vec<_>>>()
+    else {
+        return per_tuple();
+    };
+    let (Some(src_kinds), Some(tgt_kinds)) = (
+        co.trust_ir.lane_kinds(&first),
+        co.aarch64.lane_kinds(&first),
+    ) else {
+        return per_tuple();
+    };
+    let src_root = src_kinds[co.trust_ir.root_index()];
+    let tgt_root = tgt_kinds[co.aarch64.root_index()];
+    let same_root_kind = src_root == tgt_root;
+
+    let widths: Vec<u32> = obligation.inputs.iter().map(|(_, w)| *w).collect();
+    let slots = widths.len();
+    let mut counter = vec![0u64; slots];
+    let mut vars = vec![0u64; slots * B];
+    let mut met = [true; B];
+    let mut cols_pre: Vec<u64> = Vec::new();
+    let mut cols_src: Vec<u64> = Vec::new();
+    let mut cols_tgt: Vec<u64> = Vec::new();
+    let mut saw_satisfying = false;
+    let mut filled = 0u64;
+    while filled < input_count {
+        let lanes = (input_count - filled).min(B as u64) as usize;
+        for lane in 0..lanes {
+            for (slot, value) in counter.iter().enumerate() {
+                vars[slot * B + lane] = *value;
+            }
+            for (slot, width) in widths.iter().enumerate().rev() {
+                counter[slot] += 1;
+                if counter[slot] < (1u64 << *width) {
+                    break;
+                }
+                counter[slot] = 0;
+            }
+        }
+        filled += lanes as u64;
+
+        met[..lanes].fill(true);
+        for (pc, kinds) in co.preconds.iter().zip(&pre_kinds) {
+            let Some(root) = pc.eval_lanes(kinds, &vars, B, lanes, &mut cols_pre) else {
+                return per_tuple();
+            };
+            let root_kind = kinds[pc.root_index()];
+            for (lane, payload) in root.iter().enumerate() {
+                if !root_kind.decode(*payload).to_eval().as_bool() {
+                    met[lane] = false;
+                }
+            }
+        }
+        let Some(source) = co
+            .trust_ir
+            .eval_lanes(&src_kinds, &vars, B, lanes, &mut cols_src)
+        else {
+            return per_tuple();
+        };
+        let Some(target) = co
+            .aarch64
+            .eval_lanes(&tgt_kinds, &vars, B, lanes, &mut cols_tgt)
+        else {
+            return per_tuple();
+        };
+        for lane in 0..lanes {
+            #[cfg(test)]
+            exhaustive_visit_probe::record(&vars, B, lane, slots);
+            let lane_met = met[lane];
+            let target_lane = target[lane];
+            // Test-only fault injection: makes this sweep disagree with the
+            // per-tuple decision at one tuple, so the disagreement arm below
+            // is exercised. Compiled out of every non-test build.
+            #[cfg(test)]
+            let (lane_met, target_lane) = exhaustive_visit_probe::fault(
+                filled - lanes as u64 + lane as u64,
+                lane_met,
+                target_lane,
+            );
+            if !lane_met {
+                continue;
+            }
+            // Same kind and same payload decode to the same `Bv` or `Bool`,
+            // which `semantically_equal` holds equal; any other lane is
+            // decided by `semantically_equal` itself.
+            if (same_root_kind && source[lane] == target_lane)
+                || src_root
+                    .decode(source[lane])
+                    .to_eval()
+                    .semantically_equal(&tgt_root.decode(target_lane).to_eval())
+            {
+                saw_satisfying = true;
+                continue;
+            }
+            let mut env = EvalEnv::default();
+            for (slot, (name, _)) in obligation.inputs.iter().enumerate() {
+                env.insert(name.clone(), vars[slot * B + lane]);
+            }
+            let mut scratch: Vec<SVal> = Vec::new();
+            return match check_single_point(obligation, Some(co), &env, &mut scratch) {
+                PointCheck::Counterexample(result) => result,
+                PointCheck::Inconclusive(reason) => VerificationResult::Unknown { reason },
+                PointCheck::Equal | PointCheck::PreconditionUnmet => VerificationResult::Unknown {
+                    reason: format!(
+                        "the blocked and per-tuple evaluators disagree at inputs {env:?}; \
+                         no verdict"
+                    ),
+                },
+            };
+        }
+    }
+    sweep_verdict(obligation, saw_satisfying)
+}
+
+/// Test-only record of the tuples an exhaustive sweep decides, in decision
+/// order, as the input values its tapes read: the blocked sweep's lanes, or
+/// the per-tuple loop's environment. Off unless a test
+/// turns it on for its own thread.
+#[cfg(test)]
+pub(crate) mod exhaustive_visit_probe {
+    use std::cell::RefCell;
+
+    thread_local! {
+        static VISITS: RefCell<Option<Vec<Vec<u64>>>> = const { RefCell::new(None) };
+        static FAULT: std::cell::Cell<Option<(Fault, u64)>> = const { std::cell::Cell::new(None) };
+    }
+
+    /// A deliberate disagreement the blocked sweep takes at one tuple index.
+    #[derive(Clone, Copy, Debug)]
+    pub(crate) enum Fault {
+        /// Flip bit 0 of the expansion side's stored root payload.
+        FlipTarget,
+        /// Treat the tuple's preconditions as met.
+        ForceMet,
+    }
+
+    /// Inject `fault` at tuple index `tuple` (mixed-radix order, from 0) on
+    /// this thread until [`clear_fault`].
+    pub(crate) fn inject_fault(fault: Fault, tuple: u64) {
+        FAULT.with(|f| f.set(Some((fault, tuple))));
+    }
+
+    pub(crate) fn clear_fault() {
+        FAULT.with(|f| f.set(None));
+    }
+
+    pub(super) fn fault(tuple: u64, met: bool, target: u64) -> (bool, u64) {
+        match FAULT.with(|f| f.get()) {
+            Some((Fault::FlipTarget, at)) if at == tuple => (met, target ^ 1),
+            Some((Fault::ForceMet, at)) if at == tuple => (true, target),
+            _ => (met, target),
+        }
+    }
+
+    /// Start recording on this thread, discarding any earlier record.
+    pub(crate) fn start() {
+        VISITS.with(|v| *v.borrow_mut() = Some(Vec::new()));
+    }
+
+    /// Forget what was recorded so far (the sweep starts again from its
+    /// first tuple), keeping the recorder on.
+    pub(super) fn restart() {
+        VISITS.with(|v| {
+            if let Some(visits) = v.borrow_mut().as_mut() {
+                visits.clear();
+            }
+        });
+    }
+
+    /// Record one tuple given as its values.
+    pub(super) fn record_values(values: Vec<u64>) {
+        VISITS.with(|v| {
+            if let Some(visits) = v.borrow_mut().as_mut() {
+                visits.push(values);
+            }
+        });
+    }
+
+    /// Stop recording and return what was recorded since [`start`].
+    pub(crate) fn take() -> Vec<Vec<u64>> {
+        VISITS.with(|v| v.borrow_mut().take().unwrap_or_default())
+    }
+
+    pub(super) fn record(vars: &[u64], stride: usize, lane: usize, slots: usize) {
+        VISITS.with(|v| {
+            if let Some(visits) = v.borrow_mut().as_mut() {
+                visits.push((0..slots).map(|slot| vars[slot * stride + lane]).collect());
+            }
+        });
+    }
+}
+
+/// The per-tuple exhaustive loop: one environment, updated in place, and one
+/// [`check_single_point`] per tuple. Scratch and the environment are
+/// allocated once, not per tuple.
+fn verify_exhaustive_scalar(
     obligation: &ProofObligation,
     compiled: Option<&CompiledObligation>,
     input_count: u64,
@@ -1714,6 +1981,14 @@ fn verify_exhaustive(
     }
     let mut saw_satisfying = false;
     for _ in 0..input_count {
+        #[cfg(test)]
+        exhaustive_visit_probe::record_values(
+            obligation
+                .inputs
+                .iter()
+                .map(|(name, _)| *env.get(name).expect("exhaustive input must be bound"))
+                .collect(),
+        );
         match check_single_point(obligation, compiled, &env, &mut scratch) {
             PointCheck::Counterexample(result) => return result,
             PointCheck::Inconclusive(reason) => return VerificationResult::Unknown { reason },

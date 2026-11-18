@@ -394,15 +394,30 @@ impl RegAllocFunction {
     /// additional identities outside the arena must observe them before
     /// allocating; commit the counter only after the complete plan succeeds.
     pub(crate) fn vreg_allocation_plan(&self) -> VRegAllocationPlan {
+        self.vreg_allocation_plan_with_highest(self.highest_vreg_id())
+    }
+
+    /// The largest register ID any instruction of the arena names, the value
+    /// [`Self::vreg_allocation_plan`] scans for.
+    pub(crate) fn highest_vreg_id(&self) -> Option<u32> {
+        self.insts
+            .iter()
+            .flat_map(|inst| inst.vreg_defs().chain(inst.vreg_uses()))
+            .map(|reg| reg.id)
+            .max()
+    }
+
+    /// [`Self::vreg_allocation_plan`] with the arena's highest register ID
+    /// supplied by a caller that tracked it (see
+    /// `split::SplitIdCache`) instead of scanned.
+    pub(crate) fn vreg_allocation_plan_with_highest(
+        &self,
+        highest_existing: Option<u32>,
+    ) -> VRegAllocationPlan {
         VRegAllocationPlan {
             ids: FreshIdCursor {
                 next: self.next_vreg,
-                highest_existing: self
-                    .insts
-                    .iter()
-                    .flat_map(|inst| inst.vreg_defs().chain(inst.vreg_uses()))
-                    .map(|reg| reg.id)
-                    .max(),
+                highest_existing,
             },
         }
     }
@@ -422,6 +437,12 @@ impl VRegAllocationPlan {
 
     pub(crate) fn allocate(&mut self, class: RegClass) -> Option<VReg> {
         self.ids.allocate().map(|id| VReg::new(id, class))
+    }
+
+    /// The ID the next [`Self::allocate`] would issue, without issuing it.
+    #[cfg(any(test, debug_assertions))]
+    pub(crate) fn peek_id(&self) -> Option<u32> {
+        self.ids.peek()
     }
 
     pub(crate) fn next_vreg(&self) -> u32 {
@@ -462,12 +483,20 @@ impl FreshIdCursor {
     }
 
     fn allocate(&mut self) -> Option<u32> {
+        let id = self.peek()?;
+        let next = id.checked_add(1)?;
+        self.next = next;
+        Some(id)
+    }
+
+    /// The ID [`Self::allocate`] issues next (`None` on exhaustion), without
+    /// issuing it.
+    fn peek(&self) -> Option<u32> {
         let id = match self.highest_existing {
             Some(highest) => self.next.max(highest.checked_add(1)?),
             None => self.next,
         };
-        let next = id.checked_add(1)?;
-        self.next = next;
+        id.checked_add(1)?;
         Some(id)
     }
 }

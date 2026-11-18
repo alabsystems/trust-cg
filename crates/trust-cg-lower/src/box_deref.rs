@@ -16,21 +16,37 @@
 //! call the same two functions before their own lowering. No lane restates
 //! the rule, and no lane compares tiers itself.
 //!
-//! The verdict is trust-ir's, never this crate's: the structural rules of the
-//! carried fact (rules 1 to 9) and the evidence floor are read from
+//! The structural rules of the carried fact (rules 1 to 9) and the evidence
+//! floor are trust-ir's, read from
 //! `trust_ir_build::validate_module_for_codegen_with` under
 //! `CodegenAdmission::with_require_box_validity_evidence`. This module
 //! classifies those findings as one typed refusal
-//! ([`AdapterError::BoxDerefNotAdmitted`]) and writes the manifest.
+//! ([`AdapterError::BoxDerefNotAdmitted`]) and writes the manifest. The one
+//! verdict it adds is its own re-derivation (below), which only the floors
+//! that opt into it consult, and which can only discharge a floor finding
+//! for a conjunct it establishes; it never relaxes a rule.
 //!
-//! # The two floors
+//! # The three floors
 //!
-//! [`BoxValidityFloor`] has two values and no spelling for anything weaker:
+//! [`BoxValidityFloor`] has three values, most restrictive first, and no
+//! spelling for anything weaker than the last:
 //!
-//! - [`BoxValidityFloor::Refuse`] (the default of every policy): trust-ir's
-//!   `ConsumerRederived` floor. No evidence kind of the pinned format reaches
-//!   it, so every `BoxDeref` is refused. This is the proof-required answer:
-//!   a named premise is not evidence a proof lane may rest on.
+//! - [`BoxValidityFloor::Refuse`] (the default of every policy, and the gate
+//!   of every proof-emitting, verified-promotion and JIT-verified compile):
+//!   trust-ir's `ConsumerRederived` floor, exactly as trust-ir states it. No
+//!   evidence kind of the pinned format reaches it, so every `BoxDeref` is
+//!   refused at it. This backend's re-derivation is NOT consulted here.
+//! - [`BoxValidityFloor::LocallyRederived`] (opt-in by name,
+//!   [`crate::CodegenLicensePolicy::with_locally_rederived_box_floor`]):
+//!   trust-ir's findings at its `ConsumerRederived` floor, each discharged
+//!   only for a conjunct this backend RE-DERIVES itself from the function's
+//!   own instructions ([`crate::box_deref_rederive`]): a stack slot or a
+//!   success-tested Rust-heap allocation of the same function, in bounds,
+//!   aligned, and neither freed nor escaped on any path to the deref. Every
+//!   other `BoxDeref` is refused, and a named premise is never evidence at
+//!   it. This is a consumer-local verdict, not trust-ir's tier (which is
+//!   defined as what EVERY consumer re-derives), so it has its own name and
+//!   its own license identity token.
 //! - [`BoxValidityFloor::NamedPremise`]: trust-ir's `NamedPremise` floor. A
 //!   consumer opts in by name and only by handing over the place the
 //!   assumptions are reported
@@ -40,11 +56,28 @@
 //!   It admits a fact whose every conjunct is a premise on a root the format
 //!   classes as a named premise, and refuses the assumed roots
 //!   (`returned_box_assumed`, `reference_arg_box_valid`) and both reserved
-//!   evidence kinds.
+//!   evidence kinds, except that a conjunct this backend re-derives
+//!   discharges its finding here too, so this floor admits everything
+//!   `LocallyRederived` admits.
 //!
 //! The shared floor, which has no policy in scope, checks every module at
 //! [`BoxValidityFloor::MOST_PERMISSIVE`]: nothing below trust-ir's
-//! `NamedPremise` floor is admitted on any path, whatever a policy says.
+//! `NamedPremise` floor, and nothing `LocallyRederived` would refuse, is
+//! admitted on any path, whatever a policy says.
+//!
+//! # The consumer re-derivation
+//!
+//! At a floor that opts into it ([`BoxValidityFloor::rederives`]), trust-ir's
+//! floor finding for a conjunct this backend re-derives
+//! ([`crate::box_deref_rederive`]) is discharged ([`discharged_by_rederivation`],
+//! used by the three entries that read trust-ir's findings). Nothing else is
+//! relaxed: the structural rules of the fact (1 to 9) still refuse first, a
+//! conjunct that is not re-derived keeps trust-ir's floor finding, and the
+//! re-derivation is a decision of this consumer that is never written back
+//! into the module (the v74 wire has no consumer-re-derived evidence kind).
+//! The manifest keeps the fact's own evidence tier and lists the re-derived
+//! conjuncts separately; a row whose every conjunct is re-derived is not an
+//! assumption and is not disclosed as one.
 //!
 //! # What an admitted instruction licenses
 //!
@@ -53,24 +86,35 @@
 //! manifest and reported, and no pass or lowering may use it, or the
 //! instruction's undefined behaviour, to remove a check or a branch or to
 //! move or introduce a memory access (section 28, "No licence from the
-//! undefined behaviour"). The manifest is evidence of what was assumed, not
-//! of validity.
+//! undefined behaviour"). A re-derived conjunct licenses nothing either: it
+//! decides admission only. The manifest is evidence of what was assumed and
+//! of what this backend re-derived, not a proof of validity.
 
-use trust_ir::box_validity::{BoxDerefSite, BoxValidityTier, PremiseRoot};
-use trust_ir::{Function, Inst, Module};
+use trust_ir::box_validity::{BoxDerefSite, BoxValidityTier, PremiseRoot, ValidityConjunct};
+use trust_ir::{BlockId, Function, Inst, Module};
 
 use crate::adapter::AdapterError;
+pub(crate) use crate::box_deref_rederive::ModuleRederiver;
 
 /// The evidence floor a consumer holds `Inst::BoxDeref` to. Ordered most
-/// restrictive first; there is no value below trust-ir's `NamedPremise`.
+/// restrictive first; each floor admits everything the floors before it
+/// admit, and there is no value below trust-ir's `NamedPremise`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Default)]
 pub enum BoxValidityFloor {
-    /// Refuse every `BoxDeref` (trust-ir's `ConsumerRederived` floor). The
-    /// default, and the only floor a proof-required lane may use.
+    /// Refuse every `BoxDeref` (trust-ir's `ConsumerRederived` floor, which
+    /// no v74 evidence reaches; this backend's re-derivation is not
+    /// consulted). The default, and the only floor a proof-required lane may
+    /// use.
     #[default]
     Refuse,
+    /// Admit only a `BoxDeref` whose every conjunct this backend re-derives
+    /// from its own function (trust-ir's findings at `ConsumerRederived`,
+    /// discharged per conjunct by [`crate::box_deref_rederive`]). Opt-in; a
+    /// consumer-local verdict, not trust-ir's tier.
+    LocallyRederived,
     /// Admit a fact whose every conjunct rests on a named premise (trust-ir's
-    /// `NamedPremise` floor). Opt-in; the diagnostic lane's floor.
+    /// `NamedPremise` floor) or is re-derived by this backend. Opt-in; the
+    /// diagnostic lane's floor.
     NamedPremise,
 }
 
@@ -79,19 +123,34 @@ impl BoxValidityFloor {
     /// policy-free shared floor checks every module against.
     pub const MOST_PERMISSIVE: Self = Self::NamedPremise;
 
-    /// The trust-ir tier this floor is.
+    /// The trust-ir tier whose findings this floor reads.
     #[must_use]
     pub const fn tier(self) -> BoxValidityTier {
         match self {
-            Self::Refuse => BoxValidityTier::ConsumerRederived,
+            Self::Refuse | Self::LocallyRederived => BoxValidityTier::ConsumerRederived,
             Self::NamedPremise => BoxValidityTier::NamedPremise,
         }
     }
 
-    /// The diagnostic spelling: trust-ir's name of the tier.
+    /// Whether this floor consults this backend's own re-derivation to
+    /// discharge a trust-ir floor finding. `Refuse` never does.
+    #[must_use]
+    pub const fn rederives(self) -> bool {
+        match self {
+            Self::Refuse => false,
+            Self::LocallyRederived | Self::NamedPremise => true,
+        }
+    }
+
+    /// The diagnostic and identity spelling: trust-ir's name of the tier for
+    /// the two floors that are trust-ir's, and this backend's own name for
+    /// the consumer-local one (never trust-ir's tier name).
     #[must_use]
     pub const fn name(self) -> &'static str {
-        self.tier().name()
+        match self {
+            Self::Refuse | Self::NamedPremise => self.tier().name(),
+            Self::LocallyRederived => "trust_cg_locally_rederived_v1",
+        }
     }
 }
 
@@ -104,6 +163,10 @@ pub enum BoxDerefRefusal {
         conjunct: &'static str,
         tier: &'static str,
         floor: &'static str,
+        /// Why this backend's own re-derivation did not establish the
+        /// conjunct (`None` where the entry classified the finding without
+        /// running it).
+        not_rederived: Option<&'static str>,
     },
     /// trust-ir's validator refused the carried fact under one of its
     /// structural rules; `rule` is its variant name and `finding` its text.
@@ -123,11 +186,18 @@ impl std::fmt::Display for BoxDerefRefusal {
                 conjunct,
                 tier,
                 floor,
-            } => write!(
-                f,
-                "conjunct {conjunct} is backed at tier {tier}, below this lane's Box validity \
-                 floor {floor}"
-            ),
+                not_rederived,
+            } => {
+                write!(
+                    f,
+                    "conjunct {conjunct} is backed at tier {tier}, below this lane's Box validity \
+                     floor {floor}"
+                )?;
+                if let Some(why) = not_rederived {
+                    write!(f, "; this backend does not re-derive it: {why}")?;
+                }
+                Ok(())
+            }
             Self::FactRefused { rule, finding } => {
                 write!(f, "trust-ir refuses its validity fact ({rule}): {finding}")
             }
@@ -154,8 +224,26 @@ pub struct BoxDerefManifestRow {
     pub site: BoxDerefSite,
     /// The one root every premise of the fact names.
     pub root: PremiseRoot,
-    /// The fact's weakest evidence tier.
+    /// The weakest evidence tier the FACT carries, exactly as trust-ir
+    /// grades it. Never raised by this backend's re-derivation, which is
+    /// reported in `rederived` instead.
     pub tier: BoxValidityTier,
+    /// The conjuncts this backend re-derived from the function itself, in
+    /// canonical order (empty when none was, and always empty at a floor that
+    /// does not consult the re-derivation).
+    pub rederived: Vec<ValidityConjunct>,
+    /// The conjuncts that rest on the fact's evidence alone, below trust-ir's
+    /// `ConsumerRederived` tier and not in `rederived`, in canonical order.
+    pub assumed: Vec<ValidityConjunct>,
+}
+
+impl BoxDerefManifestRow {
+    /// Whether the row rests on an assumption: some conjunct is backed only
+    /// by the fact's evidence and was not re-derived.
+    #[must_use]
+    pub fn is_assumption(&self) -> bool {
+        !self.assumed.is_empty()
+    }
 }
 
 /// The assumptions a module was admitted under: one row per admitted
@@ -173,11 +261,13 @@ impl BoxDerefManifest {
     /// failure, so this deliberately makes no claim that code was compiled.
     #[must_use]
     pub fn disclosure(&self) -> Option<String> {
-        if self.rows.is_empty() {
+        let assumed: Vec<&BoxDerefManifestRow> =
+            self.rows.iter().filter(|row| row.is_assumption()).collect();
+        if assumed.is_empty() {
             return None;
         }
         let mut by_root = std::collections::BTreeMap::<&'static str, usize>::new();
-        for row in &self.rows {
+        for row in &assumed {
             *by_root.entry(row.root.name()).or_default() += 1;
         }
         let roots = by_root
@@ -189,7 +279,7 @@ impl BoxDerefManifest {
             "admitted for compilation under named assumptions: Box validity at {} \
              instruction(s) is assumed for admission, not established ({roots}; standing: \
              safe_body, sound_callees, box_unique)",
-            self.rows.len()
+            assumed.len()
         ))
     }
 }
@@ -244,12 +334,12 @@ impl BoxDerefDisclosure {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    /// Record one admission. A manifest with no row (a module holding no
-    /// `BoxDeref`) assumed nothing and is not recorded; a verdict repeated
-    /// for the same module (a license is consulted more than once per
-    /// compile) is recorded once.
+    /// Record one admission. A manifest with no assumed row (a module
+    /// holding no `BoxDeref`, or only wholly re-derived ones) assumed nothing
+    /// and is not recorded; a verdict repeated for the same module (a license
+    /// is consulted more than once per compile) is recorded once.
     pub(crate) fn record(&self, module: &Module, manifest: &BoxDerefManifest) {
-        if manifest.rows.is_empty() {
+        if !manifest.rows.iter().any(BoxDerefManifestRow::is_assumption) {
             return;
         }
         let record = BoxDerefDisclosureRecord {
@@ -355,17 +445,48 @@ pub fn admit_box_derefs(
     if let Some(refusal) = findings.iter().find_map(fact_rule_refusal) {
         return Err(refusal);
     }
-    if let Some(refusal) = findings.iter().find_map(floor_refusal) {
+    // At a floor that consults it, a floor finding stands unless this
+    // backend re-derives its conjunct; the refusal of one that stands says
+    // why the re-derivation did not. At `Refuse` every floor finding stands
+    // exactly as trust-ir reported it.
+    let mut rederiver = ModuleRederiver::new(module);
+    if let Some(refusal) = findings
+        .iter()
+        .find_map(|error| floor_refusal_explained(&mut rederiver, floor, error))
+    {
         return Err(refusal);
     }
     let mut rows = Vec::new();
-    for func in &module.functions {
+    for (function, func) in module.functions.iter().enumerate() {
         for block in &func.blocks {
             for (inst_index, node) in block.body.iter().enumerate() {
                 let Inst::BoxDeref { fact, .. } = &node.inst else {
                     continue;
                 };
-                let (Some(root), Some(tier)) = (fact.premise_root(), fact.weakest_tier()) else {
+                let rederived: Vec<ValidityConjunct> = if floor.rederives() {
+                    rederiver
+                        .rederive(function, block.id, inst_index)
+                        .map(|rederivation| rederivation.established_conjuncts())
+                        .unwrap_or_default()
+                } else {
+                    Vec::new()
+                };
+                let tier = fact
+                    .evidence
+                    .iter()
+                    .map(|entry| entry.evidence.tier())
+                    .min();
+                // In the fact's own (canonical, rule-checked) order.
+                let mut assumed: Vec<ValidityConjunct> = Vec::new();
+                for entry in &fact.evidence {
+                    if entry.evidence.tier() < BoxValidityTier::ConsumerRederived
+                        && !rederived.contains(&entry.conjunct)
+                        && !assumed.contains(&entry.conjunct)
+                    {
+                        assumed.push(entry.conjunct);
+                    }
+                }
+                let (Some(root), Some(tier)) = (fact.premise_root(), tier) else {
                     return Err(AdapterError::BoxDerefNotAdmitted {
                         function: func.name.clone(),
                         block: block.id.index(),
@@ -380,6 +501,8 @@ pub fn admit_box_derefs(
                     site: fact.site,
                     root,
                     tier,
+                    rederived,
+                    assumed,
                 });
             }
         }
@@ -401,10 +524,17 @@ pub(crate) fn admission_at<'a>(
 }
 
 /// The typed refusal of one trust-ir finding, when the finding is about a
-/// `BoxDeref` (a rule of its fact, or the evidence floor). The classifier
-/// every entry shares; `None` for a finding about anything else.
-pub(crate) fn refusal_of_finding(error: &trust_ir_build::ValidationError) -> Option<AdapterError> {
-    fact_rule_refusal(error).or_else(|| floor_refusal(error))
+/// `BoxDeref` (a rule of its fact, or the evidence floor), for an entry that
+/// read trust-ir's findings at `floor`. The classifier every entry shares;
+/// `None` for a finding about anything else, and for a floor finding `floor`
+/// discharges.
+pub(crate) fn refusal_of_finding(
+    module: &Module,
+    floor: BoxValidityFloor,
+    error: &trust_ir_build::ValidationError,
+) -> Option<AdapterError> {
+    fact_rule_refusal(error)
+        .or_else(|| floor_refusal_explained(&mut ModuleRederiver::new(module), floor, error))
 }
 
 /// trust-ir's structural verdict on a fact, as this backend's typed refusal.
@@ -451,6 +581,18 @@ fn fact_rule_refusal(error: &trust_ir_build::ValidationError) -> Option<AdapterE
                 unreachable!("typed BoxDeref rule disagrees with its validation error")
             };
             (function, block, inst_index, "BoxDerefConjunctCover")
+        }
+        R::ConjunctUnestablished => {
+            let V::BoxDerefConjunctUnestablished {
+                function,
+                block,
+                inst_index,
+                ..
+            } = error
+            else {
+                unreachable!("typed BoxDeref rule disagrees with its validation error")
+            };
+            (function, block, inst_index, "BoxDerefConjunctUnestablished")
         }
         R::PremiseNotPinned => {
             let V::BoxDerefPremiseNotPinned {
@@ -545,6 +687,94 @@ fn fact_rule_refusal(error: &trust_ir_build::ValidationError) -> Option<AdapterE
     })
 }
 
+/// The conjunct of a trust-ir floor finding and this backend's
+/// re-derivation of its instruction, or `None` for any other finding and for
+/// one whose function is not named by exactly one function of the module (a
+/// finding is never matched to a guessed body).
+fn rederivation_for_finding(
+    rederiver: &mut ModuleRederiver<'_>,
+    error: &trust_ir_build::ValidationError,
+) -> Option<(ValidityConjunct, crate::box_deref_rederive::Rederivation)> {
+    let trust_ir_build::ValidationError::BoxValidityEvidenceBelowFloor {
+        function,
+        block,
+        inst_index,
+        conjunct,
+        ..
+    } = error
+    else {
+        return None;
+    };
+    let conjunct = ValidityConjunct::from_name(conjunct)?;
+    let mut named = rederiver
+        .module()
+        .functions
+        .iter()
+        .enumerate()
+        .filter(|(_, func)| func.name == *function)
+        .map(|(index, _)| index);
+    let (Some(index), None) = (named.next(), named.next()) else {
+        return None;
+    };
+    let rederivation = rederiver.rederive(
+        index,
+        BlockId::new(*block),
+        usize::try_from(*inst_index).ok()?,
+    )?;
+    Some((conjunct, rederivation))
+}
+
+/// Whether `error` is a trust-ir floor finding that `floor` discharges: the
+/// floor consults this backend's re-derivation
+/// ([`BoxValidityFloor::rederives`]; `Refuse` never does) and the
+/// re-derivation establishes the finding's conjunct from the instruction's
+/// own function. The one predicate every entry that reads trust-ir's
+/// findings applies before it classifies them ([`admit_box_derefs`],
+/// `validate_codegen_prerequisites`, `ingest::admission_findings`), each
+/// with the floor it read them at and one [`ModuleRederiver`] for all of
+/// them: a discharged finding is not a refusal, and every other finding is
+/// left exactly as trust-ir reported it.
+#[must_use]
+pub(crate) fn discharged_by_rederivation(
+    rederiver: &mut ModuleRederiver<'_>,
+    floor: BoxValidityFloor,
+    error: &trust_ir_build::ValidationError,
+) -> bool {
+    floor.rederives()
+        && rederivation_for_finding(rederiver, error)
+            .is_some_and(|(conjunct, rederivation)| rederivation.established(conjunct))
+}
+
+/// trust-ir's floor verdict, as this backend's typed refusal, unless `floor`
+/// consults the re-derivation and it establishes the finding's conjunct
+/// (then `None`: discharged). At such a floor a refusal that stands carries
+/// the re-derivation's reason; at `Refuse` it is trust-ir's verdict
+/// unchanged. Every entry classifies a floor finding through this one
+/// function, so the refusal text is the same on every target.
+fn floor_refusal_explained(
+    rederiver: &mut ModuleRederiver<'_>,
+    floor: BoxValidityFloor,
+    error: &trust_ir_build::ValidationError,
+) -> Option<AdapterError> {
+    let mut refusal = floor_refusal(error)?;
+    if !floor.rederives() {
+        return Some(refusal);
+    }
+    if let Some((conjunct, rederivation)) = rederivation_for_finding(rederiver, error) {
+        let Err(why) = rederivation.verdict(conjunct) else {
+            return None;
+        };
+        if let AdapterError::BoxDerefNotAdmitted {
+            reason: BoxDerefRefusal::EvidenceBelowFloor { not_rederived, .. },
+            ..
+        } = &mut refusal
+        {
+            *not_rederived = Some(why.reason());
+        }
+    }
+    Some(refusal)
+}
+
 /// trust-ir's floor verdict, as this backend's typed refusal.
 fn floor_refusal(error: &trust_ir_build::ValidationError) -> Option<AdapterError> {
     let trust_ir_build::ValidationError::BoxValidityEvidenceBelowFloor {
@@ -566,6 +796,7 @@ fn floor_refusal(error: &trust_ir_build::ValidationError) -> Option<AdapterError
             conjunct,
             tier,
             floor,
+            not_rederived: None,
         },
     })
 }

@@ -51,6 +51,8 @@ use scalar_values::{CompareKind, ComparisonFlags, Predicate, ScalarType, ScalarV
 
 #[path = "aarch64_affine_lowering_trust_ir.rs"]
 mod trust_ir_binding;
+#[cfg(feature = "source-defined-call")]
+pub(crate) use trust_ir_binding::check_plain_integer_entry_abi;
 
 pub use trust_ir_binding::{
     AffineByteError, AffineByteStatistics, AttachedDefinedAffineCallee,
@@ -61,6 +63,16 @@ pub use trust_ir_binding::{
     TrustIrAffineLoweringError, TrustIrAffineLoweringStatistics, check_aarch64_defined_call_bytes,
     check_aarch64_trust_ir_affine_bytes, check_aarch64_trust_ir_affine_lowering,
 };
+
+// Issued only inside the immutable complete-byte owner. A public numeric
+// statistics value or a claimed private extent cannot supply this observation.
+// Effects inherit the untagged Normal-memory/GCS-disabled normal-return model;
+// this closed class does not establish machine mode or access authority.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum NormalReturnMemoryEffect {
+    Unchanged,
+    StandardFpLrRecord,
+}
 
 /// Located refusal; unsupported coverage is distinct from invalid inputs and
 /// unequal observable results. None of these errors grants weaker authority.

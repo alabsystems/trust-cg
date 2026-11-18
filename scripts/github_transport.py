@@ -235,30 +235,42 @@ class Transport:
                 raise Refused("fetched ref differs from its admitted raw object ID")
         return rows
 
-    def fetch_main(self, remote):
+    def has_local_checkout(self, oid):
+        # Verify this checkout and its commit ancestry without reading historical
+        # blob bodies. The transport's Git environment disables lazy fetching,
+        # replacements and grafts. Do not let a commit graph mask missing commits.
+        if (git(self.repo, "cat-file", "-t", oid, check=False) != "commit"
+                or git(self.repo, "rev-parse", "--is-shallow-repository") != "false"):
+            return False
+        ancestry = run(["git", "-C", self.repo, "-c", "core.commitGraph=false",
+                        "rev-list", "--count", oid], check=False)
+        if ancestry.returncode:
+            return False
+        checkout = run(["git", "-C", self.repo, "rev-list", "--objects", "--quiet",
+                        "--missing=error", f"{oid}^{{tree}}"], check=False)
+        return checkout.returncode == 0
+
+    def fetch_main(self, remote, *, reuse_checkout=False):
         destination = ref(self.repo, f"refs/remotes/{remote}/main")
         # Capture before any network work, so a concurrent import cannot be
         # overwritten by a later observation from this invocation.
         before = old_ref(self.repo, destination)
-        if self.slug is None:
-            oid = self.main()
-            self.fetch({"refs/heads/main": oid})
-        else:
+        cache = "refs/agh/fetched-main"
+        if self.slug is not None:
             run(["agh", "repo", "check-local", self.slug, self.repo])
-            cache = "refs/agh/fetched-main"
             guard_ref(self.repo, cache)
-            # Resolve the fresh remote identity before requesting its complete
-            # checkout and ancestry metadata. Local objects are cache DATA,
-            # checked by native agh; neither their refs nor artifacts grant
-            # authority. Historical checkout bodies are not a main-source input.
-            expected = self.main()
-            run(["agh", "repo", "fetch", self.slug, self.repo,
-                 "--ref", expected, "--into", cache, "--checkout-closure",
-                 "--checkout-cache", self.repo])
-            guard_ref(self.repo, cache)
-            oid = sha(git(self.repo, "rev-parse", "--verify", cache))
-            if oid != expected:
-                raise Refused("native main checkout differs from the fresh remote identity")
+        oid = self.main()
+        if not (reuse_checkout and self.has_local_checkout(oid)):
+            if self.slug is None:
+                self.fetch({"refs/heads/main": oid})
+            else:
+                # Request only the selected checkout and ancestry metadata.
+                # The mutable receiver cannot also be a read-only data cache.
+                run(["agh", "repo", "fetch", self.slug, self.repo,
+                     "--ref", oid, "--into", cache, "--checkout-closure"])
+                guard_ref(self.repo, cache)
+                if sha(git(self.repo, "rev-parse", "--verify", cache)) != oid:
+                    raise Refused("native main checkout differs from the fresh remote identity")
         if git(self.repo, "cat-file", "-t", oid) != "commit":
             raise Refused("main must directly name a commit")
         import_refs(self.repo, {destination: oid}, {destination: before})
@@ -280,6 +292,46 @@ class Transport:
         self.fetch({sha(oid): oid})
         if git(self.repo, "cat-file", "-t", oid) != "commit":
             raise Refused("dependency pin must directly name a commit")
+
+    def complete_publication_objects(self, roots, directory):
+        """Supply historical DATA omitted by checkout-only main imports.
+
+        Native publication stages the source graph, including ancestor bodies
+        that are not inputs to the current checkout. Keep main reads narrow;
+        hydrate only exact missing objects, then independently walk again.
+        Neither source admission nor refs are changed by this read operation.
+        """
+        roots = sorted({sha(oid) for oid in roots})
+        seen = set()
+        round_number = 0
+        while True:
+            rows = git(self.repo, "rev-list", "--objects", "--missing=print",
+                       "--no-object-names", *roots).splitlines()
+            missing = sorted({sha(row[1:]) for row in rows if row.startswith("?")})
+            for row in rows:
+                sha(row[1:] if row.startswith("?") else row)
+            (directory / f"objects-{round_number}.json").write_text(json.dumps(missing) + "\n")
+            if not missing:
+                return
+            if seen.intersection(missing):
+                raise Refused(f"native object hydration left requested data missing; retained receipt {directory}")
+            seen.update(missing)
+            for start in range(0, len(missing), 2048):
+                stem = directory / f"hydrate-{round_number}-{start // 2048}"
+                path = stem.with_suffix(".json")
+                path.write_text(json.dumps(missing[start:start + 2048]) + "\n")
+                try:
+                    result = run(["agh", "repo", "fetch", self.slug, self.repo,
+                                  "--objects", path], check=False)
+                except (OSError, subprocess.SubprocessError) as error:
+                    stem.with_suffix(".error").write_text(type(error).__name__ + "\n")
+                    raise Refused(f"native object hydration did not complete; retained receipt {directory}") from error
+                stem.with_suffix(".stdout").write_text(result.stdout)
+                stem.with_suffix(".stderr").write_text(result.stderr)
+                stem.with_suffix(".exit.json").write_text(json.dumps(dict(exit=result.returncode)) + "\n")
+                if result.returncode:
+                    raise Refused(f"native object hydration failed (exit {result.returncode}); retained receipt {directory}")
+            round_number += 1
 
     def push(self, subject, *, base=None, source_only=False):
         subject = sha(subject)
@@ -328,6 +380,7 @@ class Transport:
         else:
             if git(self.repo, "rev-parse", "--is-shallow-repository") != "false":
                 raise Refused("atomic publication requires a complete source repository")
+            self.complete_publication_objects((row["after"] for row in updates), directory)
             actual = ["agh", "repo", "push", self.slug, str(self.repo), "--input", str(path)]
             dry = actual + ["--dry-run"]
         for phase, argv in (("dry-run", dry), ("write", actual)):
@@ -360,7 +413,9 @@ def main():
     parser.add_argument("--repo", required=True)
     parser.add_argument("--remote", default="origin")
     sub = parser.add_subparsers(dest="command", required=True)
-    sub.add_parser("main")
+    p = sub.add_parser("main")
+    p.add_argument("--reuse-checkout", action="store_true",
+                   help="reuse a complete local checkout of freshly resolved main")
     p = sub.add_parser("records")
     p.add_argument("--subject")
     p = sub.add_parser("pin")
@@ -377,7 +432,7 @@ def main():
     try:
         transport = Transport(args.repo, args.remote)
         if args.command == "main":
-            print(transport.fetch_main(args.remote))
+            print(transport.fetch_main(args.remote, reuse_checkout=args.reuse_checkout))
         elif args.command == "records":
             print(f"fetched {transport.records(args.subject)} record ref(s)")
         elif args.command == "pin":

@@ -188,7 +188,12 @@ impl ModRM {
 
     /// Encode the ModR/M byte.
     pub fn encode(self) -> u8 {
-        (self.mode << 6) | (self.reg << 3) | self.rm
+        if (self.reg | self.rm) < 8 {
+            trust_cg_x86_pack_fields(self.mode, self.reg, self.rm)
+        } else {
+            // Public fields can be initialized directly with overlapping bits.
+            (self.mode << 6) | (self.reg << 3) | self.rm
+        }
     }
 }
 
@@ -247,7 +252,11 @@ impl Sib {
 
     /// Encode the SIB byte.
     pub fn encode(self) -> u8 {
-        (self.scale << 6) | (trust_cg_x86_low3(self.index) << 3) | trust_cg_x86_low3(self.base)
+        trust_cg_x86_pack_fields(
+            self.scale,
+            trust_cg_x86_low3(self.index),
+            trust_cg_x86_low3(self.base),
+        )
     }
 }
 
@@ -1721,7 +1730,17 @@ impl X86Encoder {
             // SHR r/m64, imm8: REX.W + C1 /5 ib
             X86Opcode::ShrRI => {
                 let dst = self.require_dst(ops, opcode)?;
-                self.encode_shift_ri(5, dst, ops.imm as i8);
+                if dst.is_gpr64() {
+                    let register = dst.hw_enc();
+                    let instruction = trust_cg_x86_shr64_word(
+                        u32::from(trust_cg_x86_is_extended(register)),
+                        u32::from(trust_cg_x86_low3(register)),
+                        u32::from(ops.imm as u8),
+                    );
+                    self.emit_u32_le(instruction);
+                } else {
+                    self.encode_shift_ri(5, dst, ops.imm as i8);
+                }
             }
             // SAR r/m64, imm8: REX.W + C1 /7 ib
             X86Opcode::SarRI => {
@@ -1769,20 +1788,25 @@ impl X86Encoder {
                     self.emit_rex_forced(rex, Self::low_byte_reg_needs_rex(dst));
                     self.emit_byte(0xB0 + trust_cg_x86_low3(dst.hw_enc()));
                     self.emit_imm8(ops.imm as i8);
+                } else if dst.is_gpr64() {
+                    let register = dst.hw_enc();
+                    let prefix = trust_cg_x86_movabs_prefix(
+                        u16::from(trust_cg_x86_is_extended(register)),
+                        u16::from(trust_cg_x86_low3(register)),
+                    );
+                    self.emit_u16_le(prefix);
+                    self.emit_imm64(ops.imm);
                 } else {
                     if dst.is_gpr16() {
                         self.emit_byte(0x66);
                     }
-                    let is_gpr64 = dst.is_gpr64();
-                    let rex = Self::rex_oprd(dst, is_gpr64);
+                    let rex = Self::rex_oprd(dst, false);
                     self.emit_rex(rex);
                     self.emit_byte(0xB8 + trust_cg_x86_low3(dst.hw_enc()));
                     if dst.is_gpr16() {
                         self.emit_u16_le(ops.imm as u16);
-                    } else if dst.is_gpr32() {
-                        self.emit_imm32(ops.imm as i32);
                     } else {
-                        self.emit_imm64(ops.imm);
+                        self.emit_imm32(ops.imm as i32);
                     }
                 }
             }
@@ -5183,6 +5207,11 @@ mod tests {
         // SHR RDX, 8: REX.W + C1 + ModRM(11 101 010) + ib(08)
         let bytes = encode(X86Opcode::ShrRI, &X86InstOperands::ri(RDX, 8));
         assert_eq!(bytes, vec![0x48, 0xC1, 0xEA, 0x08]);
+
+        let bytes = encode(X86Opcode::ShrRI, &X86InstOperands::ri(x86_64_regs::EDX, 8));
+        assert_eq!(bytes, vec![0xC1, 0xEA, 0x08]);
+        let bytes = encode(X86Opcode::ShrRI, &X86InstOperands::ri(R10D, 255));
+        assert_eq!(bytes, vec![0x41, 0xC1, 0xEA, 0xFF]);
     }
 
     #[test]

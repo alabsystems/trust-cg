@@ -5900,6 +5900,12 @@ fn compiler_abi_value_for_trust_ir_type(
         | trust_ir::Ty::RefMut(_)
         | trust_ir::Ty::Rc(_)
         | trust_ir::Ty::Func(_) => AbiValueKind::Ptr,
+        trust_ir::Ty::FnItem(_) => {
+            return Err(format!(
+                "unsupported exported ABI nominal function item {ty:?} for target {}; its singleton identity is not a runtime function pointer or scalar carrier",
+                target_spec.triple()
+            ));
+        }
         trust_ir::Ty::Refine(_, _) => {
             return Err(format!(
                 "unsupported exported ABI refinement {ty:?} for target {}; the install boundary \
@@ -5949,8 +5955,7 @@ fn compiler_abi_value_for_trust_ir_type(
         | trust_ir::Ty::Set(_, _)
         | trust_ir::Ty::Sequence(_)
         | trust_ir::Ty::Record(_)
-        | trust_ir::Ty::Closure(_)
-        | trust_ir::Ty::FnItem(_) => {
+        | trust_ir::Ty::Closure(_) => {
             return Err(format!(
                 "unsupported exported ABI value {ty:?} for target {}; aggregates, vectors, f16/i128, fat pointers, and non-scalar shapes require an explicit target ABI classifier",
                 target_spec.triple()
@@ -5962,6 +5967,26 @@ fn compiler_abi_value_for_trust_ir_type(
         value = value.nullable();
     }
     Ok(value)
+}
+
+/// Reconstruct typed symbol metadata from the selected actual Core function.
+///
+/// This returns ordinary manifest DATA, not a source license, ABI readiness,
+/// proof, memory permission or callable entry. Publication independently
+/// rederives the same signature through this original owner.
+pub fn symbol_signature_for_core_function(
+    module: &trust_ir::Module,
+    function: trust_ir::FuncId,
+    target_spec: TargetSpec,
+) -> Result<SymbolSignature, String> {
+    let mut selected = module.functions.iter().filter(|f| f.id == function);
+    let source = selected
+        .next()
+        .ok_or_else(|| format!("Core symbol function {function:?} is absent"))?;
+    if selected.next().is_some() {
+        return Err(format!("Core symbol function {function:?} is duplicated"));
+    }
+    compiler_symbol_signature(module, source, target_spec)
 }
 
 fn compiler_symbol_signature(
@@ -11370,6 +11395,29 @@ mod tests {
         .expect("bare function pointers are supported scalar ABI values");
 
         assert_eq!(value, AbiValue::new(AbiValueKind::Ptr));
+    }
+
+    #[test]
+    fn compiler_export_abi_cannot_reclassify_nominal_items_as_code_addresses() {
+        for triple in ["aarch64-apple-darwin", "x86_64-unknown-linux-gnu"] {
+            let target = TargetSpec::parse(triple).unwrap();
+            let error = compiler_abi_value_for_trust_ir_type(
+                &Ty::FnItem(trust_ir::FuncId::new(7)),
+                false,
+                target,
+            )
+            .unwrap_err();
+            assert!(error.contains("nominal function item"), "{error}");
+            assert_eq!(
+                compiler_abi_value_for_trust_ir_type(
+                    &Ty::Func(trust_ir::FuncTyId::new(0)),
+                    false,
+                    target,
+                )
+                .unwrap(),
+                AbiValue::new(AbiValueKind::Ptr)
+            );
+        }
     }
 
     #[test]

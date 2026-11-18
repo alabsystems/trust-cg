@@ -112,6 +112,7 @@ const FAMILIES: &[(&str, &[&str])] = &[
             "m92_hashmap_x86",
         ],
     ),
+    ("slice_capabilities", &["slice_capabilities_x86"]),
     (
         "strings_format",
         &[
@@ -368,6 +369,17 @@ fn heap_collections_match_llvm_natively() {
     run_family(
         "heap_collections_match_llvm_natively",
         "heap_collections",
+        &knob,
+    );
+}
+
+/// Format fallback, Box payload drop and aggregate array-element stores.
+#[test]
+fn slice_capabilities_match_llvm_natively() {
+    let knob = toolchain_support::backend_knobs_arg(&["no-proof-certs"]);
+    run_family(
+        "slice_capabilities_match_llvm_natively",
+        "slice_capabilities",
         &knob,
     );
 }

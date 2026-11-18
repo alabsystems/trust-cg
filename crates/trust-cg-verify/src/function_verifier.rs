@@ -9184,8 +9184,18 @@ impl FunctionVerifier {
         // source and shown to execute, unconditional BRKs admitted only in an
         // exactly bound role, everything else refused by name. Its decisions
         // are merged into the rows below (`aarch64_trap_guard::combine`).
-        let trap_analysis =
-            crate::aarch64_trap_guard::analyze(func, lir_index.as_ref(), &self.config);
+        let retained_trap_source =
+            if xcheck_mode == ProvenanceXCheckMode::Enforce && lir_index.is_some() {
+                lir_source
+            } else {
+                None
+            };
+        let trap_analysis = crate::aarch64_trap_guard::analyze(
+            func,
+            lir_index.as_ref(),
+            retained_trap_source,
+            &self.config,
+        );
 
         // Walk all blocks and their instructions.
         // `TCG_TIME_WALK=1`: attribute this walk's time to its arms.

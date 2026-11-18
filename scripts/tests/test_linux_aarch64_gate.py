@@ -27,6 +27,7 @@ SPEC = importlib.util.spec_from_file_location("check_linux_aarch64", SCRIPT)
 assert SPEC is not None and SPEC.loader is not None
 GATE = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(GATE)
+REAL_CARGO_CONFIG_RECORD = GATE.cargo_config_record
 
 
 
@@ -1596,6 +1597,22 @@ class LinuxAarch64GateTests(unittest.TestCase):
         with mock.patch.object(GATE, "DEPENDENCY_RECORDER", ROOT / "scripts" / "absent-recorder.py"):
             with self.assertRaisesRegex(RuntimeError, "recorder is missing"):
                 GATE.dependency_identity("git", {"CARGO_HOME": "/nonexistent"})
+
+    def test_native_home_is_shared_by_dependency_and_config_records(self):
+        with tempfile.TemporaryDirectory() as temp:
+            native = Path(temp) / "native"
+            native.mkdir()
+            config = native / "config.toml"
+            config.write_text('[env]\nPROPTEST_CASES = "0"\n')
+            environment = {"TARGO_HOME": str(native), "HOME": temp, "PATH": "/usr/bin"}
+            identity = GATE.dependency_identity("git", environment)
+            record = REAL_CARGO_CONFIG_RECORD(environment=environment)
+        self.assertEqual(identity["cargo_home"], str(native))
+        self.assertEqual(identity["cargo_home_source"], "TARGO_HOME")
+        self.assertEqual(record["cargo_home"], str(native))
+        self.assertTrue(any(entry["path"] == str(config) for entry in record["files"]))
+        self.assertTrue(record["problems"])
+        self.assertFalse(identity["offline_ready"])
 
     def test_invalid_ceiling_is_a_usage_error(self):
         for value in ("0", "-2", "nan", "inf", "lots"):

@@ -10,6 +10,8 @@
 # must cover changed source/behavior and applicable proof/certificate paths.
 # --resume-source-candidate SHA keeps an explicit existing clean worktree at
 # that exact commit; fresh main and all lanes must already be its ancestors.
+# It reuses a complete local checkout of freshly authenticated main, fetching
+# that exact commit through the normal transport when local objects are missing.
 # It neither runs nor claims the full attestation campaign, creates no proof
 # records and grants no landing/release verdict. The default attested mode
 # below remains unchanged. Owner ordinary-source directive 2026-11-02.
@@ -258,19 +260,28 @@ candidate_source_checks() {
   done
 }
 
+resume_is_ancestor() {
+  GIT_NO_LAZY_FETCH=1 GIT_NO_REPLACE_OBJECTS=1 GIT_GRAFT_FILE=/dev/null GIT_ALLOW_PROTOCOL=file \
+    git -C "$worktree" merge-base --is-ancestor "$1" "$2"
+}
+
 attempt=1
 transport="$repo/scripts/github_transport.py"
+main_args=(main)
+if [ -n "$resume_source_candidate" ]; then
+  main_args+=(--reuse-checkout)
+fi
 while :; do
   say "attempt ${attempt}/${attempts}: fetching ${remote}/main"
-  base="$("$SOUNDNESS_PYTHON3" -I "$transport" --repo "$repo" --remote "$remote" main)" || die "cannot fetch ${remote}/main"
+  base="$("$SOUNDNESS_PYTHON3" -I "$transport" --repo "$repo" --remote "$remote" "${main_args[@]}")" || die "cannot fetch ${remote}/main"
   if [ -n "$resume_source_candidate" ]; then
     [ "$(git -C "$worktree" rev-parse HEAD)" = "$resume_source_candidate" ] &&
       [ -z "$(git -C "$worktree" status --porcelain)" ] ||
       die "source resume candidate changed before qualification"
-    git -C "$worktree" merge-base --is-ancestor "$base" "$resume_source_candidate" ||
+    resume_is_ancestor "$base" "$resume_source_candidate" ||
       die "remote main advanced beyond the source resume candidate; preserved it for ordinary merging and qualification"
     for index in "${!lanes[@]}"; do
-      git -C "$worktree" merge-base --is-ancestor "${lane_commits[$index]}" "$resume_source_candidate" ||
+      resume_is_ancestor "${lane_commits[$index]}" "$resume_source_candidate" ||
         die "lane ${lanes[$index]} is not an ancestor of the source resume candidate"
     done
     candidate="$resume_source_candidate"
@@ -337,7 +348,7 @@ while :; do
   fi
   fi
   [ "$push_rc" -ne 75 ] || die "unacknowledged atomic write: retained transport receipt requires reconciliation; no retry"
-  moved="$("$SOUNDNESS_PYTHON3" -I "$transport" --repo "$repo" --remote "$remote" main)" ||
+  moved="$("$SOUNDNESS_PYTHON3" -I "$transport" --repo "$repo" --remote "$remote" "${main_args[@]}")" ||
     die "publication failed (transport exit ${push_rc}); ${remote}/main readback unavailable, ref state unknown; candidate preserved; see the transport diagnostic and any retained receipt above"
   if [ "$moved" = "$base" ]; then
     die "publication of ${candidate} failed (transport exit ${push_rc}); readback confirms ${remote}/main unchanged at ${base}; candidate preserved; see the transport diagnostic and any retained receipt above"

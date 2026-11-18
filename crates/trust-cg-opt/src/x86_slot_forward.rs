@@ -132,8 +132,7 @@
 //! would make the kill rule depend on a whole-function analysis instead of the
 //! instruction in front of it.
 
-use std::collections::HashMap;
-use std::collections::HashSet;
+use crate::fast_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 use trust_cg_ir::X86Opcode;
 use trust_cg_ir::function::StackSlotAllocationKind;
@@ -329,7 +328,7 @@ const FRAME_RESOLVE_ROUNDS: usize = 8;
 /// non-default flags is excluded because its semantics are not this pass's to
 /// assume.
 fn build_frame_addresses(func: &X86ISelFunction) -> HashMap<u32, (u32, i64)> {
-    let mut def_counts: HashMap<u32, usize> = HashMap::new();
+    let mut def_counts: HashMap<u32, usize> = HashMap::default();
     for block_id in &func.block_order {
         let Some(block) = func.blocks.get(block_id) else {
             continue;
@@ -346,7 +345,7 @@ fn build_frame_addresses(func: &X86ISelFunction) -> HashMap<u32, (u32, i64)> {
     };
     let single_def = |v: &VReg| def_counts.get(&v.id).copied().unwrap_or(0) == 1;
 
-    let mut frame: HashMap<u32, (u32, i64)> = HashMap::new();
+    let mut frame: HashMap<u32, (u32, i64)> = HashMap::default();
     for _ in 0..FRAME_RESOLVE_ROUNDS {
         let before = frame.len();
         for block_id in &func.block_order {
@@ -569,7 +568,7 @@ fn run_impl(func: &mut X86ISelFunction, rewrites: &mut usize, deletions: &mut us
     // a deletion removes a load whose destination already held the value), so
     // planning ahead of applying is consistent with applying as we go.
     let mut plans: Vec<(Block, Vec<Action>)> = Vec::new();
-    let mut block_exit: HashMap<Block, HashMap<SlotRange, VReg>> = HashMap::new();
+    let mut block_exit: HashMap<Block, HashMap<SlotRange, VReg>> = HashMap::default();
     for block_id in &block_ids {
         let Some(block) = func.blocks.get(block_id) else {
             continue;
@@ -588,7 +587,7 @@ fn run_impl(func: &mut X86ISelFunction, rewrites: &mut usize, deletions: &mut us
         let Some(block) = func.blocks.get_mut(&block_id) else {
             continue;
         };
-        let mut doomed: HashSet<usize> = HashSet::new();
+        let mut doomed: HashSet<usize> = HashSet::default();
         for action in plan {
             match action {
                 Action::Rewrite { index, dst, source } => {

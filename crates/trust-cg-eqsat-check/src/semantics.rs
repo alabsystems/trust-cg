@@ -146,6 +146,8 @@ pub(crate) fn eval(desc: OpDesc, args: &[u128], ctx: Ctx) -> Option<u128> {
             })
         }
         OpDesc::Select(_) => Some(if args[0] == 1 { args[1] } else { args[2] }),
+        // A pinned reduction is uninterpreted: the checker never folds one.
+        OpDesc::Pinned(..) => None,
     }
 }
 

@@ -54,14 +54,16 @@ fn ordinary_source() -> trust_ir::Module {
     module.build().unwrap()
 }
 
-fn prepared() -> (
+fn prepared(
+    module: trust_ir::Module,
+    name: &str,
+) -> (
     trust_cg_lower::Function,
     MachFunction,
     trust_cg_codegen::frame::FrameLayout,
     Vec<u8>,
     Vec<FrameImagePatch>,
 ) {
-    let module = ordinary_source();
     let license = trust_cg_codegen::CodegenLicensePolicy::default()
         .with_unlicensed(trust_cg_codegen::UnlicensedBodyPolicy::Permit);
     let lowered = trust_cg_lower::translate_module_for_arch_with_tls_with_license(
@@ -71,10 +73,7 @@ fn prepared() -> (
         &license,
     )
     .unwrap();
-    let (lir, context) = lowered
-        .into_iter()
-        .find(|(f, _)| f.name == "ordinary_static_frame")
-        .unwrap();
+    let (lir, context) = lowered.into_iter().find(|(f, _)| f.name == name).unwrap();
     let pipeline = Pipeline::new(PipelineConfig {
         opt_level: OptLevel::O0,
         ..PipelineConfig::for_target("aarch64-apple-darwin")
@@ -125,7 +124,7 @@ fn rewrite_word(machine: &MachFunction, code: &mut [u8], id: InstId) {
 
 #[test]
 fn original_ordinary_nonleaf_envelopes_keep_all_body_and_call_obligations_pending() {
-    let (lir, machine, layout, code, fixups) = prepared();
+    let (lir, machine, layout, code, fixups) = prepared(ordinary_source(), "ordinary_static_frame");
     assert!(layout.callee_saved_pairs.len() >= 3);
     assert!(
         layout.spill_area_size > 0
@@ -164,8 +163,89 @@ fn original_ordinary_nonleaf_envelopes_keep_all_body_and_call_obligations_pendin
 }
 
 #[test]
+fn darwin_startup_frame_checks_geometry_and_keeps_external_call_pending() {
+    use trust_cg_lower::instructions::{DirectCallBinding, Opcode};
+
+    let mut module = ModuleBuilder::new("startup_frame");
+    let external_type = module.add_func_type(vec![Ty::Ptr], vec![Ty::I64]);
+    let external = module.declare_function("startup_observe", external_type);
+    let ty = module.add_func_type(vec![Ty::I64], vec![Ty::I64]);
+    let mut f = module.function("startup_frame", ty);
+    let entry = f.create_block();
+    let input = f.add_block_param(entry, Ty::I64);
+    f.switch_to_block(entry);
+    let local = f.alloca(Ty::I64);
+    f.store(Ty::I64, local, input);
+    let result = f.call(external, vec![local]);
+    f.ret(vec![result]);
+    f.build();
+
+    let (lir, machine, layout, code, fixups) = prepared(module.build().unwrap(), "startup_frame");
+    let instructions = lir.blocks.values().flat_map(|block| &block.instructions);
+    let address = instructions
+        .clone()
+        .find(|inst| matches!(&inst.opcode, Opcode::StackAddr { slot: 0 }))
+        .unwrap();
+    let source_calls: Vec<_> = instructions
+        .filter(|inst| matches!(&inst.opcode, Opcode::Call { .. }))
+        .collect();
+    let [source_call] = source_calls.as_slice() else {
+        panic!("expected one source call");
+    };
+    assert!(matches!(
+        &source_call.opcode,
+        Opcode::Call { name, binding: DirectCallBinding::Interposable } if name == "startup_observe"
+    ));
+    assert_eq!(source_call.args, address.results);
+
+    let claim = fixture::claim(&machine, &layout);
+    let candidates = fixture::candidates(&machine, &layout);
+    let checked =
+        check_static_frame_envelopes(&lir, &machine, &code, &claim, &candidates, &fixups).unwrap();
+    assert!(!layout.is_leaf && layout.uses_frame_pointer);
+    assert_eq!(claim.total_bytes, 32);
+    assert_eq!(
+        claim.saved_pairs,
+        [[SavedFrameRegister::X(29), SavedFrameRegister::X(30)]]
+    );
+    assert_eq!(
+        checked.fixed_slots(),
+        &[RelativeFrameRegion {
+            start: -24,
+            end: -16
+        }]
+    );
+    assert_eq!(candidates.prologue.len(), 3);
+    let prologue_words: Vec<_> = code[..12]
+        .chunks_exact(4)
+        .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+        .collect();
+    assert_eq!(prologue_words, [0xa9bf_7bfd, 0x9100_03fd, 0xd100_43ff]);
+
+    let [exit] = checked.conditional_exits() else {
+        panic!("expected one conditional exit");
+    };
+    assert_eq!((exit.required_sp, exit.required_fp), (-32, Some(-16)));
+    let [body] = checked.unresolved_body() else {
+        panic!("expected one unresolved body");
+    };
+    let [call] = body.calls.as_slice() else {
+        panic!("expected one pending call");
+    };
+    assert_eq!(machine.insts[call.0 as usize].opcode, Op::Bl);
+    assert!(body.instructions.contains(call) && body.instructions.len() > 1);
+    assert_eq!(
+        fixups,
+        [FrameImagePatch {
+            offset: checked.byte_offset(*call).unwrap().try_into().unwrap(),
+            bytes: 4,
+        }]
+    );
+}
+
+#[test]
 fn wrong_frame_setup_restore_save_word_and_slot_placement_refuse() {
-    let (lir, machine, layout, code, fixups) = prepared();
+    let (lir, machine, layout, code, fixups) = prepared(ordinary_source(), "ordinary_static_frame");
     let claim = fixture::claim(&machine, &layout);
     let candidates = fixture::candidates(&machine, &layout);
     let fp = *candidates
@@ -227,7 +307,7 @@ fn wrong_frame_setup_restore_save_word_and_slot_placement_refuse() {
 
 #[test]
 fn missing_reused_exits_fixups_and_dynamic_or_red_zone_claims_refuse() {
-    let (lir, machine, layout, code, fixups) = prepared();
+    let (lir, machine, layout, code, fixups) = prepared(ordinary_source(), "ordinary_static_frame");
     let claim = fixture::claim(&machine, &layout);
     let candidates = fixture::candidates(&machine, &layout);
     let mut wrong = candidates.clone();
@@ -284,7 +364,7 @@ fn missing_reused_exits_fixups_and_dynamic_or_red_zone_claims_refuse() {
 
 #[test]
 fn early_sp_deallocation_fp_clobber_and_relabelled_pairs_refuse() {
-    let (lir, machine, layout, code, fixups) = prepared();
+    let (lir, machine, layout, code, fixups) = prepared(ordinary_source(), "ordinary_static_frame");
     let claim = fixture::claim(&machine, &layout);
     let candidates = fixture::candidates(&machine, &layout);
     let mut wrong = claim.clone();
@@ -373,7 +453,7 @@ fn early_sp_deallocation_fp_clobber_and_relabelled_pairs_refuse() {
 
 #[test]
 fn restored_fp_clobber_refuses_and_body_call_flags_cannot_hide_pending_calls() {
-    let (lir, machine, layout, code, fixups) = prepared();
+    let (lir, machine, layout, code, fixups) = prepared(ordinary_source(), "ordinary_static_frame");
     let claim = fixture::claim(&machine, &layout);
     let candidates = fixture::candidates(&machine, &layout);
     let original =

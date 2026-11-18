@@ -51,9 +51,11 @@ mod memory;
 
 pub use scalar_memory::{
     ScalarMemoryTargetAccess, ScalarMemoryTargetEndpoint, ScalarMemoryTargetQueries,
-    ScalarReturnTargetQueries, bind_scalar_memory_bytes, bind_scalar_memory_machine,
-    bind_scalar_return_bytes, bind_scalar_return_machine,
+    ScalarReturnTargetQueries, VoidMemoryTargetQueries, bind_scalar_memory_bytes,
+    bind_scalar_memory_machine, bind_scalar_return_bytes, bind_scalar_return_machine,
+    bind_void_memory_bytes, bind_void_memory_machine,
 };
+pub(crate) use scalar_memory::{bind_memory_bytes, bind_memory_machine};
 
 #[cfg(test)]
 #[path = "read_only_target_tests.rs"]

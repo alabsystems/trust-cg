@@ -31,7 +31,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.8.0"
+version = "0.9.0"
 edition = "2024"
 license = "Apache-2.0"
 authors = ["Andrew Yates <andrewyates.name@gmail.com>"]
@@ -76,8 +76,8 @@ anyhow = "1.0"
 #     dependency graph only, and `first-party/trust-cg` is `exclude`d from it, so
 #     a plain `cargo build` run from inside the submodule directory resolves in
 #     THIS workspace and gets the pinned rev, not the patch.
-trust-ir = { git = "https://github.com/alabsystems/trust-ir.git", rev = "8bae728257b123d6394b2dc049b3573ad885049f", features = ["serde", "parser", "binary", "dialect-verif-example", "clean-expr"] }
-trust-ir-build = { git = "https://github.com/alabsystems/trust-ir.git", rev = "8bae728257b123d6394b2dc049b3573ad885049f", features = ["binary"] }
+trust-ir = { git = "https://github.com/alabsystems/trust-ir.git", rev = "899d46e7a303fad2b706a88a7a8eda41ec47dcfe", features = ["serde", "parser", "binary", "dialect-verif-example", "clean-expr"] }
+trust-ir-build = { git = "https://github.com/alabsystems/trust-ir.git", rev = "899d46e7a303fad2b706a88a7a8eda41ec47dcfe", features = ["binary"] }
 # The must-refuse corpus runner (KIND 4, trust-ir 3aacfcd5 / a31c6ff1): dev-only,
 # `default-features = false` + `must-refuse` forwards exactly `trust-ir/binary`.
 # Same rev as the two lines above BY CONSTRUCTION: scripts/bump_trust_ir_pin.py
@@ -86,7 +86,7 @@ trust-ir-build = { git = "https://github.com/alabsystems/trust-ir.git", rev = "8
 # It is consumed ONLY by the must-refuse consumer tests (trust-cg-codegen
 # `tests/must_refuse_corpus.rs`, trust-cg-cli `tests/must_refuse_corpus.rs`);
 # the production graph MUST NOT gain it.
-trust-ir-conformance = { git = "https://github.com/alabsystems/trust-ir.git", rev = "8bae728257b123d6394b2dc049b3573ad885049f", default-features = false, features = ["must-refuse"] }
+trust-ir-conformance = { git = "https://github.com/alabsystems/trust-ir.git", rev = "899d46e7a303fad2b706a88a7a8eda41ec47dcfe", default-features = false, features = ["must-refuse"] }
 
 # Internal crates
 trust-cg-ir = { path = "crates/trust-cg-ir" }

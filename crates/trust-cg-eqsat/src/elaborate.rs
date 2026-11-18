@@ -294,6 +294,9 @@ fn build_inst(desc: OpDesc, operands: &[ValueId]) -> EngineResult<Inst> {
             then_val: operand(1)?,
             else_val: operand(2)?,
         },
+        OpDesc::Pinned(..) => {
+            return invariant("a pinned reduction has no trust-ir instruction");
+        }
     })
 }
 

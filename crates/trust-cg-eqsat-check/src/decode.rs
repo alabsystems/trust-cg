@@ -1,4 +1,4 @@
-// trust-cg-eqsat-check/src/decode.rs - derivation byte format (version 1) with canonicity refusals
+// trust-cg-eqsat-check/src/decode.rs - derivation byte format (versions 1 and 2) with canonicity refusals
 //
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // Copyright 2026 Andrew Yates | License: Apache-2.0
@@ -8,6 +8,12 @@
 //! or proof entries, entries unreachable from a claim, claims not strictly
 //! increasing, an unsorted or repeated rule table or binding list, and bytes
 //! after the claims.
+//!
+//! Version 1 is a Tier E (function) derivation. Version 2 is a Tier S
+//! (region) derivation (docs/eqsat-tier-s.md section 6): version 1 plus the
+//! pinned-reduction opdesc and the `Impl` proof step. The caller says which
+//! [`Tier`] it checks; the other version, and under Tier E both additions,
+//! are refused here.
 //!
 //! This layer is purely syntactic: it does not type terms, look up leaves or
 //! rules, or replay proofs (see `replay`). Counts are never trusted for
@@ -19,7 +25,24 @@ use crate::rejection::{DecodeError, NonCanonicalKind, Rejection};
 use crate::types::{ALL_BIN, ALL_CAST, ALL_PRED, ALL_UN, BinK, CastK, OpDesc, Pred, Sty, UnK};
 
 pub(crate) const MAGIC: &[u8; 8] = b"TCGEQSAT";
-pub(crate) const VERSION: u32 = 1;
+
+/// Which derivation format the caller checks.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Tier {
+    /// A function derivation: version 1.
+    E,
+    /// A region derivation: version 2.
+    S,
+}
+
+impl Tier {
+    pub(crate) const fn version(self) -> u32 {
+        match self {
+            Tier::E => 1,
+            Tier::S => 2,
+        }
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum RawTerm {
@@ -54,6 +77,12 @@ pub(crate) enum RawProof {
         bindings: Vec<(String, u32)>,
         premises: Vec<u32>,
     },
+    /// Version 2 only: the order-free node whose result is the leaf term
+    /// `leaf`, implemented by the reduction pinned at `order`.
+    Impl {
+        leaf: u32,
+        order: u32,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -65,12 +94,35 @@ pub(crate) struct Derivation {
     pub(crate) claims: Vec<u32>,
 }
 
-struct Reader<'a> {
+pub(crate) struct Reader<'a> {
     bytes: &'a [u8],
-    pos: usize,
+    pub(crate) pos: usize,
+    tier: Tier,
 }
 
 impl<'a> Reader<'a> {
+    pub(crate) fn new(bytes: &'a [u8], tier: Tier) -> Self {
+        Reader {
+            bytes,
+            pos: 0,
+            tier,
+        }
+    }
+
+    /// Refuses bytes after the last field.
+    pub(crate) fn finish(&self) -> Result<(), Rejection> {
+        if self.pos == self.bytes.len() {
+            Ok(())
+        } else {
+            Err(Rejection::Decode {
+                offset: self.pos,
+                detail: DecodeError::TrailingBytes {
+                    count: self.bytes.len() - self.pos,
+                },
+            })
+        }
+    }
+
     fn err(&self, detail: DecodeError) -> Rejection {
         Rejection::Decode {
             offset: self.pos,
@@ -78,7 +130,7 @@ impl<'a> Reader<'a> {
         }
     }
 
-    fn take(&mut self, n: usize) -> Result<&'a [u8], Rejection> {
+    pub(crate) fn take(&mut self, n: usize) -> Result<&'a [u8], Rejection> {
         let end = self.pos.checked_add(n).filter(|&e| e <= self.bytes.len());
         match end {
             Some(end) => {
@@ -90,11 +142,11 @@ impl<'a> Reader<'a> {
         }
     }
 
-    fn u8(&mut self) -> Result<u8, Rejection> {
+    pub(crate) fn u8(&mut self) -> Result<u8, Rejection> {
         Ok(self.take(1)?[0])
     }
 
-    fn u32(&mut self) -> Result<u32, Rejection> {
+    pub(crate) fn u32(&mut self) -> Result<u32, Rejection> {
         let b = self.take(4)?;
         Ok(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
     }
@@ -106,7 +158,7 @@ impl<'a> Reader<'a> {
         Ok(u128::from_le_bytes(a))
     }
 
-    fn str(&mut self) -> Result<String, Rejection> {
+    pub(crate) fn str(&mut self) -> Result<String, Rejection> {
         let len = self.u32()? as usize;
         let start = self.pos;
         let b = self.take(len)?;
@@ -119,7 +171,7 @@ impl<'a> Reader<'a> {
         }
     }
 
-    fn ty(&mut self, what: &'static str) -> Result<Sty, Rejection> {
+    pub(crate) fn ty(&mut self, what: &'static str) -> Result<Sty, Rejection> {
         let at = self.pos;
         let code = self.u8()?;
         Sty::from_code(code).ok_or(Rejection::Decode {
@@ -170,6 +222,10 @@ impl<'a> Reader<'a> {
                 OpDesc::Cast(k, s, d)
             }
             0x05 => OpDesc::Select(self.ty("type")?),
+            0x06 if self.tier == Tier::S => {
+                let order = self.u32()?;
+                OpDesc::Pinned(order, self.ty("type")?)
+            }
             tag => {
                 return Err(Rejection::Decode {
                     offset: at,
@@ -177,6 +233,49 @@ impl<'a> Reader<'a> {
                         what: "opdesc kind",
                         tag,
                     },
+                });
+            }
+        })
+    }
+
+    /// Reads term entry `index` of a term table (section 7.2 `Term`): every
+    /// operand names an earlier entry.
+    pub(crate) fn term(&mut self, index: usize) -> Result<RawTerm, Rejection> {
+        let at = self.pos;
+        let tag = self.u8()?;
+        Ok(match tag {
+            0x01 => RawTerm::Param {
+                block: self.u32()?,
+                index: self.u32()?,
+            },
+            0x02 => RawTerm::Result {
+                block: self.u32()?,
+                ordinal: self.u32()?,
+                index: self.u32()?,
+            },
+            0x03 => {
+                let ty = self.ty("const type")?;
+                RawTerm::Const {
+                    ty,
+                    residue: self.u128()?,
+                }
+            }
+            0x04 => {
+                let desc = self.opdesc()?;
+                let mut args = Vec::new();
+                for _ in 0..desc.arity() {
+                    let a = self.u32()?;
+                    if a as usize >= index {
+                        return Err(non_canonical(NonCanonicalKind::TermOrder, index));
+                    }
+                    args.push(a);
+                }
+                RawTerm::Op { desc, args }
+            }
+            tag => {
+                return Err(Rejection::Decode {
+                    offset: at,
+                    detail: DecodeError::BadTag { what: "term", tag },
                 });
             }
         })
@@ -194,9 +293,9 @@ fn out_of_range(offset: usize, what: &'static str, index: u32, limit: usize) -> 
     }
 }
 
-/// Decodes and checks canonicity.
-pub(crate) fn decode(bytes: &[u8]) -> Result<Derivation, Rejection> {
-    let mut r = Reader { bytes, pos: 0 };
+/// Decodes a derivation of `tier`'s version and checks canonicity.
+pub(crate) fn decode(bytes: &[u8], tier: Tier) -> Result<Derivation, Rejection> {
+    let mut r = Reader::new(bytes, tier);
     let magic = r.take(8)?;
     if magic != MAGIC {
         return Err(Rejection::Decode {
@@ -206,7 +305,7 @@ pub(crate) fn decode(bytes: &[u8]) -> Result<Derivation, Rejection> {
     }
     let version_at = r.pos;
     let version = r.u32()?;
-    if version != VERSION {
+    if version != tier.version() {
         return Err(Rejection::Decode {
             offset: version_at,
             detail: DecodeError::BadVersion { version },
@@ -234,45 +333,7 @@ pub(crate) fn decode(bytes: &[u8]) -> Result<Derivation, Rejection> {
     let term_count = r.u32()?;
     let mut terms: Vec<RawTerm> = Vec::new();
     for i in 0..term_count as usize {
-        let at = r.pos;
-        let tag = r.u8()?;
-        let term = match tag {
-            0x01 => RawTerm::Param {
-                block: r.u32()?,
-                index: r.u32()?,
-            },
-            0x02 => RawTerm::Result {
-                block: r.u32()?,
-                ordinal: r.u32()?,
-                index: r.u32()?,
-            },
-            0x03 => {
-                let ty = r.ty("const type")?;
-                RawTerm::Const {
-                    ty,
-                    residue: r.u128()?,
-                }
-            }
-            0x04 => {
-                let desc = r.opdesc()?;
-                let mut args = Vec::new();
-                for _ in 0..desc.arity() {
-                    let a = r.u32()?;
-                    if a as usize >= i {
-                        return Err(non_canonical(NonCanonicalKind::TermOrder, i));
-                    }
-                    args.push(a);
-                }
-                RawTerm::Op { desc, args }
-            }
-            tag => {
-                return Err(Rejection::Decode {
-                    offset: at,
-                    detail: DecodeError::BadTag { what: "term", tag },
-                });
-            }
-        };
-        terms.push(term);
+        terms.push(r.term(i)?);
     }
 
     // Proofs.
@@ -348,6 +409,17 @@ pub(crate) fn decode(bytes: &[u8]) -> Result<Derivation, Rejection> {
                     premises,
                 }
             }
+            0x06 if tier == Tier::S => {
+                let t_at = r.pos;
+                let leaf = r.u32()?;
+                if leaf as usize >= n_terms {
+                    return Err(out_of_range(t_at, "term", leaf, n_terms));
+                }
+                RawProof::Impl {
+                    leaf,
+                    order: r.u32()?,
+                }
+            }
             tag => {
                 return Err(Rejection::Decode {
                     offset: at,
@@ -374,14 +446,7 @@ pub(crate) fn decode(bytes: &[u8]) -> Result<Derivation, Rejection> {
         }
         claims.push(c);
     }
-    if r.pos != bytes.len() {
-        return Err(Rejection::Decode {
-            offset: r.pos,
-            detail: DecodeError::TrailingBytes {
-                count: bytes.len() - r.pos,
-            },
-        });
-    }
+    r.finish()?;
 
     // No two equal entries.
     let mut seen_terms = BTreeSet::new();
@@ -410,7 +475,7 @@ pub(crate) fn decode(bytes: &[u8]) -> Result<Derivation, Rejection> {
             continue;
         }
         match &proofs[i] {
-            RawProof::Refl(t) => term_live[*t as usize] = true,
+            RawProof::Refl(t) | RawProof::Impl { leaf: t, .. } => term_live[*t as usize] = true,
             RawProof::Sym(p) => proof_live[*p as usize] = true,
             RawProof::Trans(p, q) => {
                 proof_live[*p as usize] = true;

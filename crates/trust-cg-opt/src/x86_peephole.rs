@@ -62,6 +62,13 @@ pub struct X86Peephole {
     /// Proof admission for the const-multiply shift reduction. See
     /// [`ConstMulShiftAdmit`].
     admit_constmul_shift: ConstMulShiftAdmit,
+    /// Whether this compile keeps no proof certificates and its driver
+    /// enabled the certificate-free IMUL reductions
+    /// ([`Self::with_certificate_free_imul_reductions`]). `false` (every
+    /// constructor's default) keeps the IMUL reductions exactly as they were
+    /// before 2026-11-15: no doubling-LEA arm, and the flags scan stops at
+    /// every store.
+    certificate_free_imul: bool,
 }
 
 impl X86Peephole {
@@ -72,6 +79,7 @@ impl X86Peephole {
         Self {
             admit_reconstructed,
             admit_constmul_shift: |_, _, _| false,
+            certificate_free_imul: false,
         }
     }
 
@@ -83,12 +91,33 @@ impl X86Peephole {
         Self {
             admit_reconstructed,
             admit_constmul_shift,
+            certificate_free_imul: false,
         }
+    }
+
+    /// Enable (`true`) the two IMUL reductions a compile that keeps proof
+    /// certificates withholds: the `ImulRRI d, s, 2` -> doubling `LEA` arm,
+    /// and a flags scan for every `ImulRRI` reduction that lets a plain store
+    /// pass ([`imul_flags_are_dead`]). Both change the emitted bytes and no
+    /// compile with proof certificates has exercised them (the certificate
+    /// lane does not run on the host that measured them), so the codegen
+    /// pipeline passes `true` only in a certificate-free compile
+    /// (`X86AllocationQuality::CertificateFree`, or an installed policy that
+    /// enables them) and the default is `false`.
+    #[must_use]
+    pub fn with_certificate_free_imul_reductions(mut self, enabled: bool) -> Self {
+        self.certificate_free_imul = enabled;
+        self
     }
 
     /// Run x86 peepholes directly on an ISel function.
     pub fn run_on_function(&mut self, func: &mut X86ISelFunction) -> bool {
-        run_impl(func, self.admit_reconstructed, self.admit_constmul_shift)
+        run_impl(
+            func,
+            self.admit_reconstructed,
+            self.admit_constmul_shift,
+            self.certificate_free_imul,
+        )
     }
 }
 
@@ -101,6 +130,7 @@ impl Default for X86Peephole {
         Self {
             admit_reconstructed: |_| false,
             admit_constmul_shift: |_, _, _| false,
+            certificate_free_imul: false,
         }
     }
 }
@@ -111,7 +141,12 @@ impl X86MachinePass for X86Peephole {
     }
 
     fn run(&mut self, func: &mut X86ISelFunction) -> bool {
-        run_impl(func, self.admit_reconstructed, self.admit_constmul_shift)
+        run_impl(
+            func,
+            self.admit_reconstructed,
+            self.admit_constmul_shift,
+            self.certificate_free_imul,
+        )
     }
 }
 
@@ -163,6 +198,7 @@ fn run_impl(
     func: &mut X86ISelFunction,
     admit_reconstructed: ReconstructionAdmit,
     admit_constmul_shift: ConstMulShiftAdmit,
+    certificate_free_imul: bool,
 ) -> bool {
     let mut changed = false;
 
@@ -665,6 +701,7 @@ fn run_impl(
                 index,
                 Some(&zeroidiom_used),
                 admit_constmul_shift,
+                certificate_free_imul,
             ) {
                 Some(PeepholeEdit::Remove) => {
                     block.insts.remove(index);
@@ -3020,7 +3057,7 @@ fn collect_peephole_operand_vregs(operand: &X86ISelOperand, used: &mut FxHashSet
 fn simplify_inst(insts: &[X86ISelInst], index: usize) -> Option<PeepholeEdit> {
     // Fail-closed const-multiply admission, exactly like `X86Peephole::default`:
     // the existing single-instruction tests must observe no behaviour change.
-    simplify_inst_gated(insts, index, None, |_, _, _| false)
+    simplify_inst_gated(insts, index, None, |_, _, _| false, false)
 }
 
 /// [`simplify_inst`] with the const-multiply shift reduction ADMITTED — the
@@ -3029,7 +3066,17 @@ fn simplify_inst(insts: &[X86ISelInst], index: usize) -> Option<PeepholeEdit> {
 /// site instead of a global.
 #[cfg(test)]
 fn simplify_inst_constmul_admitted(insts: &[X86ISelInst], index: usize) -> Option<PeepholeEdit> {
-    simplify_inst_gated(insts, index, None, |_, _, _| true)
+    simplify_inst_gated(insts, index, None, |_, _, _| true, false)
+}
+
+/// [`simplify_inst_constmul_admitted`] in a certificate-free compile: the
+/// doubling-LEA arm and the store-passing IMUL flags scan are enabled too.
+#[cfg(test)]
+fn simplify_inst_constmul_admitted_certificate_free(
+    insts: &[X86ISelInst],
+    index: usize,
+) -> Option<PeepholeEdit> {
+    simplify_inst_gated(insts, index, None, |_, _, _| true, true)
 }
 
 // ---------------------------------------------------------------------------
@@ -4222,6 +4269,7 @@ fn simplify_inst_gated(
     index: usize,
     zeroidiom_used: Option<&FxHashSet<VReg>>,
     admit_constmul_shift: ConstMulShiftAdmit,
+    certificate_free_imul: bool,
 ) -> Option<PeepholeEdit> {
     let inst = &insts[index];
 
@@ -4318,7 +4366,15 @@ fn simplify_inst_gated(
         }
         X86Opcode::ImulRRI => {
             let (dst, src, imm) = ri_vregs_and_imm(inst)?;
-            if !flags_written_here_are_dead(insts, index) {
+            // A certificate-free compile lets a plain store pass in the
+            // flags scan; one that keeps certificates uses the historical
+            // scan, which stops at every store.
+            let flags_dead = if certificate_free_imul {
+                imul_flags_are_dead(insts, index)
+            } else {
+                flags_written_here_are_dead(insts, index)
+            };
+            if !flags_dead {
                 return None;
             }
 
@@ -4336,6 +4392,21 @@ fn simplify_inst_gated(
                 // temporary (requires d != s). The flags guard above
                 // already proved the IMUL's flag results are dead, and
                 // every replacement opcode is inside the proof perimeter.
+                // d = s*2 is the doubling LEA [s + s*1] the `AddRR d, s, s`
+                // arm below also produces: one 1-cycle LEA for the 3-cycle
+                // IMUL, no flags written (the IMUL's are dead by the guard
+                // above). 64-bit only, the width `lea_sib_double` encodes.
+                // Measured on the TY kernel `ty_bfs_kernel` (`y * 2` stored
+                // to the successor state): 1.083 to 1.065 of LLVM by a hand
+                // edit of the linked binary, LLVM and gcc both emit the LEA.
+                // Certificate-free compiles only (`certificate_free_imul`).
+                2 if certificate_free_imul
+                    && dst != src
+                    && dst.class == RegClass::Gpr64
+                    && src.class == RegClass::Gpr64 =>
+                {
+                    Some(PeepholeEdit::Replace(lea_sib_double(dst, src)))
+                }
                 3 | 5 | 9 if dst != src => Some(PeepholeEdit::Replace(lea_sib_scaled(
                     dst,
                     src,
@@ -4841,6 +4912,61 @@ fn flags_written_here_are_dead(insts: &[X86ISelInst], index: usize) -> bool {
     }
 
     false
+}
+
+/// Whether the RFLAGS an `ImulRRI` at `insts[index]` writes are dead, for
+/// its strength reductions: [`flags_written_here_are_dead`], except that a
+/// plain store ([`is_plain_store_keeping_flags`]) does not end the scan.
+/// `flags_written_here_are_dead` stops at every instruction with side
+/// effects, and every store carries `HAS_SIDE_EFFECTS`; a `MOV` store neither
+/// reads nor writes RFLAGS and transfers no control, so the flags stay
+/// exactly as observable after it as before it, and the deadness claim still
+/// needs a FULL overwrite before any reader, control transfer or other
+/// side-effecting instruction. Measured case: TY's `ty_bfs_kernel` stores
+/// between `y * 2` and the next full flag writer.
+fn imul_flags_are_dead(insts: &[X86ISelInst], index: usize) -> bool {
+    let strict_partial = strict_partial_flags_enabled();
+    for inst in &insts[index + 1..] {
+        if x86_reads_flags(inst.opcode) {
+            return false;
+        }
+        match condition_flag_overwrite(inst) {
+            FlagOverwrite::Partial if strict_partial => return false,
+            FlagOverwrite::None | FlagOverwrite::Partial => {}
+            FlagOverwrite::Full => return true,
+        }
+        if instruction_may_export_flags(inst) && !is_plain_store_keeping_flags(inst) {
+            return false;
+        }
+    }
+    false
+}
+
+/// A non-volatile `MOV` store (GPR, scalar FP or vector, any addressing
+/// form) that is not also a call, branch, terminator or return. Such an
+/// instruction neither reads nor writes RFLAGS. Volatile stores and every
+/// other side-effecting instruction keep ending the scan.
+fn is_plain_store_keeping_flags(inst: &X86ISelInst) -> bool {
+    use X86Opcode::*;
+    let flags = inst.flags;
+    matches!(
+        inst.opcode,
+        MovMR8
+            | MovMR16
+            | MovMR32
+            | MovMR
+            | MovMRSib
+            | MovMR8Sib
+            | MovMR32Sib
+            | MovsdMR
+            | MovssMR
+            | MovdquMR
+            | MovdquMRSib
+            | MovdqaMR
+    ) && !flags.is_call()
+        && !flags.is_branch()
+        && !flags.is_terminator()
+        && !flags.is_return()
 }
 
 fn instruction_may_export_flags(inst: &X86ISelInst) -> bool {
@@ -9728,6 +9854,214 @@ mod tests {
     }
 
     #[test]
+    fn x86_peephole_rewrites_imul_rri_two_to_a_doubling_lea_when_flags_die() {
+        // Each IMUL is followed by a full flag overwrite (`add`), so its
+        // flags are dead. A certificate-free compile.
+        let rewritten = |imul: X86ISelInst| {
+            let mut func = make_func(vec![
+                imul,
+                X86ISelInst::new(X86Opcode::AddRR, vec![vreg(8), vreg(7), vreg(6)]),
+                X86ISelInst::new(X86Opcode::Ret, vec![]),
+            ]);
+            X86Peephole::default()
+                .with_certificate_free_imul_reductions(true)
+                .run_on_function(&mut func);
+            entry_insts(&func)[0].clone()
+        };
+        let doubled = rewritten(X86ISelInst::new(
+            X86Opcode::ImulRRI,
+            vec![vreg(2), vreg(1), X86ISelOperand::Imm(2)],
+        ));
+        assert_eq!(doubled.opcode, X86Opcode::LeaSib);
+        assert_eq!(
+            doubled.operands,
+            lea_sib_double(VReg::new(2, RegClass::Gpr64), VReg::new(1, RegClass::Gpr64)).operands
+        );
+        // 32-bit: not rewritten (the doubling LEA is 64-bit).
+        assert_eq!(
+            rewritten(X86ISelInst::new(
+                X86Opcode::ImulRRI,
+                vec![vreg32(4), vreg32(3), X86ISelOperand::Imm(2)],
+            ))
+            .opcode,
+            X86Opcode::ImulRRI
+        );
+        // Mixed classes: not rewritten, whichever operand is not 64-bit
+        // (each class check is pinned on its own).
+        assert_eq!(
+            rewritten(X86ISelInst::new(
+                X86Opcode::ImulRRI,
+                vec![vreg(4), vreg32(3), X86ISelOperand::Imm(2)],
+            ))
+            .opcode,
+            X86Opcode::ImulRRI
+        );
+        assert_eq!(
+            rewritten(X86ISelInst::new(
+                X86Opcode::ImulRRI,
+                vec![vreg32(4), vreg(3), X86ISelOperand::Imm(2)],
+            ))
+            .opcode,
+            X86Opcode::ImulRRI
+        );
+        // d == s: not rewritten.
+        assert_eq!(
+            rewritten(X86ISelInst::new(
+                X86Opcode::ImulRRI,
+                vec![vreg(5), vreg(5), X86ISelOperand::Imm(2)],
+            ))
+            .opcode,
+            X86Opcode::ImulRRI
+        );
+    }
+
+    /// A compile that keeps proof certificates (every constructor's default)
+    /// withholds both certificate-free IMUL reductions: `x * 2` keeps its
+    /// IMUL even with dead flags, and a store between an IMUL and the next
+    /// full flag writer keeps an otherwise reducible IMUL (`x * 3`, the
+    /// pre-existing scaled-LEA arm) because the historical scan stops at it.
+    /// The same functions are reduced once the reductions are enabled.
+    #[test]
+    fn x86_peephole_withholds_the_certificate_free_imul_reductions_by_default() {
+        let first = |imm: i64, store: bool, certificate_free: bool| {
+            let mut insts = vec![X86ISelInst::new(
+                X86Opcode::ImulRRI,
+                vec![vreg(2), vreg(1), X86ISelOperand::Imm(imm)],
+            )];
+            if store {
+                insts.push(store_of(2, 9, X86Opcode::MovMR));
+            }
+            insts.push(X86ISelInst::new(
+                X86Opcode::AddRR,
+                vec![vreg(8), vreg(7), vreg(6)],
+            ));
+            insts.push(X86ISelInst::new(X86Opcode::Ret, vec![]));
+            let mut func = make_func(insts);
+            X86Peephole::default()
+                .with_certificate_free_imul_reductions(certificate_free)
+                .run_on_function(&mut func);
+            entry_opcodes(&func)[0]
+        };
+        // The doubling-LEA arm.
+        assert_eq!(first(2, false, false), X86Opcode::ImulRRI);
+        assert_eq!(first(2, false, true), X86Opcode::LeaSib);
+        // The store-passing scan (the x3 arm itself is not new).
+        assert_eq!(first(3, false, false), X86Opcode::LeaSib);
+        assert_eq!(first(3, true, false), X86Opcode::ImulRRI);
+        assert_eq!(first(3, true, true), X86Opcode::LeaSib);
+        // `X86Peephole::new` and `with_admissions` withhold them too.
+        for mut peephole in [
+            X86Peephole::new(|_| false),
+            X86Peephole::with_admissions(|_| false, |_, _, _| false),
+        ] {
+            let mut func = make_func(vec![
+                X86ISelInst::new(
+                    X86Opcode::ImulRRI,
+                    vec![vreg(2), vreg(1), X86ISelOperand::Imm(2)],
+                ),
+                X86ISelInst::new(X86Opcode::AddRR, vec![vreg(8), vreg(7), vreg(6)]),
+                X86ISelInst::new(X86Opcode::Ret, vec![]),
+            ]);
+            peephole.run_on_function(&mut func);
+            assert_eq!(entry_opcodes(&func)[0], X86Opcode::ImulRRI);
+        }
+    }
+
+    #[test]
+    fn x86_peephole_keeps_imul_rri_two_when_its_flags_are_read() {
+        let mut func = make_func(vec![
+            X86ISelInst::new(
+                X86Opcode::ImulRRI,
+                vec![vreg(2), vreg(1), X86ISelOperand::Imm(2)],
+            ),
+            X86ISelInst::new(
+                X86Opcode::Jcc,
+                vec![
+                    X86ISelOperand::CondCode(X86CondCode::O),
+                    X86ISelOperand::Block(Block(1)),
+                ],
+            ),
+            X86ISelInst::new(X86Opcode::Ret, vec![]),
+        ]);
+        let mut peephole = X86Peephole::default().with_certificate_free_imul_reductions(true);
+        peephole.run_on_function(&mut func);
+        assert_eq!(entry_opcodes(&func)[0], X86Opcode::ImulRRI);
+    }
+
+    fn store_of(value: u32, base: u32, opcode: X86Opcode) -> X86ISelInst {
+        X86ISelInst::new(
+            opcode,
+            vec![
+                X86ISelOperand::MemAddr {
+                    base: Box::new(vreg(base)),
+                    disp: 0,
+                },
+                vreg(value),
+            ],
+        )
+    }
+
+    /// A plain store between the IMUL and the next full flag writer does not
+    /// hide the flags' death (TY's `ty_bfs_kernel` shape: `y * 2` stored, then
+    /// an `add`); a volatile store does, and so does a flag reader after the
+    /// store, and a block that ends without a full overwrite.
+    #[test]
+    fn x86_peephole_imul_rri_flags_die_past_a_plain_store_only() {
+        let imul = || {
+            X86ISelInst::new(
+                X86Opcode::ImulRRI,
+                vec![vreg(2), vreg(1), X86ISelOperand::Imm(2)],
+            )
+        };
+        let add = X86ISelInst::new(X86Opcode::AddRR, vec![vreg(4), vreg(3), vreg(1)]);
+        let first = |insts: Vec<X86ISelInst>| {
+            let mut func = make_func(insts);
+            X86Peephole::default()
+                .with_certificate_free_imul_reductions(true)
+                .run_on_function(&mut func);
+            entry_opcodes(&func)[0]
+        };
+        let ret = || X86ISelInst::new(X86Opcode::Ret, vec![]);
+        assert_eq!(
+            first(vec![
+                imul(),
+                store_of(2, 9, X86Opcode::MovMR),
+                add.clone(),
+                ret()
+            ]),
+            X86Opcode::LeaSib
+        );
+        assert_eq!(
+            first(vec![
+                imul(),
+                store_of(2, 9, X86Opcode::VolatileMovMR),
+                add.clone(),
+                ret()
+            ]),
+            X86Opcode::ImulRRI
+        );
+        assert_eq!(
+            first(vec![
+                imul(),
+                store_of(2, 9, X86Opcode::MovMR),
+                X86ISelInst::new(
+                    X86Opcode::Jcc,
+                    vec![
+                        X86ISelOperand::CondCode(X86CondCode::O),
+                        X86ISelOperand::Block(Block(1)),
+                    ],
+                ),
+                ret()
+            ]),
+            X86Opcode::ImulRRI
+        );
+        assert_eq!(
+            first(vec![imul(), store_of(2, 9, X86Opcode::MovMR), ret()]),
+            X86Opcode::ImulRRI
+        );
+    }
+
+    #[test]
     fn x86_peephole_removes_self_imul_rri_one_when_flags_die() {
         let mut func = make_func(vec![
             X86ISelInst::new(
@@ -9971,10 +10305,12 @@ mod tests {
 
     #[test]
     fn x86_peephole_preserves_non_identity_imul_rri_immediates() {
+        // 6: none of the IMUL reductions applies (2, 3, 5, 7, 9 and 2^a +/- 1
+        // are reduced).
         let mut func = make_func(vec![
             X86ISelInst::new(
                 X86Opcode::ImulRRI,
-                vec![vreg(2), vreg(1), X86ISelOperand::Imm(2)],
+                vec![vreg(2), vreg(1), X86ISelOperand::Imm(6)],
             ),
             X86ISelInst::new(X86Opcode::CmpRI, vec![vreg(2), X86ISelOperand::Imm(0)]),
             X86ISelInst::new(X86Opcode::Ret, vec![]),
@@ -11426,7 +11762,7 @@ mod tests {
             X86ISelInst::new(X86Opcode::AddRR, vec![vreg(7), vreg(8), vreg(5)]),
             X86ISelInst::new(X86Opcode::Ret, vec![]),
         ]);
-        assert!(run_impl(&mut func, |_| false, |_, _, _| false));
+        assert!(run_impl(&mut func, |_| false, |_, _, _| false, false));
         let opcodes = entry_opcodes(&func);
         assert!(
             opcodes.contains(&X86Opcode::MovRMSib),
@@ -11654,7 +11990,7 @@ mod tests {
             X86ISelInst::new(X86Opcode::CmpRR, vec![vreg(4), vreg(5)]),
             X86ISelInst::new(X86Opcode::Ret, vec![]),
         ]);
-        assert!(run_impl(&mut func, |_| false, |_, _, _| false));
+        assert!(run_impl(&mut func, |_| false, |_, _, _| false, false));
         let opcodes = entry_opcodes(&func);
         assert!(opcodes.contains(&X86Opcode::MovRMSib), "{opcodes:?}");
         assert!(!opcodes.contains(&X86Opcode::LeaSib), "{opcodes:?}");
@@ -14076,10 +14412,10 @@ mod tests {
         let used = peephole_function_use_set(&unread);
         let insts = &unread.blocks.get(&Block(0)).unwrap().insts;
         // v1 unread -> gate declines.
-        assert!(simplify_inst_gated(insts, 0, Some(&used), |_, _, _| false).is_none());
+        assert!(simplify_inst_gated(insts, 0, Some(&used), |_, _, _| false, false).is_none());
         // v2 read -> rewrite proceeds.
         assert!(matches!(
-            simplify_inst_gated(insts, 1, Some(&used), |_, _, _| false),
+            simplify_inst_gated(insts, 1, Some(&used), |_, _, _| false, false),
             Some(PeepholeEdit::Replace(_))
         ));
         // Ungated behavior unchanged: both rewrite.
@@ -14705,7 +15041,7 @@ mod tests {
     /// leaves alone must all keep the IMUL.
     #[test]
     fn constmul_shift_bails_on_two_shift_and_power_of_two_constants() {
-        for c in [24i64, 126, 13, 14, 100, 576, 61, 37, 2, 8, 4096] {
+        for c in [24i64, 126, 13, 14, 100, 576, 61, 37, 8, 4096] {
             let insts = vec![
                 X86ISelInst::new(X86Opcode::ImulRRI, vec![vreg(2), vreg(1), imm(c)]),
                 X86ISelInst::new(X86Opcode::CmpRI, vec![vreg(9), imm(0)]),
@@ -14715,6 +15051,18 @@ mod tests {
                 "x{c} must NOT be claimed by the one-shift arm"
             );
         }
+        // x2: no arm claims it when certificates are kept; in a
+        // certificate-free compile the doubling-LEA arm claims it before the
+        // one-shift arm.
+        let insts = vec![
+            X86ISelInst::new(X86Opcode::ImulRRI, vec![vreg(2), vreg(1), imm(2)]),
+            X86ISelInst::new(X86Opcode::CmpRI, vec![vreg(9), imm(0)]),
+        ];
+        assert!(simplify_inst_constmul_admitted(&insts, 0).is_none());
+        assert!(matches!(
+            simplify_inst_constmul_admitted_certificate_free(&insts, 0),
+            Some(PeepholeEdit::Replace(ref lea)) if lea.opcode == X86Opcode::LeaSib
+        ));
     }
 
     /// `1 - 2^a` (e.g. `-31`) is excluded on x86: it would need

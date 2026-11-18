@@ -29,10 +29,34 @@
       "production_connection": "unproved"
     },
     {
+      "path": "formal/lean/Trust/A64/AddSubImmBits.lean",
+      "state": "shared-computation-compiled-by-trust",
+      "trust_unit": "crates/trust-cg-codegen/src/aarch64/encoding.rs: add_sub_imm_bits",
+      "production_connection": "Source SHA256 c62b616bf9b43d4ec52c5f20e2e957c5ffe2c904bf2d751040e4c07c21bf4249 supplies the ADD, SUB, ADDS and SUBS immediate word used by the production encoder. Trust 5062eed55 kernel-checked both declarations. The packing module passed 66 tests in each of debug and release, including 67 frozen ADD/SUB immediate words. The release check covered 70 raw field cases against the original bitwise expression. The emitted word matched 65,536 flag, shift and immediate combinations at fixed register fields and one CTFE value. The body-only mutation was refused at its unchanged theorem and produced no binary."
+    },
+    {
       "path": "formal/lean/Trust/A64/Bitmask.lean",
       "state": "port-required",
       "trust_unit": null,
-      "production_connection": "unproved"
+      "production_connection": "unproved",
+      "dependency_progress": {
+        "logical_immediate_inversion": "The canonical-field bridges relate the Trust-emitted rotation and repeat operations to the original DecodeBitMasks model. The complete Bitmask module remains a reference Lean build target."
+      }
+    },
+    {
+      "path": "formal/lean/Trust/A64/ClosedCallee.lean",
+      "state": "shared-computation-compiled-by-trust",
+      "trust_unit": "crates/trust-cg-verify/src/aarch64_closed_callee.rs: closed_callee",
+      "production_connection": "Source SHA256 79d187b6fde6180d910bdd079543053b9cdd38f0c84fe63fb6e48da39c52031e supplies the emitted row rule for a callee whose only ordinary successors advance to its terminal BRK. Trust 5062eed55 kernel-checks two declarations and emits one body. The native probe passed 16,641 role and position pairs and two compile-time controls. Trust refused the trap-role mutation at the unchanged body theorem."
+    },
+    {
+      "path": "formal/lean/Trust/A64/ClosedCalleeMachine.lean",
+      "state": "port-required",
+      "trust_unit": null,
+      "production_connection": "unproved",
+      "dependency_progress": {
+        "closed_call": "The independent machine decoder and execution model use the same Trust-compiled row predicate to show that normal returns from interior calls only resume at BL+4 and that terminal BRK ends the checked activation. The exact 76-word GCD oracle and rejected word mutations were checked against this model. A general Rust decoder correspondence and promotion authority remain open."
+      }
     },
     {
       "path": "formal/lean/Trust/A64/Corpus.lean",
@@ -47,16 +71,76 @@
       "production_connection": "unproved"
     },
     {
+      "path": "formal/lean/Trust/A64/ConditionBits.lean",
+      "state": "shared-computation-compiled-by-trust",
+      "trust_unit": "crates/trust-cg-ir/src/aarch64_regs.rs: condition_bits",
+      "production_connection": "Source SHA256 5b685f634ff2ebda2e39c640fdd4c5be7fce6060539e9d7ea187faeac40a93c6 supplies the condition toggle and complementability for AArch64 layout, branch relaxation and CSET, plus the compile-time NZCV truth table used by the concrete verifier. The Lean machine shares the truth mask and checks branch-edge swapping against the CMP comparison model."
+    },
+    {
+      "path": "formal/lean/Trust/A64/ConditionalTrap.lean",
+      "state": "shared-computation-compiled-by-trust",
+      "trust_unit": "crates/trust-cg-verify/src/aarch64_terminal_trap.rs: conditional_trap",
+      "production_connection": "Source SHA256 c221a474ccf18ccf731ddeb50d7fe87eea26523bac8b215fd43665299cc1669f supplies wrapping arithmetic for the source and allocated counter recurrences and the trap event after a normal call return. Trust 5062eed55 checks 11 declarations and emits two functions. Mutation controls refuse unsigned subtraction in the step and disjunction in the continuation. The local correspondence requires matched header visits and normal call outcomes for full proof credit."
+    },
+    {
       "path": "formal/lean/Trust/A64/Encoding.lean",
       "state": "port-required",
       "trust_unit": null,
-      "production_connection": "unproved"
+      "production_connection": "unproved",
+      "dependency_progress": {
+        "shared_move_wide_word": "Lean encode and Rust encode_move_wide use trust_cg_a64_move_wide_word from MoveWideBits.lean. encode_moveWide_toNat proves the original architectural layout for every field value, and encode_toNat connects it to the existing round trips and machine fetch proof.",
+        "shared_add_sub_imm_word": "Lean encode and Rust encode_add_sub_imm use trust_cg_a64_add_sub_imm_word from AddSubImmBits.lean. encode_addSubImm_toNat proves the architectural layout for all Fin fields, and encode_toNat connects it to the existing round trips and machine fetch proof. The public Rust helper retains the release behavior of overlapping raw fields.",
+        "shared_logical_imm_word": "The architectural Fin-field model and the Rust AND, ORR, EOR and immediate TST emitters use trust_cg_a64_logical_imm_word. encode_logicalImm_toNat connects the word to the existing encoder and decoder round trips."
+      }
+    },
+    {
+      "path": "formal/lean/Trust/A64/EuclideanProgress.lean",
+      "state": "port-required",
+      "trust_unit": null,
+      "production_connection": "unproved",
+      "dependency_progress": {
+        "register_routing": "The reference proof uses the production register check from EuclideanRemainder.lean to connect the actual AArch64 UDIV, MSUB and register moves to the source unsigned remainder. The strictly decreasing divisor proves finite progress on the guarded loop. Final-byte binding and proof credit remain open."
+      }
+    },
+    {
+      "path": "formal/lean/Trust/A64/EuclideanRemainder.lean",
+      "state": "shared-computation-compiled-by-trust",
+      "trust_unit": "crates/trust-cg-verify/src/aarch64_omitted_trap_machine.rs: euclidean_remainder",
+      "production_connection": "Source SHA256 a6e3a953c4d59a51d8ca5ac1bf7f39cce068a129343da5ad6baf2de606325f07 supplies the wrapped register-pair delta consumed by the allocated remainder binder. Trust 5062eed55 checks two declarations and emits one body. The native probe passed all 1,048,576 five-bit register quadruples and two CTFE controls. Trust refused a coefficient mutation at the unchanged body theorem."
+    },
+    {
+      "path": "formal/lean/Trust/A64/FrameLayoutBits.lean",
+      "state": "shared-computation-compiled-by-trust",
+      "trust_unit": "crates/trust-cg-codegen/src/frame.rs: frame_layout_bits",
+      "production_connection": "Source SHA256 24ff9a183731bbc7e3f79e24b1761c17ffa4147b5d88b91b1d38d3db5ef7eba9 supplies mask construction and application for the production frame size and fixed FP-relative slot offsets. Trust 5062eed55 kernel-checked four declarations and emitted both bodies. The native probe passed 4,456,448 comparisons and two CTFE values. Changing either body was refused at the composition theorem. The source-to-machine frame and call proofs remain open."
+    },
+    {
+      "path": "formal/lean/Trust/A64/LogicalImmBits.lean",
+      "state": "shared-computation-compiled-by-trust",
+      "trust_unit": "crates/trust-cg-codegen/src/aarch64/encode.rs: logical_imm_bits",
+      "production_connection": "Source SHA256 56db25ca6cddd8ce3a938c67113be7bd675c2396db1b721e11f59a864f27daef supplies the shared logical-immediate word, element extraction, exact rotated-run reconstruction, repetition and canonical fields. The constant materializer in trust-cg-opt also consumes the same N and imms definitions. Trust 5062eed55 checks 17 declarations, including 13 emitted functions. The production table initializers passed 65 power, 11 mask and 11 repetition CTFE checks. Four body mutations were refused at their unchanged theorems."
     },
     {
       "path": "formal/lean/Trust/A64/Machine.lean",
       "state": "port-required",
       "trust_unit": null,
-      "production_connection": "unproved"
+      "production_connection": "unproved",
+      "dependency_progress": {
+        "shared_condition_bits": "The model uses the Trust-compiled condition truth mask. The branch-swap theorem connects the production complement operation to the architectural predicate after CMP.",
+        "counted_terminal_trap": "The B.HS predicate on CMP64 flags is connected to the Trust-compiled trap continuation at corresponding loop visits. The full machine model and external call effects still require proof."
+      }
+    },
+    {
+      "path": "formal/lean/Trust/A64/MoveWideBits.lean",
+      "state": "shared-computation-compiled-by-trust",
+      "trust_unit": "crates/trust-cg-codegen/src/aarch64/encoding.rs: move_wide_bits",
+      "production_connection": "Source SHA256 5ecc0aa648cbf07c5c9a42de7352e4937605504958e20b0441ca930cf599d3b2 supplies the shared MOVN, MOVZ, and MOVK word. Trust 5062eed55 kernel-checked both declarations in the production packing module in debug and release. Each profile passed 63 tests, including all 68 frozen move-wide words and the raw-field boundary test. The isolated native probe checked all 65,536 immediate fields for one MOVK prefix and one CTFE value. The body-only mutation was refused at its unchanged theorem and produced no binary."
+    },
+    {
+      "path": "formal/lean/Trust/A64/RedundantZeroGuard.lean",
+      "state": "shared-computation-compiled-by-trust",
+      "trust_unit": "crates/trust-cg-verify/src/aarch64_omitted_trap.rs: redundant_zero_guard",
+      "production_connection": "Source SHA256 1f2ea95085fc9feb316d77b693f12a3328b9665babd014f45e7a2a31d234b797 proves the repeated I64 zero test cannot trap on the nonzero switch edge. The source accounting matcher uses the emitted Boolean normalization for both layers. Trust 5062eed55 checked all seven declarations and emitted a callable body. Both Boolean inputs passed runtime and CTFE checks. Body and proof mutations were refused. This witness grants no machine row or whole-function proof credit."
     },
     {
       "path": "formal/lean/Trust/A64/SiliconChecks.lean",
@@ -203,9 +287,12 @@
       "production_connection": "unproved",
       "dependency_progress": {
         "shared_high_register_predicate": "gprHiBit and actual REX consumers use trust_cg_x86_is_extended from required RegisterBits.lean",
-        "finite_bridge": "gprHiBit_bits preserves the original getMsbD0 statement; the current pinned Lean model and the six-declaration Trust source population pass",
+        "finite_bridge": "gprHiBit_bits preserves the original getMsbD0 statement. The pinned Lean model and the 12-declaration Trust source population pass.",
         "full_model_port": "not established",
-        "shared_rex_byte": "rexByte and actual RexPrefix.encode call trust_cg_x86_rex_byte; rexByte_bits retains the original BitVec equation; current native/CTFE controls and the exact 447-test encoder composition pass"
+        "shared_rex_byte": "rexByte and actual RexPrefix.encode call trust_cg_x86_rex_byte. rexByte_bits retains the original BitVec equation.",
+        "shared_modrm_sib_packing": "The model's modrmByte and the backend's ModRM and SIB encoders call trust_cg_x86_pack_fields for disjoint fields. modrmByte_bits proves the original BitVec formula at the architectural widths. The SHR audit checks its axiom closure alongside all nine original declarations.",
+        "shared_shr64_word": "The Lean encoder and Rust ShrRI GPR64 path call the same Trust-compiled word packer. shr64Word_bytes proves the little-endian bytes for widths 1, 3 and 8. encode_shrRI_bytes connects them to the architectural register names; decode_encode_shrRI proves their round trip with arbitrary following bytes. The SHR audit checks 12 declarations.",
+        "shared_movabs_prefix": "The Lean MOVABS model and the Rust full-width MovRI branch call trust_cg_x86_movabs_prefix. Rust selects that branch after checking for a shorter zero-extending move. movabsPrefix_bytes proves the original REX and opcode bytes for all 16 registers, and decode_encode_movabsRI preserves every 64-bit immediate and any following bytes. The MOVABS audit checks eight declarations."
       }
     },
     {
@@ -236,7 +323,7 @@
       "path": "formal/lean/Trust/Model/RegisterBits.lean",
       "state": "shared-computation-compiled-by-trust",
       "trust_unit": "crates/trust-cg-codegen/src/x86_64/encode.rs: register_bits",
-      "production_connection": "Current source SHA256 896dceb444ab73d5ec2bc4d08a9d0055bcc1f8461fcb80d6476e4522328c2578 supplies the Trust-minted low3, extended-register and REX-byte computations used by ModRM/SIB construction, serialization, memory-base decisions, byte-register prefixes, opcode-register fields, RexPrefix.encode and the Lean encoder model. Trust SDK 16387 kernel-checked all six declarations, emitted callable bodies, passed native exhaustive UInt8/Boolean controls plus three CTFE calls, and refused separate low3, extended and REX body mutations against their unchanged theorems. A dependency-free composition of the unchanged production encode/opcode/register sources and complete current InstFlags definition passed all 447 actual unit tests, 0 failed/ignored/filtered. This is explicitly unverified Rust source qualification, not complete CG/source-to-machine refinement, native ABI/NoUB, x86 execution or performance proof; the full model and overall 85-file port remain incomplete."
+      "production_connection": "Source SHA256 da8faef70d615197ac880907ad46741b034bdc8ccba254f5f86ede3147b77ac6 supplies six shared computations for low register bits, register extension, REX bytes, ModR/M or SIB field packing, SHR64 word packing, and the MOVABS prefix. Trust 5062eed55 kernel-checked all 12 declarations and emitted six callable bodies. Native checks covered 256 low-bit inputs, 256 extension inputs, 16 REX combinations, 16,384 field-packing inputs, all 4,096 SHR words, all 16 MOVABS prefixes, and six CTFE values. The six body mutations failed at their unchanged theorems with type mismatches and produced no binary. The isolated production encoder and golden binding composition passed all 454 tests, including all SHR byte and alias checks, all 96 MOVABS vectors, and short zero-extending MOV checks. The full encoder model port, machine-code refinement, ABI, NoUB and performance verification remain open."
     },
     {
       "path": "formal/lean/Trust/Model/ShrGolden.lean",
@@ -493,12 +580,13 @@
     {
       "path": "reports/fixtures/ProofIndexedEGraph.lean",
       "state": "port-required",
-      "trust_unit": null,
+      "trust_unit": "crates/trust-cg-verify/src/proof_indexed_models.rs: egraph",
       "production_connection": "unproved",
       "dependency_progress": {
-        "source_inclusion": "Complete original source remains tracked but is not an unconditional verifier module: Trust SDK 16387 refuses its dependent Fin equality elaboration. No reduced proof fixture substitutes for it.",
-        "owning_crate_native_qualification": "refused by current Trust; no production consumer may claim this unit until the complete original declarations compile.",
-        "rust_implementation_refinement": "unproved; the mathematical source theorem grants no native codegen license."
+        "source_inclusion": "The complete original source with SHA256 141bd844146114c00865a5651377c8a31342efc7a0d39900b47c39e1f83203bc is a required clean mod in the verifier.",
+        "owning_crate_native_qualification": "Trust 5062eed55 checked all 21 original declarations alongside the 42 other declarations in the actual owner in an offline dependency-free native build. Substituting reflexivity for the merge witness was refused at merge_sound with a type mismatch and produced no binary.",
+        "artifact_replay_binding": "The existing certified-pass semantic replay fixture names the same source URI and digest.",
+        "rust_implementation_refinement": "Unproved. The admitted declarations check the mathematical model."
       }
     },
     {
@@ -548,12 +636,13 @@
     {
       "path": "reports/fixtures/ProofIndexedRewriteCore.lean",
       "state": "port-required",
-      "trust_unit": null,
+      "trust_unit": "crates/trust-cg-verify/src/proof_indexed_models.rs: rewrite_core",
       "production_connection": "unproved",
       "dependency_progress": {
-        "source_inclusion": "Complete original source remains tracked but is not an unconditional verifier module: Trust SDK 16387 refuses idStep's dependent Fin equality field and its downstream references. No reduced proof fixture substitutes for it.",
-        "owning_crate_native_qualification": "refused by current Trust; no production consumer may claim this unit until the complete original declarations compile.",
-        "rust_implementation_refinement": "unproved; the mathematical source theorem grants no native codegen license."
+        "source_inclusion": "The complete original source with SHA256 c36eae9980575686ce85ec7568d2fc29fb43fa07e44c280c59e3f26ff4ccb392 is a required clean mod in the verifier.",
+        "owning_crate_native_qualification": "Trust 5062eed55 checked all 18 original declarations alongside the 45 other declarations in the actual owner in an offline dependency-free native build. Changing the composed endpoint while keeping its proof was refused at composeStep with a sound field projection mismatch and produced no binary.",
+        "artifact_replay_binding": "The existing certified-pass semantic replay fixture names the same source URI and digest.",
+        "rust_implementation_refinement": "Unproved. The admitted declarations check the mathematical model."
       }
     },
     {

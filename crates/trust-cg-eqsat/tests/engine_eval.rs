@@ -77,6 +77,9 @@ fn module_for(desc: OpDesc) -> Module {
             then_val: arg(1),
             else_val: arg(2),
         },
+        // A pinned reduction is a Tier S region operator: no trust-ir
+        // instruction denotes it, and this test builds Tier E operators only.
+        OpDesc::Pinned(..) => panic!("{desc:?} has no trust-ir instruction"),
     };
     let result = ValueId(desc.arity() as u32);
     block.body.push(InstrNode::new(inst).with_result(result));

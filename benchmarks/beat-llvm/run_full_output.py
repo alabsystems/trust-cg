@@ -15,12 +15,14 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
+HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE))
+sys.path.insert(0, str(HERE.parent.parent / "scripts"))
+from trust_toolchain import ToolchainError, resource_fds
 from full_output import (BASE_REVISION, LANES, SUPPORTED, OutputError, compare_lanes,
                          counts, decode_output, digest, empty_accounting,
                          load_manifest, render_validation)
 
-HERE = Path(__file__).resolve().parent
 SCHEMA = "trust-cg-benchmark-full-output-diagnostic-v1"
 ENVIRONMENT_KEYS = ("SDKROOT", "MACOSX_DEPLOYMENT_TARGET", "CPATH", "C_INCLUDE_PATH",
                     "LIBRARY_PATH", "CCC_OVERRIDE_OPTIONS", "CLANG_CONFIG_FILE")
@@ -38,16 +40,18 @@ def load_helper(repo, name):
     return module
 
 
-def capture(command, timeout, env=None):
-    """Timeout/launch failure stays incomplete, never a wrong-code result."""
+def capture(command, timeout, env=None, *, trust_compiler=False):
+    """Keep Trust's inherited admission for compilers and close it for executions."""
     try:
-        result = subprocess.run(command, capture_output=True, env=env, timeout=timeout)
+        descriptors = resource_fds(os.environ if env is None else env) if trust_compiler else ()
+        result = subprocess.run(command, capture_output=True, env=env, timeout=timeout,
+                                pass_fds=descriptors)
         return {"status": "EXITED", "returncode": result.returncode,
                 "stdout": result.stdout, "stderr": result.stderr}
     except subprocess.TimeoutExpired as error:
         return {"status": "TIMEOUT", "returncode": None,
                 "stdout": error.stdout or b"", "stderr": error.stderr or b""}
-    except OSError as error:
+    except (OSError, ToolchainError) as error:
         return {"status": "EXECUTION_UNAVAILABLE", "returncode": None,
                 "stdout": b"", "stderr": str(error).encode("utf-8")}
 
@@ -96,6 +100,7 @@ def resolve_tools(args, repo):
             "clang": str(clang), "clang_sha256": file_digest(clang), "clang_version": banner,
             "helper_sources": {name: file_digest(Path(repo) / "scripts" / (name + ".py"))
                                for name in ("trust_toolchain", "bridge_backend")},
+            "resource_custody_source_sha256": file_digest(resource_fds.__code__.co_filename),
             "environment": {key: os.environ.get(key) for key in ENVIRONMENT_KEYS},
             "isa_parity_qualified": False,
             "identity_limit": "command/file identities and declared native target; loaded compiler/source/default-feature adequacy remains a qualification obligation"}
@@ -146,7 +151,7 @@ def check_kernel(here, directory, stem, row, tools, args):
         expected_source = row["validation_sources"]["c" if lane == "clang" else "rust"]["sha256"]
         if file_digest(source) != expected_source:
             raise OutputError("validation source changed before compilation")
-        compiled = capture(command, args.compile_timeout)
+        compiled = capture(command, args.compile_timeout, trust_compiler=(lane != "clang"))
         record = row["lanes"][lane] = {"compile_command": command,
                     "source_sha256": file_digest(source),
                     "compile": retain_capture(directory, stem + "_" + lane + "_compile", compiled),

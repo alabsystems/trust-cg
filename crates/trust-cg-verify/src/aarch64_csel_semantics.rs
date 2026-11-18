@@ -16,6 +16,7 @@
 
 use crate::nzcv::NzcvFlags;
 use crate::smt::{SmtExpr, SmtSort};
+use trust_cg_ir::CondCode;
 
 /// The four architectural variants, not a source-language operation binding.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -329,31 +330,10 @@ impl DecodedConditionalSelect {
 /// In particular, both AL (14) and NV (15) are true; neither complements the
 /// other. Invalid external nibble values are rejected, not silently masked.
 pub fn condition_holds(condition: u8, nzcv: u8) -> Result<bool, ConditionalSelectError> {
-    if condition > 15 {
-        return Err(ConditionalSelectError::InvalidCondition(condition));
-    }
-    if nzcv > 15 {
-        return Err(ConditionalSelectError::InvalidNzcv(nzcv));
-    }
-    let n = nzcv & 8 != 0;
-    let z = nzcv & 4 != 0;
-    let c = nzcv & 2 != 0;
-    let v = nzcv & 1 != 0;
-    let base = match condition >> 1 {
-        0 => z,
-        1 => c,
-        2 => n,
-        3 => v,
-        4 => c && !z,
-        5 => n == v,
-        6 => n == v && !z,
-        _ => true,
-    };
-    Ok(if condition & 1 != 0 && condition != 15 {
-        !base
-    } else {
-        base
-    })
+    CondCode::from_encoding(i64::from(condition))
+        .ok_or(ConditionalSelectError::InvalidCondition(condition))?
+        .holds(nzcv)
+        .ok_or(ConditionalSelectError::InvalidNzcv(nzcv))
 }
 
 fn condition_expression(condition: u8, nzcv: SmtExpr) -> SmtExpr {

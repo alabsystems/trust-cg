@@ -63,6 +63,7 @@ pub const BUILD_FEATURE_IDENTITY: &str =
     };
 
 pub mod aarch64;
+pub mod aarch64_closed_terminal_call;
 pub mod aarch64_dispatch;
 pub mod aot_frame_inputs;
 pub mod apple_deployment;
@@ -787,9 +788,17 @@ pub use x86_64::pipeline::set_x86_reload_elide_disabled;
 pub use x86_64::pipeline::set_x86_sroa_disabled;
 pub use x86_64::pipeline::x86_loop_align_relocate_contained_withheld;
 pub use x86_64::pipeline::{
+    X86_O2_FIXPOINT_MAX_ITERATIONS, set_x86_leaf_frame_elision_disabled,
+    set_x86_o2_fixpoint_iterations, x86_leaf_frame_elision_withheld, x86_o2_fixpoint_withheld,
+};
+pub use x86_64::pipeline::{
     X86AllocationQuality, set_x86_ra_abi_copy_hints_disabled, set_x86_ra_call_split_disabled,
     set_x86_ra_caller_saved_first_disabled, set_x86_ra_cold_call_weight_disabled,
     set_x86_ra_trace_enabled, x86_ra_quality_withheld,
+};
+pub use x86_64::pipeline::{
+    set_x86_imul_certificate_free_reductions_disabled,
+    x86_imul_certificate_free_reductions_withheld,
 };
 
 /// The codegen license the crate's unit tests compile their hand-built

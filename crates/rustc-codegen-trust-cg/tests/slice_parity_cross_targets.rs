@@ -19,7 +19,8 @@ mod toolchain_support;
 // (`print_std_fallback_target`, `array_element_aggregate_target`,
 // `union_transmute_slot_target`, `typed_swap_thin_pointer_target`,
 // `slice_element_newtype_borrow_target`,
-// `aggregate_stored_reference_cell_target`, and the Box payload lane's
+// `aggregate_stored_reference_cell_target`, `terminal_capturing_closure_target`,
+// `collection_field_image_target`, and the Box payload lane's
 // `abort_payload_lane`): an admitted target must produce an object that
 // defines the crate's export; an excluded target must refuse with the
 // refusal it had before the admission. Widening or narrowing a predicate
@@ -27,9 +28,9 @@ mod toolchain_support;
 //
 // EVIDENCE BOUNDARY: compile-only. Nothing here is executed; an AArch64
 // object compiled here is "written, compiled, not executed" (its executing
-// test is `tests/slice_capabilities_2_linux.rs` on an AArch64 Linux host).
-// The AArch64 Darwin and wasm32 rows record EXCLUSION only: each capability
-// must still be refused there with the refusal it had before.
+// tests are `tests/slice_capabilities_2_linux.rs` and
+// `tests/slice_capabilities_3_linux.rs` on an AArch64 Linux host).
+// AArch64 Darwin expects an object for the standard print fallback.
 //
 // Prerequisite: SLICE_PARITY_CROSS_SYSROOT. When it is unset the test prints
 // "SKIPPED" and PASSES without judging a cell, so an ordinary `cargo test`
@@ -80,7 +81,7 @@ fn cases() -> Vec<Case> {
         Case {
             crate_file: "cap_print.rs",
             expect: |target, _| match target {
-                LINUX => Expect::Object("cap_print"),
+                LINUX | DARWIN => Expect::Object("cap_print"),
                 _ => Expect::Refused("[TCG-FMT-DECLINED]"),
             },
         },
@@ -91,6 +92,24 @@ fn cases() -> Vec<Case> {
                 // (`tests/drop_heap_linux.rs`, "recursive drop glue").
                 LINUX => Expect::Refused("drop_glue"),
                 _ => Expect::Unjudged,
+            },
+        },
+        Case {
+            crate_file: "cap_terminal.rs",
+            expect: |target, _| match target {
+                LINUX => Expect::Object("cap_terminal"),
+                // Refused before the closure is reached, as before.
+                DARWIN => Expect::Refused("[TCG-AGGREGATE-ABI-SCOPE]"),
+                _ => Expect::Refused(
+                    "iterator any with a capturing (non-ZST) closure is not modeled",
+                ),
+            },
+        },
+        Case {
+            crate_file: "cap_collfield.rs",
+            expect: |target, _| match target {
+                LINUX => Expect::Object("cap_collfield"),
+                _ => Expect::Refused("[TCG-COLLECTION-IMAGE]"),
             },
         },
         Case {

@@ -41,13 +41,17 @@
 //!    solver on, unwind modelling on, no traces. So a backend that never
 //!    reaches `install` — a non-rustc embedding, or a compiler too old to carry
 //!    the option — runs the fully checked lane and claims nothing extra.
-//! 3. **The knobs never widen what is admitted, with one named exception.**
+//! 3. **The knobs never widen what is admitted, with two named exceptions.**
 //!    They select traces, opt-outs and resource budgets, and none of those
-//!    admits a MIR shape the default lane would refuse. The exception is
-//!    `box-deref-named-premise`, which is an opt-IN: it lets the lane compile
+//!    admits a MIR shape the default lane would refuse. The exceptions are the
+//!    two Box deref opt-INs. `box-deref-named-premise` lets the lane compile
 //!    a Box deref the compiler's own fail-closed check admitted, under a
-//!    disclosed named assumption (`box_deref_disclosure`). Absent, the lane
-//!    refuses every Box deref, so the default of rule 2 is unchanged.
+//!    disclosed named assumption (`box_deref_disclosure`).
+//!    `box-deref-locally-rederived` admits strictly less: only a Box deref
+//!    whose every validity conjunct trust-cg re-derives from the deref's own
+//!    function (`BoxValidityFloor::LocallyRederived`), so nothing is assumed
+//!    or disclosed. Absent both, the lane refuses every Box deref, so the
+//!    default of rule 2 is unchanged.
 //! 4. **A value is READ, never merely counted as present.** Each knob declares
 //!    a [`Shape`], the grammar is checked once at parse where a bad value is
 //!    `fatal`, and the stored value is canonical. This is the fix for a
@@ -183,6 +187,8 @@ declare_knobs! {
         "neither read nor write this compile's certificate replay hint, so no stored certificate is replayed (and no resident solver started) before lowering asks for it (A/B only; every replay is the same full check either way and verdicts are identical)";
     BOX_DEREF_NAMED_PREMISE = "box-deref-named-premise", "TCG_BOX_DEREF_NAMED_PREMISE", Shape::Boolean,
         "ADMITS MORE, unlike every other knob: compile `Inst::BoxDeref` under trust-ir's named-premise floor (roots param_by_value and alloc_postcondition) instead of refusing it, and print what was assumed as `[TCG-BOX-DEREF-FACT]` / `[TCG-BOX-DEREF-ASSUMED]` lines on stderr. The instruction is only ever emitted for a cast the compiler's own fail-closed Box fact check admitted, which needs a compiler that exports those facts and a session whose verifier ran; the object then rests on a NAMED ASSUMPTION, not on a proof. A proof-emitting compile refuses the instruction regardless, so this needs `no-proof-certs`. DEFAULT OFF: every Box deref is refused with [TCG-BOX-DEREF]";
+    BOX_DEREF_LOCALLY_REDERIVED = "box-deref-locally-rederived", "TCG_BOX_DEREF_LOCALLY_REDERIVED", Shape::Boolean,
+        "ADMITS MORE than the default, less than `box-deref-named-premise`: compile `Inst::BoxDeref` under trust-cg's opt-in LocallyRederived floor, which admits a BoxDeref only when trust-cg re-derives every one of its nonnull, aligned and dereferenceable conjuncts from the deref's own function (a stack slot or a success-tested heap allocation of that function), so nothing is assumed. Like the named-premise knob it acts only on an instruction the compiler's own fail-closed Box fact check admitted and the bridge emitted, and a proof-emitting compile refuses the instruction regardless, so this needs `no-proof-certs`. With `box-deref-named-premise` also set, the named-premise floor (a superset) applies. DEFAULT OFF: every Box deref is refused with [TCG-BOX-DEREF]";
     DISABLE_UNWIND = "disable-unwind", "TCG_DISABLE_UNWIND", Shape::Boolean,
         "refuse crates that need unwind tables instead of modelling the cleanup edges";
     NO_VC_DIAMOND = "no-vc-diamond", "TCG_NO_VC_DIAMOND", Shape::Boolean,
@@ -281,6 +287,14 @@ declare_knobs! {
         "seed the heap i64 sum tier's two XMM accumulators through stored lanes of a stack slot again (two 8-byte stores, two 16-byte loads that the store buffer cannot forward) instead of `movq` from the zero register. DEFAULT ON only together with `no-proof-certs` (since 2026-11-15); withheld with proof certificates on. Measured on h4_vec_dropper: 1.100 to 1.083 of LLVM by a hand edit of the linked binary";
     NO_X86_LOOP_ALIGN_RELOCATE_CONTAINED = "no-x86-loop-align-relocate-contained", "TCG_NO_X86_LOOP_ALIGN_RELOCATE_CONTAINED", Shape::Boolean,
         "keep the x86 loop-head aligner's G6 rule (never move a loop whose body already lies inside one 64-byte line). DEFAULT: contained loops are aligned too, only together with `no-proof-certs` (since 2026-11-15); withheld with proof certificates on. Measured: p7_sieve's array-fill loop is ~1.5 % of the program slower inside a line than at its start, and the ABI copy hints moved it there";
+    NO_X86_O2_FIXPOINT = "no-x86-o2-fixpoint", "TCG_NO_X86_O2_FIXPOINT", Shape::Boolean,
+        "run the x86-64 machine-pass schedule ONCE at O2, as before 2026-11-15. DEFAULT: at O2 the schedule runs to the same bounded fixpoint O3 runs (at most `x86-o2-fixpoint-iterations`, default 4, stopping when nothing changes), only together with `no-proof-certs`; withheld with proof certificates on. The schedule's late structural passes (bounds-check elimination, if-conversion, the branch layout) expose work to its earlier cleanup passes (CSE, the peephole's read-modify-write fusion and SIB folds) that one pass leaves undone. Measured: b1_mispredict 1.053 to 1.004, p2_collatz 1.025 to 1.009 of LLVM -O2 (the O3 binaries, min of 21)";
+    X86_O2_FIXPOINT_ITERATIONS = "x86-o2-fixpoint-iterations", "TCG_X86_O2_FIXPOINT_ITERATIONS", Shape::Uint,
+        "the O2 machine-pass iteration bound of `no-x86-o2-fixpoint`'s fixpoint, 1 to 4 (1 is the single pass). DEFAULT 4, the O3 bound. Used only together with `no-proof-certs`";
+    NO_X86_LEAF_FRAME_ELISION = "no-x86-leaf-frame-elision", "TCG_NO_X86_LEAF_FRAME_ELISION", Shape::Boolean,
+        "keep the `push rbp; mov rbp, rsp; ...; pop rbp` frame of every x86-64 function. DEFAULT: a leaf that needs no frame (no stack slot, spill, callee-saved register, call, push, pop, dynamic allocation or RSP/RBP operand) is emitted frameless, only together with `no-proof-certs` (since 2026-11-15) and only in an ELF System V module that emits no unwind tables (`panic=abort`, no exception-handling structure); withheld with proof certificates on. Measured: the TY kernel `ty_bfs_kernel` 1.083 to 1.011 of LLVM by a hand edit of the linked binary (kernel at the same address, identical driver), LLVM omits the frame pointer by default on this target";
+    NO_X86_IMUL_CERTIFICATE_FREE_REDUCTIONS = "no-x86-imul-certificate-free-reductions", "TCG_NO_X86_IMUL_CERTIFICATE_FREE_REDUCTIONS", Shape::Boolean,
+        "keep the x86-64 `IMUL r, r, imm` strength reductions as before 2026-11-15: no `x * 2` -> doubling `LEA [s + s*1]` arm, and a flags scan that stops at every store. DEFAULT: both on, only together with `no-proof-certs`; withheld with proof certificates on. The flags scan lets a plain (non-volatile) `MOV` store pass on the way to the full flag overwrite every reduction still requires. Measured: the TY kernel `ty_bfs_kernel` 1.083 to 1.065 of LLVM by a hand edit of the linked binary (the `y * 2` it stores)";
     NO_X86_XORSHIFT_DEMANDED_BITS = "no-x86-xorshift-demanded-bits", "TCG_NO_X86_XORSHIFT_DEMANDED_BITS", Shape::Boolean,
         "DISABLE the xorshift demanded-bits rewrite (DEFAULT ON since 2026-10-01: b1_mispredict 1.0959 -> 1.0260, ~60x its noise floor, all 18 programs MATCH, library/core at O3 unchanged). The rewrite lets a consumer that reads only bits [0,k) of `x ^ (x << k)` read `x` instead: shifting left by k cannot change bits below k, so the two agree there and the dependency chain feeding that consumer loses one shift-and-xor. The capability EXISTS in this repo as the AArch64 `xorshift_demanded_bits` (default-ON, credited -9ms of b1's 29ms gap there and independently reproduced at -11ms) and had NO x86 twin -- `x86_loop_top.rs` carried a comment naming it as missing. A direct port fires on nothing: AArch64's producer is one shift-fused `EorRRLsl` with both sources equal, while x86's is the PAIR `ShlRI`+`XorRR` whose operands do NOT match syntactically (b1's measured stream shifts v25 and xors v24, with `MovRR` copies between), and x86 ISel vregs are not SSA so single-def-ness must be checked where SSA gave the AArch64 twin it for free. This is a LATENCY lever, not an instruction-count one: it resolves b1's 50%-mispredicting branch one ALU op earlier";
     TRACE_X86_XORSHIFT_DEMANDED_BITS = "trace-x86-xorshift-demanded-bits", "TCG_X86_XORSHIFT_DB_TRACE", Shape::Boolean,

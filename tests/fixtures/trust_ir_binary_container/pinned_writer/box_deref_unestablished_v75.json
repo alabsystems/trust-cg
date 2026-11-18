@@ -1,0 +1,158 @@
+{
+  "name": "refuse_box_deref_unestablished_parameter",
+  "functions": [
+    {
+      "id": 0,
+      "name": "subject",
+      "ty": 0,
+      "entry": 0,
+      "blocks": [
+        {
+          "id": 0,
+          "params": [
+            [
+              0,
+              "Ptr"
+            ]
+          ],
+          "body": [
+            {
+              "inst": {
+                "BoxDeref": {
+                  "ptr_ty": "Ptr",
+                  "pointee": {
+                    "Sized": {
+                      "ty": "I64"
+                    }
+                  },
+                  "operand": 0,
+                  "fact": {
+                    "site": {
+                      "item": [
+                        94,
+                        94,
+                        94,
+                        94,
+                        94,
+                        94,
+                        94,
+                        94,
+                        94,
+                        94,
+                        94,
+                        94,
+                        94,
+                        94,
+                        94,
+                        94
+                      ],
+                      "ordinal": 0
+                    },
+                    "session": {
+                      "judged": "OptimizedFallback",
+                      "producing": "NonProofSession"
+                    },
+                    "evidence": [
+                      {
+                        "conjunct": "NonNull",
+                        "evidence": "Unestablished"
+                      },
+                      {
+                        "conjunct": "Aligned",
+                        "evidence": "Unestablished"
+                      },
+                      {
+                        "conjunct": "Dereferenceable",
+                        "evidence": "Unestablished"
+                      }
+                    ],
+                    "not_claimed": [
+                      "Uniqueness",
+                      "PointeeValidity",
+                      "Allocator"
+                    ]
+                  }
+                }
+              },
+              "results": [
+                1
+              ],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            },
+            {
+              "inst": {
+                "Return": {
+                  "values": [
+                    1
+                  ]
+                }
+              },
+              "results": [],
+              "proofs": [],
+              "span": null,
+              "proof_context": null
+            }
+          ]
+        }
+      ],
+      "proofs": [],
+      "calling_conv": "C",
+      "linkage": "External",
+      "attrs": {
+        "readonly": false,
+        "readnone": false,
+        "inlinehint": false,
+        "cold": false,
+        "params": [],
+        "naked": false,
+        "target_features": []
+      },
+      "summary": null,
+      "producer": null,
+      "value_names": null,
+      "scopes": null,
+      "source_provenance": null,
+      "body_gate": {
+        "Gated": {
+          "authority": "trust-direct-lane-structural"
+        }
+      },
+      "display_path": null,
+      "section": null,
+      "visibility": "Default"
+    }
+  ],
+  "structs": [],
+  "enums": [],
+  "records": [],
+  "closure_types": [],
+  "globals": [],
+  "func_types": [
+    {
+      "params": [
+        "Ptr"
+      ],
+      "returns": [
+        "Ptr"
+      ],
+      "is_vararg": false
+    }
+  ],
+  "types": [],
+  "proof_obligations": [],
+  "proof_certificates": [],
+  "target_info": null,
+  "files": [],
+  "obligation_diagnostics": [],
+  "spec_modules": [],
+  "universes": [],
+  "predicates": [],
+  "global_asm": [],
+  "imports": [],
+  "tuple_layouts": [],
+  "completeness": null,
+  "drop_glue": [],
+  "closure_layouts": []
+}

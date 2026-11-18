@@ -676,6 +676,12 @@ pub enum OpDesc {
     Cast(CastOpCode, ScalarTy, ScalarTy),
     /// `Select(T)`: arity 3 (`Bool`, `T`, `T`), result `T`.
     Select(ScalarTy),
+    /// `Pinned(order, T)`: a reduction whose order is pinned in the operator
+    /// (`docs/eqsat-tier-s.md` section 2.2): arity 1, operand `T`, result
+    /// `T`. A Tier S region operator only: no trust-ir instruction denotes
+    /// it, the Tier E reader never makes one, and a version-1 derivation
+    /// that names one is refused by the checker.
+    Pinned(u32, ScalarTy),
 }
 
 impl OpDesc {
@@ -684,7 +690,7 @@ impl OpDesc {
     pub const fn arity(self) -> usize {
         match self {
             OpDesc::Bin(..) | OpDesc::Cmp(..) => 2,
-            OpDesc::Un(..) | OpDesc::Cast(..) => 1,
+            OpDesc::Un(..) | OpDesc::Cast(..) | OpDesc::Pinned(..) => 1,
             OpDesc::Select(_) => 3,
         }
     }
@@ -693,7 +699,9 @@ impl OpDesc {
     #[must_use]
     pub const fn result_ty(self) -> ScalarTy {
         match self {
-            OpDesc::Bin(_, ty) | OpDesc::Un(_, ty) | OpDesc::Select(ty) => ty,
+            OpDesc::Bin(_, ty) | OpDesc::Un(_, ty) | OpDesc::Select(ty) | OpDesc::Pinned(_, ty) => {
+                ty
+            }
             OpDesc::Cmp(..) => ScalarTy::Bool,
             OpDesc::Cast(_, _, dst) => dst,
         }
@@ -704,7 +712,7 @@ impl OpDesc {
     pub const fn operand_ty(self, index: usize) -> Option<ScalarTy> {
         match (self, index) {
             (OpDesc::Bin(_, ty) | OpDesc::Cmp(_, ty), 0 | 1) => Some(ty),
-            (OpDesc::Un(_, ty), 0) => Some(ty),
+            (OpDesc::Un(_, ty) | OpDesc::Pinned(_, ty), 0) => Some(ty),
             (OpDesc::Cast(_, src, _), 0) => Some(src),
             (OpDesc::Select(_), 0) => Some(ScalarTy::Bool),
             (OpDesc::Select(ty), 1 | 2) => Some(ty),
@@ -713,7 +721,7 @@ impl OpDesc {
     }
 
     /// Whether the operator is admitted at its types (section 2.2): a cast
-    /// needs both types in `IT`.
+    /// needs both types in `IT`, a pinned reduction an integer type.
     #[must_use]
     pub const fn admitted(self) -> bool {
         match self {
@@ -722,10 +730,12 @@ impl OpDesc {
             OpDesc::Cmp(pred, ty) => pred.admitted_at(ty),
             OpDesc::Cast(_, src, dst) => !src.is_bool() && !dst.is_bool(),
             OpDesc::Select(_) => true,
+            OpDesc::Pinned(_, ty) => !ty.is_bool(),
         }
     }
 
-    /// The static extraction cost of section 6.
+    /// The static extraction cost of section 6 (a pinned reduction:
+    /// `docs/eqsat-tier-s.md` section 5).
     #[must_use]
     pub const fn cost(self) -> u64 {
         match self {
@@ -738,6 +748,7 @@ impl OpDesc {
                 | UnOpCode::BitReverse,
                 _,
             ) => 2,
+            OpDesc::Pinned(..) => REDUCTION_COST,
             OpDesc::Bin(..)
             | OpDesc::Un(..)
             | OpDesc::Cmp(..)
@@ -755,6 +766,7 @@ impl OpDesc {
             OpDesc::Cmp(..) => "icmp",
             OpDesc::Cast(..) => "cast",
             OpDesc::Select(_) => "select",
+            OpDesc::Pinned(..) => "pinned",
         }
     }
 
@@ -768,6 +780,11 @@ impl OpDesc {
                 out.extend_from_slice(&[0x04, op.code(), src.code(), dst.code()]);
             }
             OpDesc::Select(ty) => out.extend_from_slice(&[0x05, ty.code()]),
+            OpDesc::Pinned(order, ty) => {
+                out.push(0x06);
+                out.extend_from_slice(&order.to_le_bytes());
+                out.push(ty.code());
+            }
         }
     }
 }
@@ -777,3 +794,9 @@ pub const CONST_COST: u64 = 1;
 
 /// Static cost of a see-through copy in the input body (section 6).
 pub const COPY_COST: u64 = 1;
+
+/// Static cost of a reduction, pinned or order-free
+/// (`docs/eqsat-tier-s.md` section 5). The two cost the same, so an
+/// order-free node is elaborated only where that shares a pinned reduction
+/// the region already computes.
+pub const REDUCTION_COST: u64 = 4;

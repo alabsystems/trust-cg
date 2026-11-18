@@ -49,6 +49,7 @@ mod proof;
 mod remap;
 mod rewrite;
 pub mod rules;
+pub mod saturate;
 mod selector;
 mod to_graph;
 pub mod vocab;

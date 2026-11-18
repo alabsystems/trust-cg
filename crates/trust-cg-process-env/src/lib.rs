@@ -1,3 +1,7 @@
+#![cfg_attr(
+    all(unix, feature = "trust-child-resources"),
+    feature(trust_process_inherit_fds)
+)]
 // Copyright 2026 Andrew Yates
 // Author: Andrew Yates <andrewyates.name@gmail.com>
 // SPDX-License-Identifier: Apache-2.0
@@ -33,6 +37,8 @@ use std::sync::OnceLock;
 
 pub mod private_fs;
 pub mod resource_budget;
+#[cfg(feature = "trust-child-resources")]
+pub mod trust_child;
 
 /// Environment namespaces reserved for Trust Codegen compiler controls.
 ///

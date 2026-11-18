@@ -612,7 +612,7 @@ fn rust_panic_resumes_through_jit_cleanup_to_catch_unwind() {
         let cleanup = entry(&result, "rust_cleanup");
         let before = DROPS.load(Ordering::SeqCst);
         for _ in 0..32 {
-            let payload = std::panic::catch_unwind(|| cleanup())
+            let payload = std::panic::catch_unwind(cleanup)
                 .expect_err("the panic must resume past the JIT frame");
             assert_eq!(
                 payload.downcast_ref::<JitPanicMarker>(),
@@ -660,7 +660,7 @@ fn panic_unwind_registers_frame_only_tables_for_plain_frames() {
             .all(|record| record.lsda_offset.is_none())
     );
     let walk = entry(&result, "walk_frame");
-    let payload = std::panic::catch_unwind(|| walk()).expect_err("panic walks through");
+    let payload = std::panic::catch_unwind(walk).expect_err("panic walks through");
     assert_eq!(
         payload.downcast_ref::<JitPanicMarker>(),
         Some(&JitPanicMarker(7))

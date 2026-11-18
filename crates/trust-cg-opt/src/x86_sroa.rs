@@ -80,7 +80,7 @@
 //!
 //! Reference: `crates/trust-cg-opt/src/sroa.rs` (AArch64 SROA).
 
-use std::collections::{HashMap, HashSet};
+use crate::fast_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 use trust_cg_ir::regs::RegClass;
 use trust_cg_ir::{VReg, X86Opcode};
@@ -321,7 +321,7 @@ fn run_impl(func: &mut X86ISelFunction) -> bool {
         let mut all: Vec<u32> = Vec::new();
         for block in func.blocks.values() {
             for inst in &block.insts {
-                let mut vregs = HashSet::new();
+                let mut vregs = HashSet::default();
                 for op in &inst.operands {
                     collect_stack_slots_in_operand(op, &mut all);
                     collect_operand_vregs(op, &mut vregs);
@@ -508,7 +508,7 @@ fn x86_defined_vreg(inst: &X86ISelInst) -> Option<VReg> {
 }
 
 fn build_def_counts(func: &X86ISelFunction) -> HashMap<VReg, usize> {
-    let mut counts: HashMap<VReg, usize> = HashMap::new();
+    let mut counts: HashMap<VReg, usize> = HashMap::default();
     for block_id in &func.block_order {
         let Some(block) = func.blocks.get(block_id) else {
             continue;
@@ -528,7 +528,7 @@ fn build_def_counts(func: &X86ISelFunction) -> HashMap<VReg, usize> {
 /// unclassified reader exists (a vreg mentioned by two operands of one
 /// instruction makes the counts disagree → conservative bail).
 fn collect_vreg_use_counts(func: &X86ISelFunction) -> HashMap<VReg, u32> {
-    let mut counts: HashMap<VReg, u32> = HashMap::new();
+    let mut counts: HashMap<VReg, u32> = HashMap::default();
     for block_id in &func.block_order {
         let Some(block) = func.blocks.get(block_id) else {
             continue;
@@ -536,7 +536,7 @@ fn collect_vreg_use_counts(func: &X86ISelFunction) -> HashMap<VReg, u32> {
         for inst in &block.insts {
             let start = usize::from(x86_produces_value(inst.opcode));
             for op in &inst.operands[start..] {
-                let mut mentioned: HashSet<VReg> = HashSet::new();
+                let mut mentioned: HashSet<VReg> = HashSet::default();
                 collect_operand_vregs(op, &mut mentioned);
                 for v in mentioned {
                     *counts.entry(v).or_insert(0) += 1;
@@ -645,7 +645,7 @@ fn collect_stack_slot_roots(func: &X86ISelFunction) -> Vec<(u32, Site)> {
 
 fn group_roots_by_slot(roots: &[(u32, Site)]) -> Vec<(u32, Vec<Site>)> {
     let mut order: Vec<u32> = Vec::new();
-    let mut by_slot: HashMap<u32, Vec<Site>> = HashMap::new();
+    let mut by_slot: HashMap<u32, Vec<Site>> = HashMap::default();
     for (slot, site) in roots {
         if !by_slot.contains_key(slot) {
             order.push(*slot);
@@ -732,7 +732,7 @@ impl SlotPlan {
         Self {
             roots: Vec::new(),
             derived_defs: Vec::new(),
-            owned_vregs: HashMap::new(),
+            owned_vregs: HashMap::default(),
             accesses: Vec::new(),
             aborted: false,
         }
@@ -796,7 +796,7 @@ impl SlotPlan {
 
         // Width consistency: every (offset) must stay a single canonical bucket,
         // and every access's value class must match the bucket's width.
-        let mut bucket_at_offset: HashMap<i64, X86Opcode> = HashMap::new();
+        let mut bucket_at_offset: HashMap<i64, X86Opcode> = HashMap::default();
         for a in &self.accesses {
             let (_mov, class) = match bucket_move_and_class(a.bucket) {
                 Some(v) => v,
@@ -836,7 +836,7 @@ impl SlotPlan {
         }
 
         // One shadow vreg per offset, matching the value register class.
-        let mut scalar_vreg: HashMap<i64, VReg> = HashMap::new();
+        let mut scalar_vreg: HashMap<i64, VReg> = HashMap::default();
         for a in &self.accesses {
             if scalar_vreg.contains_key(&a.byte_offset) {
                 continue;
@@ -1079,7 +1079,7 @@ fn accesses_have_reaching_stores(
             return false;
         }
         for pred in block_preds {
-            let mut seen = HashSet::new();
+            let mut seen = HashSet::default();
             if !predecessor_path_has_store(preds, accesses, *pred, access.byte_offset, &mut seen) {
                 return false;
             }
@@ -1094,12 +1094,12 @@ fn compute_dominators(
 ) -> HashMap<Block, HashSet<Block>> {
     let all_blocks: HashSet<Block> = func.block_order.iter().copied().collect();
     let Some(entry) = func.block_order.first().copied() else {
-        return HashMap::new();
+        return HashMap::default();
     };
-    let mut dominators: HashMap<Block, HashSet<Block>> = HashMap::new();
+    let mut dominators: HashMap<Block, HashSet<Block>> = HashMap::default();
     for block_id in &func.block_order {
         if *block_id == entry {
-            dominators.insert(*block_id, HashSet::from([entry]));
+            dominators.insert(*block_id, HashSet::from_iter([entry]));
         } else {
             dominators.insert(*block_id, all_blocks.clone());
         }
@@ -1125,7 +1125,7 @@ fn compute_dominators(
                 }
                 intersection
             } else {
-                HashSet::new()
+                HashSet::default()
             };
             next.insert(*block_id);
             if dominators.get(block_id) != Some(&next) {
@@ -1196,7 +1196,7 @@ fn predecessor_path_has_store(
 }
 
 fn stores_are_single_block_per_offset(accesses: &[Access]) -> bool {
-    let mut store_block_by_offset: HashMap<i64, Block> = HashMap::new();
+    let mut store_block_by_offset: HashMap<i64, Block> = HashMap::default();
     for access in accesses {
         if access.is_load {
             continue;
@@ -1223,8 +1223,8 @@ fn apply_rewrites(
 ) -> bool {
     // Build the in-place access replacements and the dead-address removal set,
     // keyed by their (stable) original sites.
-    let mut replacements: HashMap<Site, X86ISelInst> = HashMap::new();
-    let mut dead: HashSet<Site> = HashSet::new();
+    let mut replacements: HashMap<Site, X86ISelInst> = HashMap::default();
+    let mut dead: HashSet<Site> = HashSet::default();
 
     for rw in rewrites {
         for acc in &rw.accesses {
@@ -1675,7 +1675,7 @@ mod tests {
         assert_eq!(count_opcode(insts, X86Opcode::MovRM), 0);
         assert_eq!(count_opcode(insts, X86Opcode::MovMR), 0);
         // distinct shadow vregs (>= 64)
-        let mut shadows: HashSet<u32> = HashSet::new();
+        let mut shadows: HashSet<u32> = HashSet::default();
         for inst in insts {
             if inst.opcode == X86Opcode::MovRR
                 && let Some(X86ISelOperand::VReg(d)) = inst.operands.first()

@@ -22,7 +22,7 @@ use trust_ir::{FuncId, Inst, Module, Ty};
 use super::{AttachedDefinedAffineCallee, defined_callee::scalar_expression, trust_ir_contract};
 use crate::FunctionSourceModules;
 use crate::aarch64_conditional_frame::{
-    FrameBodyCall, check_frame_body, conditional_static_frame_with_body,
+    FrameBodyCall, check_frame_body, exact_body_with_image_symbol,
 };
 use crate::aarch64_static_frame::{
     StaticFrameEnvelopeCandidates, StaticFrameLayoutClaim, check_static_frame_envelopes,
@@ -69,6 +69,8 @@ pub struct CheckedDefinedPeerCall<'a> {
     original_request: FunctionVerificationRequest,
     original_caller: CapturedFunctionVerificationReport,
     obligation: ProofObligation,
+    normal_return_memory: E,
+    normal_return_sp: E,
 }
 
 /// An undischarged physical storage requirement, sealed only after formal
@@ -478,7 +480,10 @@ impl<'a> CheckedDefinedPeerCall<'a> {
             .ok_or(DefinedPeerCallError::Source("caller ordinal"))?;
         let body = check_frame_body(&geometry, module, ordinal, image, caller_offset, &calls)
             .map_err(|e| DefinedPeerCallError::Machine(e.to_string()))?;
-        let composed = conditional_static_frame_with_body(&body)
+        // The already-enforced five emitted words / single entry block /
+        // twenty-byte exact envelope above establish the exact constructor's
+        // one contiguous body word and one exit, well within its256-word cap.
+        let composed = exact_body_with_image_symbol(&body, "peer_image_base")
             .map_err(|e| DefinedPeerCallError::Machine(e.to_string()))?;
         if composed.exits().len() != 1 {
             return Err(DefinedPeerCallError::Machine(
@@ -486,6 +491,16 @@ impl<'a> CheckedDefinedPeerCall<'a> {
             ));
         }
         let exit = &composed.exits()[0];
+        let normal_return_memory = exit
+            .exact_post_memory()
+            .ok_or_else(|| {
+                DefinedPeerCallError::Machine("missing exact peer memory effect".into())
+            })?
+            .clone();
+        let normal_return_sp = exit
+            .exact_post_sp()
+            .ok_or_else(|| DefinedPeerCallError::Machine("missing exact peer SP effect".into()))?
+            .clone();
         let mut obligation = exit.obligation().clone();
         // Source result is reconstructed from the original callee body, while
         // the machine result comes from the exact attached final-word relation.
@@ -513,15 +528,15 @@ impl<'a> CheckedDefinedPeerCall<'a> {
         let entry_memory = E::uf("frame_entry_memory", Vec::new(), memory_sort());
         let source_byte = encode_load_le(&source_memory, &observation, 1);
         let machine_entry_byte = encode_load_le(&entry_memory, &observation, 1);
-        let final_byte = encode_load_le(exit.resume_memory(), &observation, 1);
+        let final_byte = encode_load_le(&normal_return_memory, &observation, 1);
         let required_bytes = body.required_entry_stack_bytes() as usize;
         if argument_count == 1 {
             obligation.inputs.push(("peer_entry_x0".into(), 64));
         }
-        obligation.inputs.extend([
-            ("peer_world_observation".into(), 64),
-            ("peer_image_base".into(), 64),
-        ]);
+        // peer_image_base is already the SAME exact frame/callee input.
+        obligation
+            .inputs
+            .push(("peer_world_observation".into(), 64));
         obligation.preconditions.push(
             observation
                 .clone()
@@ -600,6 +615,8 @@ impl<'a> CheckedDefinedPeerCall<'a> {
             original_request: request.clone(),
             original_caller: original.clone(),
             obligation,
+            normal_return_memory,
+            normal_return_sp,
         })
     }
     pub(crate) fn matches_inputs(
@@ -615,6 +632,17 @@ impl<'a> CheckedDefinedPeerCall<'a> {
     }
     pub fn obligation(&self) -> &ProofObligation {
         &self.obligation
+    }
+    /// Complete actual-word normal-return effect, including caller/callee
+    /// stack stores. A conditional Rust observer result, not an additional
+    /// theorem of the narrower outside-private-world replay below. Physical
+    /// storage, source memory/provenance embedding and installation stay owed.
+    /// The untagged Normal-memory/GCS-disabled BL/RET model is also conditional.
+    pub fn normal_return_memory_effect(&self) -> &E {
+        &self.normal_return_memory
+    }
+    pub fn normal_return_sp_effect(&self) -> &E {
+        &self.normal_return_sp
     }
     pub(crate) fn matches_request(&self, request: &FunctionVerificationRequest) -> bool {
         // Exact invocation scope is checked by a captured report, not merely a
@@ -698,6 +726,8 @@ impl DefinedPeerReplay<'_, '_> {
             requirement,
             statement: owner.obligation.clone(),
             covered: owner.covered.clone(),
+            normal_return_memory: owner.normal_return_memory.clone(),
+            normal_return_sp: owner.normal_return_sp.clone(),
         })
     }
 }
@@ -712,6 +742,8 @@ pub struct ConditionallyReplayedDefinedPeer {
     requirement: ConditionalPeerEntryRequirement,
     statement: ProofObligation,
     covered: Vec<InstId>,
+    normal_return_memory: E,
+    normal_return_sp: E,
 }
 impl ConditionallyReplayedDefinedPeer {
     pub fn requirement(&self) -> &ConditionalPeerEntryRequirement {
@@ -719,6 +751,16 @@ impl ConditionallyReplayedDefinedPeer {
     }
     pub fn statement(&self) -> &ProofObligation {
         &self.statement
+    }
+    /// Retained same-image Rust semantic effect; successful replay does NOT
+    /// widen statement() to a full-array/source-embedding theorem. No raw
+    /// address, including private stack aliases, was erased from this effect.
+    /// Normal-memory/GCS-disabled host conditions are not supplied by replay.
+    pub fn normal_return_memory_effect(&self) -> &E {
+        &self.normal_return_memory
+    }
+    pub fn normal_return_sp_effect(&self) -> &E {
+        &self.normal_return_sp
     }
     pub fn covered_instructions(&self) -> &[InstId] {
         &self.covered

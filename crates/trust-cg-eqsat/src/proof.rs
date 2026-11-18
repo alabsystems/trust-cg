@@ -59,8 +59,22 @@ impl Prover {
         }
     }
 
+    /// A prover for a version-2 (Tier S region) derivation.
+    pub(crate) fn new_region(region_name: &str) -> Self {
+        Self {
+            builder: DerivationBuilder::new_region(region_name),
+            conclusions: Vec::new(),
+        }
+    }
+
     pub(crate) fn into_builder(self) -> DerivationBuilder {
         self.builder
+    }
+
+    /// The proofs built so far, to claim from a copy (Tier S writes several
+    /// derivations from one graph).
+    pub(crate) fn builder(&self) -> &DerivationBuilder {
+        &self.builder
     }
 
     fn record(&mut self, proof: ProofRef, conclusion: Conclusion) -> EngineResult<ProofRef> {
@@ -240,6 +254,27 @@ impl Prover {
                 lhs,
                 rhs,
                 equiv,
+                refl: false,
+            },
+        )
+    }
+
+    /// `Impl(leaf, order)`, concluding `(leaf, pinned, refines)` where the
+    /// caller built `pinned` as the reduction pinned at `order` over the
+    /// order-free node's operand.
+    pub(crate) fn implement(
+        &mut self,
+        leaf: TermRef,
+        order: u32,
+        pinned: TermRef,
+    ) -> EngineResult<ProofRef> {
+        let proof = self.builder.implement(leaf, order);
+        self.record(
+            proof,
+            Conclusion {
+                lhs: leaf,
+                rhs: pinned,
+                equiv: false,
                 refl: false,
             },
         )

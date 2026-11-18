@@ -4,8 +4,8 @@
 Usage: python3 scripts/bump_trust_ir_pin.py <40-hex-TrustIR-revision> \
            --targo /absolute/path/to/targo [--ay-revision <40-hex-AY-revision>] \
            [--ay-version 0.28.0] \
-           [--ir-version 0.15.0] \
-           [--clean-version 0.9.2] \
+           [--ir-version 0.15.0|0.16.0] \
+           [--clean-version 0.9.2|0.9.3|0.9.4] \
            [--admit-ir-package <trust-ir-NAME> ...] [--admit-ay-package <ay-NAME> ...] \
            [--admit-dropped-package <NAME> ...] \
            [--admit-registry-package <nix@0.29.0|cfg_aliases@0.2.1|cfg_aliases@0.2.2|wait-timeout@0.2.1> ...]
@@ -47,12 +47,13 @@ own run, and the vendored fixture tree through the end of the transaction.
 Only source moves within the existing package cohort are supported. Adding or
 removing packages, changing third-party resolution, or changing package
 versions requires a separately reviewed migration, not an automatic resolver
-expansion. The reviewed `--ir-version 0.15.0` migration admits only the
-0.14.0 to 0.15.0 TrustIR version move, authenticated at the requested immutable
-target, with the same package roster and source-qualified external graph.
-It retains all eight mandatory Rust guards and the original rollback contract.
-The reviewed `--clean-version 0.9.2` migration admits only the 0.9.1 to 0.9.2
-Clean version move co-owned by that immutable TrustIR target. It rewrites only
+expansion. The reviewed `--ir-version` migrations admit TrustIR 0.14.0 to
+0.15.0 or 0.15.0 to 0.16.0, authenticated at the requested immutable target,
+with the same package roster and source-qualified external graph. Both retain
+all eight mandatory Rust guards and the original rollback contract.
+The reviewed `--clean-version` migrations admit 0.9.1 to 0.9.2, 0.9.1/0.9.2
+to 0.9.3, or the current 0.9.3 cohort to 0.9.4, co-owned by that immutable
+TrustIR target. They rewrite only
 the direct Clean requirements and source-qualified Clean cohort identities;
 the package roster, third-party graph, eight guards and rollback stay exact.
 The reviewed `--ay-version 0.28.0` migration requires an explicit
@@ -152,6 +153,7 @@ except ModuleNotFoundError:
 from typing import Iterator
 
 from rust_guard_transcript import GUARD_TEST_NAMES, validate_rust_test_transcript
+from trust_toolchain import ToolchainError, resource_fds as compiler_resource_fds
 
 
 IR_URL = "https://github.com/alabsystems/trust-ir.git"
@@ -205,7 +207,16 @@ CACHE_NAME = "COMPILE_ARTIFACT_DEFAULT_TRUST_IR_IDENTITY"
 AY_CACHE_NAME = "COMPILE_ARTIFACT_DEFAULT_AY_IDENTITY"
 AY_VERSION_MIGRATION = ("0.27.0", "0.28.0")
 CLEAN_VERSION_MIGRATION = ("0.9.1", "0.9.2")
+CLEAN_VERSION_MIGRATIONS = (
+    CLEAN_VERSION_MIGRATION,
+    ("0.9.1", "0.9.3"),
+    ("0.9.2", "0.9.3"),
+    ("0.9.3", "0.9.4"),
+)
+CLEAN_VERSION_TARGETS = tuple(sorted({target for _, target in CLEAN_VERSION_MIGRATIONS}))
 IR_VERSION_MIGRATION = ("0.14.0", "0.15.0")
+IR_VERSION_MIGRATIONS = (IR_VERSION_MIGRATION, ("0.15.0", "0.16.0"))
+IR_VERSION_TARGETS = tuple(target for _, target in IR_VERSION_MIGRATIONS)
 SHA = re.compile(r"[0-9a-f]{40}\Z")
 
 
@@ -363,63 +374,10 @@ def restore(root: Path, before: dict[str, Snapshot]) -> None:
 
 
 def resource_fds(env: dict[str, str]) -> tuple[int, ...]:
-    """Preserve only advertised live transport descriptions, never grant authority.
-
-    The native owners still authenticate GNU/SDK/CPU custody. A Python launch
-    must not silently close its caller's actual descriptions or pass unrelated
-    descriptors. Malformed or closed locators refuse before running a row.
-    """
-    descriptors: set[int] = set()
-
-    def add(word: str, name: str) -> None:
-        if not re.fullmatch(r"[1-9][0-9]{0,9}", word) or int(word) < 3:
-            raise Refusal(f"inherited resources: malformed {name} descriptor")
-        descriptor = int(word)
-        try:
-            os.fstat(descriptor)
-        except (OSError, OverflowError) as error:
-            raise Refusal(f"inherited resources: {name} descriptor is not live") from error
-        descriptors.add(descriptor)
-
-    for name in ("ATERM_SDK_LEASE_V3", "ATERM_WORKLOAD_HOST_STORE_FD_V1",
-                 "TRUST_CPU_IMPLICIT_FD"):
-        if name in env:
-            add(env[name], name)
-    fixed_name = "TRUST_FIXED_ADMISSION_FD_V1"
-    if fixed_name in env:
-        if env[fixed_name] == "requires-live-ancestor-v1":
-            # The native nested owner deliberately advertises no direct FD.
-            # Preserve its opaque locator; Targo authenticates the ancestor.
-            require(bool(env.get("TRUST_FIXED_CLAIM_HANDOFF_V1")),
-                    "inherited resources: fixed marker needs its original ancestor advertisement")
-        else:
-            add(env[fixed_name], fixed_name)
-    for name in ("ATERM_WORKLOAD_CPU_FDS_V1", "BUILD_SLOT_FENCE_FDS"):
-        if name in env:
-            words = env[name].split(",")
-            if not 1 <= len(words) <= 128 or len(set(words)) != len(words):
-                raise Refusal(f"inherited resources: malformed {name} descriptor set")
-            for word in words:
-                add(word, name)
-    # FIFO/path and native handoff advertisements are deliberately left intact
-    # for the maintained GNU importer. Only its numeric pipe transport needs
-    # descriptor inheritance at this Python boundary.
-    for name in ("CARGO_MAKEFLAGS", "MAKEFLAGS", "MFLAGS"):
-        # GNU uses the last auth advertisement, even when it disables the
-        # jobserver or selects a non-pipe style. Legacy fds is only a fallback,
-        # matching the maintained GNU importer; never revive an obsolete pipe.
-        value = ""
-        for spelling in ("auth", "fds"):
-            advertisements = re.findall(
-                rf"(?:^|\s)--jobserver-{spelling}=([^\s]*)", env.get(name, ""))
-            if advertisements:
-                value = advertisements[-1]
-                break
-        pair = re.fullmatch(r"([0-9]+),([0-9]+)", value)
-        if pair:
-            add(pair[1], name)
-            add(pair[2], name)
-    return tuple(sorted(descriptors))
+    try:
+        return compiler_resource_fds(env)
+    except ToolchainError as error:
+        raise Refusal(str(error)) from error
 
 
 class Commands:
@@ -532,7 +490,7 @@ class Commands:
                  discard_stdout=args[0] == "metadata")
 
     def _test_guard_transport(self, args: list[str]) -> str:
-        """Select a serial interface, never reinterpret a modern admission refusal."""
+        """Select an explicit test interface without reinterpreting admission refusals."""
         if self.guard_admission == "ordinary":
             # Deliberately selected before discovery, never after a native
             # refusal. Normal Targo execution retains its own admission.
@@ -975,7 +933,7 @@ def selected_clean_version(state: Current, requested: str | None) -> str:
     if requested is None:
         return current_version
     require(requested == current_version or
-            (current_version, requested) == CLEAN_VERSION_MIGRATION,
+            (current_version, requested) in CLEAN_VERSION_MIGRATIONS,
             "unsupported Clean package-version migration")
     return requested
 
@@ -987,7 +945,7 @@ def selected_ir_version(state: Current, requested: str | None) -> str:
     if requested is None:
         return current_version
     require(requested == current_version or
-            (current_version, requested) == IR_VERSION_MIGRATION,
+            (current_version, requested) in IR_VERSION_MIGRATIONS,
             "unsupported TrustIR package-version migration")
     return requested
 
@@ -1960,10 +1918,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--ay-revision", help="explicit coordinated AY source move")
     parser.add_argument("--ay-version", choices=[AY_VERSION_MIGRATION[1]],
                         help="explicit reviewed 0.27.0 to 0.28.0 package-version migration")
-    parser.add_argument("--clean-version", choices=[CLEAN_VERSION_MIGRATION[1]],
-                        help="explicit reviewed 0.9.1 to 0.9.2 package-version migration")
-    parser.add_argument("--ir-version", choices=[IR_VERSION_MIGRATION[1]],
-                        help="explicit reviewed 0.14.0 to 0.15.0 package-version migration")
+    parser.add_argument("--clean-version", choices=CLEAN_VERSION_TARGETS,
+                        help="explicit reviewed Clean package-version migration to 0.9.2, 0.9.3 or 0.9.4")
+    parser.add_argument("--ir-version", choices=IR_VERSION_TARGETS,
+                        help="explicit reviewed 0.14.0 to 0.15.0 or 0.15.0 to 0.16.0 migration")
     parser.add_argument("--targo", required=True, help="explicit operational frontend selection, not proof authority")
     parser.add_argument("--guard-admission", choices=("ordinary", "native-worker", "original-fixed-v1"),
                         default="native-worker",

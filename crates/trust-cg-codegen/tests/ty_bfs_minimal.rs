@@ -238,6 +238,14 @@ fn install_driver_ra_policy() {
         false
     ));
     assert!(trust_cg_codegen::set_x86_ra_call_split_disabled(false));
+    // The bridge also installs the frameless leaf, the O2 fixpoint and the
+    // certificate-free IMUL reductions for `no-proof-certs`; a
+    // certificate-free compile gets them by default.
+    assert!(trust_cg_codegen::set_x86_leaf_frame_elision_disabled(false));
+    assert!(trust_cg_codegen::set_x86_o2_fixpoint_iterations(
+        trust_cg_codegen::X86_O2_FIXPOINT_MAX_ITERATIONS
+    ));
+    assert!(trust_cg_codegen::set_x86_imul_certificate_free_reductions_disabled(false));
 }
 
 fn assert_valid_macho(bytes: &[u8], ctx: &str) {
@@ -580,8 +588,10 @@ fn elf_text(obj: &[u8]) -> Vec<u8> {
 /// certificate-free allocation gets the x86-64 allocation-quality changes
 /// from `Compiler::compile` itself, with no policy installed by its driver
 /// (`X86AllocationQuality::CertificateFree`): the leaf kernel saves no
-/// callee-saved register and keeps its arguments in their registers. The
-/// historical allocation is 75 bytes and saves RBX after the frame setup
+/// callee-saved register, keeps its arguments in their registers and, being
+/// a leaf that never touches the stack in an object without unwind tables,
+/// gets no `push %rbp; mov %rsp,%rbp` frame. The historical allocation is 75
+/// bytes and saves RBX after the frame setup
 /// (`test_ty_bfs_historical_allocation_without_the_request`).
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 #[test]
@@ -589,13 +599,14 @@ fn test_ty_bfs_certificate_free_compile_gets_the_quality_allocation() {
     let (func, module) = build_ty_bfs_kernel();
     let obj = compile_trust_ir(&func, &module, OptLevel::O2).expect("O2 compile");
     let text = elf_text(&obj);
-    assert_eq!(
+    assert_ne!(
         &text[..4],
         &[0x55, 0x48, 0x89, 0xe5],
-        "push %rbp; mov %rsp,%rbp"
+        "a frameless leaf has no push %rbp; mov %rsp,%rbp: {text:02x?}"
     );
+    assert_ne!(text[0], 0x55, "no push %rbp: {text:02x?}");
     let push_callee_saved =
-        text[4] == 0x53 || (text[4] == 0x41 && (0x54..=0x57).contains(&text[5]));
+        text[0] == 0x53 || (text[0] == 0x41 && (0x54..=0x57).contains(&text[1]));
     assert!(
         !push_callee_saved,
         "no callee-saved register is saved: {text:02x?}"

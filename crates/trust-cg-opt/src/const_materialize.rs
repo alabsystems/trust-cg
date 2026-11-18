@@ -36,6 +36,9 @@ use trust_cg_ir::inst::{AArch64Opcode, MachInst};
 use trust_cg_ir::operand::MachOperand;
 use trust_cg_ir::regs::SpecialReg;
 
+#[path = "../../../formal/lean/Trust/A64/LogicalImmBits.lean"]
+clean mod logical_imm_bits;
+
 // ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
@@ -166,7 +169,7 @@ pub fn is_logical_immediate(value: u64, width: u32) -> bool {
 /// - `immr`: rotation amount within the element (6 bits)
 /// - `imms`: encodes element size and number of set bits (6 bits)
 ///
-/// The `imms` field is: `(NOT(element_size - 1) & 0x3F) | (num_ones - 1)`
+/// The `imms` field is `(NOT(2 * element_size - 1) & 0x3F) | (num_ones - 1)`.
 ///
 /// Reference: ARM ARM, "DecodeBitMasks" pseudocode.
 pub fn encode_logical_immediate(value: u64, width: u32) -> Option<(u8, u8, u8)> {
@@ -225,12 +228,9 @@ pub fn encode_logical_immediate(value: u64, width: u32) -> Option<(u8, u8, u8)> 
             };
             for rot in 0..size {
                 if rotate_right(base, rot, size) == elem {
-                    let n: u8 = if size == 64 { 1 } else { 0 };
-                    // imms: high bits encode element size (inverted), low bits encode (num_ones - 1)
-                    let size_encoding = (!(size - 1)) as u8 & 0x3F;
-                    let imms: u8 = size_encoding | ((num_ones - 1) as u8);
-                    let immr: u8 = rot as u8;
-                    return Some((n, immr, imms));
+                    let n = trust_cg_a64_logical_imm_n(size);
+                    let imms = trust_cg_a64_logical_imm_imms(size, n, num_ones);
+                    return Some((n as u8, rot as u8, imms as u8));
                 }
             }
         }
@@ -492,7 +492,7 @@ mod tests {
         let (n, immr, imms) = encode_logical_immediate(0x55555555, 32).unwrap();
         assert_eq!(n, 0);
         assert_eq!(immr, 0);
-        assert_eq!(imms, 0x3E); // ~(2-1) & 0x3F | (1-1) = 0x3E | 0 = 0x3E
+        assert_eq!(imms, 0x3C);
     }
 
     #[test]
@@ -502,7 +502,7 @@ mod tests {
         let (n, immr, imms) = encode_logical_immediate(0xAAAAAAAA, 32).unwrap();
         assert_eq!(n, 0);
         assert_eq!(immr, 1);
-        assert_eq!(imms, 0x3E);
+        assert_eq!(imms, 0x3C);
     }
 
     #[test]
@@ -512,7 +512,7 @@ mod tests {
         let (n, immr, imms) = encode_logical_immediate(0x01010101, 32).unwrap();
         assert_eq!(n, 0);
         assert_eq!(immr, 0);
-        assert_eq!(imms, 0x38); // ~(8-1) & 0x3F | (1-1) = 0x38
+        assert_eq!(imms, 0x30);
     }
 
     #[test]
@@ -522,7 +522,7 @@ mod tests {
         let (n, immr, imms) = encode_logical_immediate(0x00FF00FF, 32).unwrap();
         assert_eq!(n, 0);
         assert_eq!(immr, 0);
-        assert_eq!(imms, 0x37); // ~(16-1) & 0x3F | (8-1) = 0x30 | 7 = 0x37
+        assert_eq!(imms, 0x27);
     }
 
     #[test]
@@ -572,8 +572,7 @@ mod tests {
         let (n, immr, imms) = encode_logical_immediate(0xC0000003, 32).unwrap();
         assert_eq!(n, 0);
         assert_eq!(immr, 2);
-        // imms = ~(32-1) & 0x3F | (4-1) = 0x20 | 3 = 0x23
-        assert_eq!(imms, 0x23);
+        assert_eq!(imms, 3);
     }
 
     // ---- MOVN (mostly-ones patterns) ----
@@ -825,8 +824,7 @@ mod tests {
         let (n, immr, imms) = enc.unwrap();
         assert_eq!(n, 0); // element size 16, not 64
         assert_eq!(immr, 0);
-        // imms = ~(16-1) & 0x3F | (8-1) = 0x30 | 7 = 0x37
-        assert_eq!(imms, 0x37);
+        assert_eq!(imms, 0x27);
     }
 
     #[test]
@@ -865,29 +863,56 @@ mod tests {
         assert_eq!(rotate_right(0b11, 2, 8), 0b11000000);
     }
 
-    // ---- Materialize constant for logical imm values uses OrrRI ----
-
-    #[test]
-    fn materialize_logical_imm_orr_operands() {
-        let insts = materialize_constant(0x55555555, 32);
-        assert_eq!(insts.len(), 1);
-        assert_eq!(insts[0].opcode, AArch64Opcode::OrrRI);
-        // First operand should be WZR for 32-bit
-        assert_eq!(insts[0].operands[0], MachOperand::Special(SpecialReg::WZR));
-        // Then N, immr, imms as Imm operands
-        assert_eq!(insts[0].operands[1].as_imm(), Some(0)); // N=0
-        assert_eq!(insts[0].operands[2].as_imm(), Some(0)); // immr=0
-        assert_eq!(insts[0].operands[3].as_imm(), Some(0x3E)); // imms
+    // Decode the carrier as the instruction would, without using the
+    // optimizer's field constructors or rotating/replicating whole elements.
+    fn decode_logical_fields(width: u32, n: u32, immr: u32, imms: u32) -> Option<u64> {
+        if n > 1 || immr >= 64 || imms >= 64 {
+            return None;
+        }
+        let len = ((n << 6) | (!imms & 63)).checked_ilog2()?;
+        let element_width = 1 << len;
+        let ones = imms % element_width + 1;
+        if element_width > width || ones == element_width {
+            return None;
+        }
+        let mut mask = 0;
+        for bit in 0..width {
+            if (bit + immr) % element_width < ones {
+                mask |= 1u64 << bit;
+            }
+        }
+        Some(mask)
     }
 
     #[test]
-    fn materialize_logical_imm_64bit_uses_xzr() {
-        // 0xFF fits in 16 bits, so single MOVZ is preferred.
-        // Use a value that is ONLY encodable as logical imm, not as single chunk.
-        // 0x00FF00FF00FF00FF is a repeating bitmask that needs >1 MOVZ but can use ORR.
-        let insts = materialize_constant(0x00FF00FF00FF00FF, 64);
-        assert_eq!(insts.len(), 1);
-        assert_eq!(insts[0].opcode, AArch64Opcode::OrrRI);
-        assert_eq!(insts[0].operands[0], MachOperand::Special(SpecialReg::XZR));
+    fn materialize_logical_imm_raw_fields_decode_to_the_requested_constant() {
+        for (width, value, zr, expected_imms) in [
+            // The old prefix decoded this as 0x5555_5555.
+            (32, 0x1111_1111, SpecialReg::WZR, 56),
+            // The old prefix made these reserved.
+            (32, 0x5555_5555, SpecialReg::WZR, 60),
+            (64, 0x00ff_00ff_00ff_00ff, SpecialReg::XZR, 39),
+        ] {
+            let insts = materialize_constant(value, width);
+            let [inst] = insts.as_slice() else {
+                panic!("expected a single instruction for {value:#x}, got {insts:?}");
+            };
+            assert_eq!(inst.opcode, AArch64Opcode::OrrRI);
+            let [
+                MachOperand::Special(source),
+                MachOperand::Imm(n),
+                MachOperand::Imm(immr),
+                MachOperand::Imm(imms),
+            ] = inst.operands.as_slice()
+            else {
+                panic!("expected a zero register and raw logical fields, got {inst:?}");
+            };
+            assert_eq!(*source, zr);
+            assert_eq!((*n, *immr, *imms), (0, 0, expected_imms));
+            assert_eq!(
+                decode_logical_fields(width, *n as u32, *immr as u32, *imms as u32),
+                Some(value)
+            );
+        }
     }
 }

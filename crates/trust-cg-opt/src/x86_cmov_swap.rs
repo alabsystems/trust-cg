@@ -138,7 +138,7 @@
 //! The old `TCG_X86_CMOV_SWAP=1` opt-in is not the current registration policy.
 //! Each rewrite also requires room for two fresh virtual-register IDs.
 
-use std::collections::{HashMap, HashSet};
+use crate::fast_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 use trust_cg_ir::regs::{RegClass, VReg};
 use trust_cg_ir::x86_64_ops::{X86CondCode, X86Opcode};
@@ -303,8 +303,8 @@ struct LoadAddrOp {
 
 impl<'f> Vn<'f> {
     fn new(func: &'f X86ISelFunction) -> Self {
-        let mut def_count: HashMap<VReg, u32> = HashMap::new();
-        let mut def_site: HashMap<VReg, (Block, usize)> = HashMap::new();
+        let mut def_count: HashMap<VReg, u32> = HashMap::default();
+        let mut def_site: HashMap<VReg, (Block, usize)> = HashMap::default();
         for bid in &func.block_order {
             let Some(block) = func.blocks.get(bid) else {
                 continue;
@@ -318,14 +318,14 @@ impl<'f> Vn<'f> {
         }
         Self {
             func,
-            intern: HashMap::new(),
+            intern: HashMap::default(),
             keys: Vec::new(),
-            map: HashMap::new(),
+            map: HashMap::default(),
             epoch: 0,
             opaque_counter: 0,
             def_count,
             def_site,
-            load_addr_ops: HashMap::new(),
+            load_addr_ops: HashMap::default(),
         }
     }
 
@@ -972,7 +972,7 @@ fn try_guard(
 
     // --- Evaluate the prefix, collecting check facts. ---------------------
     let mut vn = Vn::new(func);
-    let mut facts: HashSet<CheckFact> = HashSet::new();
+    let mut facts: HashSet<CheckFact> = HashSet::default();
     for (pi, &b) in prefix.iter().enumerate() {
         let block = func.blocks.get(&b)?;
         let is_guard = pi + 1 == prefix.len();
@@ -1085,7 +1085,7 @@ fn try_guard(
 
     // --- Arm chain scan. ---------------------------------------------------
     let mut arm_blocks: Vec<Block> = Vec::new();
-    let mut arm_defs: HashSet<VReg> = HashSet::new();
+    let mut arm_defs: HashSet<VReg> = HashSet::default();
     let mut stores: Vec<StoreRec> = Vec::new();
     let mut cur = arm_entry;
     let mut prev = guard;
@@ -1415,7 +1415,7 @@ fn explicit_operands(inst: &X86ISelInst) -> &[X86ISelOperand] {
 /// an ordinary load/store, and every `lea` root flows only into load/store
 /// addresses. A slot never materialized into a register cannot escape.
 fn fixed_stack_slot_address_does_not_escape(func: &X86ISelFunction, slot: u32) -> bool {
-    let mut def_counts: HashMap<VReg, usize> = HashMap::new();
+    let mut def_counts: HashMap<VReg, usize> = HashMap::default();
     let mut roots = Vec::new();
     for block_id in &func.block_order {
         let Some(block) = func.blocks.get(block_id) else {
@@ -1457,8 +1457,8 @@ fn fixed_stack_slot_address_does_not_escape(func: &X86ISelFunction, slot: u32) -
         }
     }
 
-    let mut traced = HashSet::new();
-    let mut active = HashSet::new();
+    let mut traced = HashSet::default();
+    let mut active = HashSet::default();
     roots.into_iter().all(|root| {
         trace_non_escaping_stack_address(func, &def_counts, root, &mut traced, &mut active)
     })

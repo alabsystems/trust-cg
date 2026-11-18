@@ -46,6 +46,9 @@ mod eh_identity;
 mod instruction_view;
 mod zero_storage;
 
+#[path = "../../../formal/lean/Trust/A64/FrameLayoutBits.lean"]
+clean mod frame_layout_bits;
+
 use instruction_view::FrameInstructions;
 
 use std::collections::BTreeMap;
@@ -545,9 +548,10 @@ fn frame_layout_overflow(detail: &str) -> crate::lower::LowerError {
 }
 
 fn checked_frame_align(value: u32) -> Result<u32, crate::lower::LowerError> {
+    const MASK: u32 = trust_cg_a64_frame_alignment_mask(STACK_ALIGNMENT);
     value
         .checked_add(STACK_ALIGNMENT - 1)
-        .map(|value| value & !(STACK_ALIGNMENT - 1))
+        .map(|value| trust_cg_a64_frame_apply_mask(value, MASK))
         .ok_or_else(|| frame_layout_overflow("16-byte alignment"))
 }
 
@@ -2774,7 +2778,8 @@ pub fn stack_slot_frame_offsets(func: &MachFunction, layout: &FrameLayout) -> Ve
         let align = slot.align as i32;
         if align > 0 {
             // Round down to alignment boundary (for negative offsets).
-            current_offset &= !(align - 1);
+            let mask = trust_cg_a64_frame_alignment_mask(align as u32);
+            current_offset = trust_cg_a64_frame_apply_mask(current_offset as u32, mask) as i32;
         }
         offsets[idx] = Some(current_offset);
     }

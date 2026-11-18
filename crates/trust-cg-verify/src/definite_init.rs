@@ -628,6 +628,48 @@ mod tests {
     }
 
     #[test]
+    fn box_projection_does_not_initialize_an_unrelated_stack_cell() {
+        use trust_ir::box_validity::{
+            BoxDerefSite, BoxFactSession, BoxPointee, BoxValidityFact, PremiseRoot,
+        };
+        for initialized in [false, true] {
+            let mut function = if initialized {
+                initialized_cell()
+            } else {
+                uninitialized_cell()
+            };
+            function.blocks[0].params.push((v(90), Ty::Ptr));
+            function.blocks[0].body.insert(
+                0,
+                InstrNode::new(Inst::BoxDeref {
+                    ptr_ty: Ty::Ptr,
+                    pointee: BoxPointee::Sized { ty: Ty::I64 },
+                    operand: v(90),
+                    fact: Box::new(BoxValidityFact::premise(
+                        BoxDerefSite {
+                            item: [4; 16],
+                            ordinal: 0,
+                        },
+                        BoxFactSession::PROOF_SNAPSHOT,
+                        PremiseRoot::ParamByValue,
+                    )),
+                })
+                .with_result(v(91)),
+            );
+            let result = check_function(&function);
+            if initialized {
+                assert!(result.is_ok());
+            } else {
+                let violations =
+                    result.expect_err("a box projection cannot replace the missing store");
+                assert!(
+                    matches!(violations.as_slice(), [InitViolation::UninitializedCellRead { cell, .. }] if *cell == v(1))
+                );
+            }
+        }
+    }
+
+    #[test]
     fn catches_99_uninitialized_read() {
         let f = uninitialized_cell();
         let result = check_function(&f);

@@ -7853,9 +7853,11 @@ pub fn compile_object_with_evidence_license_options_hints(
         "link_verification",
     ];
     // trust-ir v74: a module holding an `Inst::BoxDeref` compiled only
-    // because the license opted into the named-premise floor. Its Box
-    // validity is ASSUMED, never established here; the assumptions are in
-    // the license's `BoxDerefDisclosure`.
+    // because the license opted below the refusing default: the
+    // named-premise floor, whose Box validity is ASSUMED (the assumptions
+    // are in the license's `BoxDerefDisclosure`), or this backend's
+    // locally re-derived floor, a consumer-side analysis that is not proof
+    // evidence. Either way validity is not ESTABLISHED by any check here.
     if trust_cg_lower::box_deref::module_has_box_deref(module) {
         not_run.push(BOX_VALIDITY_NOT_ESTABLISHED);
     }
@@ -9630,9 +9632,11 @@ fn compile_module_evidence(
         "host_contract_verification",
     ];
     // trust-ir v74: a module holding an `Inst::BoxDeref` compiled only
-    // because the license opted into the named-premise floor. Its Box
-    // validity is ASSUMED, never established here; the assumptions are in
-    // the license's `BoxDerefDisclosure`.
+    // because the license opted below the refusing default: the
+    // named-premise floor, whose Box validity is ASSUMED (the assumptions
+    // are in the license's `BoxDerefDisclosure`), or this backend's
+    // locally re-derived floor, a consumer-side analysis that is not proof
+    // evidence. Either way validity is not ESTABLISHED by any check here.
     if trust_cg_lower::box_deref::module_has_box_deref(module) {
         not_run.push(BOX_VALIDITY_NOT_ESTABLISHED);
     }

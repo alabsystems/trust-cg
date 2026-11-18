@@ -905,3 +905,18 @@ fn definition_literals_proof_memo_hits_do_not_repeat_derivation_work() {
     assert_eq!(work.1, composer.text.steps);
     assert_eq!(work.2, composer.text.text.len());
 }
+
+#[test]
+fn equal_ground_predicates_prove_original_values_before_same_operator_congruence() {
+    let left = E::bv_const(0x1000, 64).eq_expr(E::bv_const(0x1000, 64));
+    let right = E::bv_const(0x2000, 64).eq_expr(E::bv_const(0x2000, 64));
+    let original = obligation(left, right, vec![]);
+    let candidate = inspect(&original, 0);
+    assert!(candidate.text.contains(":rule evaluate"));
+    let mut wrong = original.clone();
+    wrong.aarch64_expr = E::bv_const(0x2000, 64).eq_expr(E::bv_const(0x2008, 64));
+    assert!(
+        compose(&wrong).is_err(),
+        "same operator never licenses a false ground predicate"
+    );
+}

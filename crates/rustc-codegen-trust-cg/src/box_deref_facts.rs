@@ -28,7 +28,8 @@
 //! the producing compiler; the translation copies its root, its standing
 //! assumptions and its session and can only refuse, never strengthen. What
 //! trust-ir has no spelling for (a root outside its five, zero-size evidence,
-//! a wide or instance-dependent pointee) is refused here. Emission is not
+//! a wide or instance-dependent pointee, a root reached through a proved
+//! returned-reference summary of a local callee) is refused here. Emission is not
 //! admission: the trust-cg license decides afterwards, and its default floor
 //! refuses every `Inst::BoxDeref` (`trust_cg_lower::admit_box_derefs`).
 //!
@@ -700,6 +701,24 @@ mod carried {
                 ));
             }
         }
+        // How the compiler's walk reached the root. trust-ir's fact names the
+        // root only, so a root reached through a proved returned-reference
+        // summary (the compiler READ a local callee's MIR: BOX-PRR) would
+        // arrive in trust-ir indistinguishable from the same root reached in
+        // the judged body. That relabels the evidence (it hides a trusted step
+        // the trust-cg floors cannot see), so it is refused until trust-ir can
+        // spell the derivation. Exhaustive on purpose.
+        match fact.derivation {
+            facts::BoxRootDerivation::JudgedBody => {}
+            facts::BoxRootDerivation::ProvedReferenceReturn => {
+                return Err(
+                    "the root was reached through a proved returned-reference summary (the \
+                     compiler read a local callee's MIR, BOX-PRR); trust-ir v74 names the root \
+                     only and has no spelling for that derivation"
+                        .to_owned(),
+                );
+            }
+        }
         match fact.instance_scope {
             facts::BoxFactInstanceScope::ConcreteBody
             | facts::BoxFactInstanceScope::InstanceIndependent => {}
@@ -912,6 +931,31 @@ mod carried {
                 } else {
                     facts::BoxRootCallee::NoCallee
                 },
+                derivation: facts::BoxRootDerivation::JudgedBody,
+            }
+        }
+
+        /// A root reached through a proved returned-reference summary is
+        /// refused even on a root trust-ir names and the named-premise floor
+        /// admits: trust-ir would carry the root without the derivation, and
+        /// the fact must not arrive looking like a judged-body one.
+        #[test]
+        fn a_proved_reference_return_derivation_is_refused() {
+            for root in [
+                facts::BoxValidityRoot::ParamByValue,
+                facts::BoxValidityRoot::AllocPostcondition,
+                facts::BoxValidityRoot::ReturnedBoxAssumed,
+            ] {
+                let mut proved = fact(root);
+                assert!(translate(&proved, SITE).is_ok(), "{root:?}");
+                proved.derivation = facts::BoxRootDerivation::ProvedReferenceReturn;
+                assert!(proved.is_well_formed(), "{root:?}");
+                let error = translate(&proved, SITE).expect_err("a summary-derived root");
+                assert!(
+                    error.contains("proved returned-reference summary"),
+                    "{error}"
+                );
+                assert!(error.contains("no spelling for that derivation"), "{error}");
             }
         }
 

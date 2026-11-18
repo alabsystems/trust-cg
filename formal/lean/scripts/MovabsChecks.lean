@@ -36,7 +36,7 @@ example : (decode ([0x48, 0xB0] ++ List.replicate 8 0x55)).isNone = true := by d
 
 elab "#audit_movabs" : command => do
   let env ← getEnv
-  let names := [``ofLe64_le64, ``decode_encode_movabsRI,
+  let names := [``movabsPrefix_bytes, ``ofLe64_le64, ``decode_encode_movabsRI,
     ``execInstr_movabsRI_regs, ``execInstr_movabsRI_frame, ``execInstr_movabsRI_rip,
     ``singleInstrStep_movabsRI, ``maskResident]
   let allowed := [``propext, ``Classical.choice, ``Quot.sound]
@@ -45,5 +45,5 @@ elab "#audit_movabs" : command => do
     let axioms := (← liftCoreM (Lean.collectAxioms name)).toList
     let extra := axioms.filter fun ax => !allowed.contains ax
     unless extra.isEmpty do throwError "forbidden axiom in {name}: {extra}"
-  logInfo "MOVABS-CHECKS axioms=foundational-only declarations=7 golden_vectors=96 truncated=16 nonwide=16 resident_execution=1"
+  logInfo "MOVABS-CHECKS axioms=foundational-only declarations=8 golden_vectors=96 truncated=16 nonwide=16 resident_execution=1"
 #audit_movabs

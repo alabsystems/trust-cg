@@ -1860,7 +1860,7 @@ mod tests {
     use trust_ir::value::ValueId;
 
     #[test]
-    fn nominal_function_item_identity_is_not_a_pointer_or_another_item() {
+    fn nominal_item_identity_keeps_target_and_address_class_through_nested_payloads() {
         #[derive(Default)]
         struct Bytes(Vec<u8>);
         impl Sink for Bytes {
@@ -1876,10 +1876,47 @@ mod tests {
             encode_constant(&mut Encoder(&mut bytes), &value);
             bytes.0
         };
-        let nominal = encode(Constant::FnItem(trust_ir::FuncId::new(3)));
-        assert_ne!(nominal, encode(Constant::FnItem(trust_ir::FuncId::new(4))));
-        assert_ne!(nominal, encode(Constant::FnDef(trust_ir::FuncId::new(3))));
-        assert_ne!(nominal, encode(Constant::PhantomData));
+        let id = trust_ir::FuncId::new(7);
+        let item = Constant::FnItem(id);
+        let base = encode(item.clone());
+        for other in [
+            Constant::FnDef(id),
+            Constant::FnItem(trust_ir::FuncId::new(8)),
+            Constant::Int(7),
+            Constant::PhantomData,
+            Constant::Aggregate(vec![]),
+        ] {
+            assert_ne!(base, encode(other));
+        }
+        assert_eq!(base, encode(item.clone()));
+        let aggregate = encode(Constant::Closure {
+            func: id,
+            captures: vec![item.clone()],
+        });
+        assert_ne!(
+            aggregate,
+            encode(Constant::Closure {
+                func: id,
+                captures: vec![Constant::FnDef(id)]
+            })
+        );
+        let short = encode(Constant::Splat {
+            elem: Box::new(item.clone()),
+            len: 2,
+        });
+        let large = encode(Constant::Splat {
+            elem: Box::new(item),
+            len: u64::MAX,
+        });
+        assert_eq!(
+            short.len(),
+            large.len(),
+            "the stored encoding must not expand a logical array"
+        );
+        assert_ne!(
+            short, large,
+            "the original logical extent still participates in identity"
+        );
     }
 
     #[test]

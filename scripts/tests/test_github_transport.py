@@ -292,6 +292,110 @@ class TransportTests(unittest.TestCase):
         self.assertEqual((receipts[0].parent / "dry-run.stderr").read_text(), reason)
         self.assertEqual((receipts[0].parent / "dry-run.stdout").read_text(), outcome)
 
+    def historical_body_gap(self):
+        """A complete current checkout whose ancestor body was not imported."""
+        old_blob = self.git("rev-parse", f"{self.base}:source")
+        (self.repo / "source").write_text("complete current checkout\n")
+        self.git("commit", "-qam", "replace ancestor body")
+        candidate = self.git("rev-parse", "HEAD")
+        path = self.repo / ".git/objects" / old_blob[:2] / old_blob[2:]
+        data = path.read_bytes()
+        path.unlink()
+        self.assertEqual((self.repo / "source").read_text(), "complete current checkout\n")
+        self.assertEqual(self.git("rev-parse", "--is-shallow-repository"), "false")
+        return old_blob, path, data, candidate
+
+    def test_native_publication_hydrates_exact_historical_bodies_before_preflight(self):
+        old_blob, path, data, candidate = self.historical_body_gap()
+        native = self.github()
+        actual, calls = transport.run, []
+        original_refs = self.git("for-each-ref")
+
+        def agh(argv, **kwargs):
+            if argv[0] != "agh":
+                return actual(argv, **kwargs)
+            calls.append(list(map(str, argv)))
+            if argv[2] == "fetch":
+                self.assertEqual(list(map(str, argv[:5])), ["agh", "repo", "fetch", "example/cg", str(self.repo)])
+                self.assertEqual(argv[5], "--objects")
+                self.assertEqual(json.loads(Path(argv[6]).read_text()), [old_blob])
+                path.write_bytes(data)
+            elif argv[2] == "push":
+                self.assertNotIn("?", self.git("rev-list", "--objects", "--missing=print", "--no-object-names", candidate))
+            return subprocess.CompletedProcess(argv, 0, "{}", "")
+
+        with patch.object(native, "main", return_value=self.base), patch.object(transport, "run", side_effect=agh):
+            native.push(candidate, base=self.base, source_only=True)
+        self.assertEqual([row[2] for row in calls], ["check-local", "fetch", "push", "push"])
+        self.assertIn("--dry-run", calls[2])
+        self.assertNotIn("--dry-run", calls[3])
+        self.assertEqual(self.git("for-each-ref"), original_refs)
+        self.assertEqual(self.git("rev-parse", "HEAD"), candidate)
+        receipts = list((self.repo / ".git/github-transport-receipts").glob("*/objects-*.json"))
+        self.assertEqual(sorted(json.loads(p.read_text()) for p in receipts), [[], [old_blob]])
+
+    def test_native_historical_body_fetch_refusal_cannot_invoke_atomic_push(self):
+        _old_blob, path, _data, candidate = self.historical_body_gap()
+        native = self.github()
+        actual, calls = transport.run, []
+
+        def agh(argv, **kwargs):
+            if argv[0] != "agh":
+                return actual(argv, **kwargs)
+            calls.append(list(map(str, argv)))
+            return subprocess.CompletedProcess(argv, 0 if argv[2] == "check-local" else 3,
+                                               "not imported", "source read refused")
+
+        with patch.object(native, "main", return_value=self.base), patch.object(transport, "run", side_effect=agh):
+            with self.assertRaisesRegex(transport.Refused, "hydration failed.*exit 3.*retained receipt"):
+                native.push(candidate, base=self.base, source_only=True)
+        self.assertEqual([row[2] for row in calls], ["check-local", "fetch"])
+        self.assertFalse(path.exists())
+        receipts = list((self.repo / ".git/github-transport-receipts").glob("*/hydrate-*.exit.json"))
+        self.assertEqual(len(receipts), 1)
+        self.assertEqual(json.loads(receipts[0].read_text()), {"exit": 3})
+        self.assertEqual(list((self.repo / ".git/github-transport-receipts").glob("*/dry-run.json")), [])
+
+    def test_successful_fetch_acknowledgement_without_objects_cannot_authorize_push(self):
+        _old_blob, path, _data, candidate = self.historical_body_gap()
+        native = self.github()
+        actual, calls = transport.run, []
+
+        def agh(argv, **kwargs):
+            if argv[0] != "agh":
+                return actual(argv, **kwargs)
+            calls.append(list(map(str, argv)))
+            return subprocess.CompletedProcess(argv, 0, "claimed success", "")
+
+        with patch.object(native, "main", return_value=self.base), patch.object(transport, "run", side_effect=agh):
+            with self.assertRaisesRegex(transport.Refused, "requested data missing.*retained receipt"):
+                native.push(candidate, base=self.base, source_only=True)
+        self.assertEqual([row[2] for row in calls], ["check-local", "fetch"])
+        self.assertFalse(path.exists())
+        self.assertEqual(list((self.repo / ".git/github-transport-receipts").glob("*/dry-run.json")), [])
+
+    def test_native_hydration_timeout_retains_read_failure_without_atomic_attempt(self):
+        _old_blob, _path, _data, candidate = self.historical_body_gap()
+        native = self.github()
+        actual, calls = transport.run, []
+
+        def agh(argv, **kwargs):
+            if argv[0] != "agh":
+                return actual(argv, **kwargs)
+            calls.append(list(map(str, argv)))
+            if argv[2] == "fetch":
+                raise subprocess.TimeoutExpired("agh", 300)
+            return subprocess.CompletedProcess(argv, 0, "{}", "")
+
+        with patch.object(native, "main", return_value=self.base), patch.object(transport, "run", side_effect=agh):
+            with self.assertRaisesRegex(transport.Refused, "hydration did not complete.*retained receipt"):
+                native.push(candidate, base=self.base, source_only=True)
+        self.assertEqual([row[2] for row in calls], ["check-local", "fetch"])
+        receipts = list((self.repo / ".git/github-transport-receipts").glob("*/hydrate-*.error"))
+        self.assertEqual(len(receipts), 1)
+        self.assertEqual(receipts[0].read_text(), "TimeoutExpired\n")
+        self.assertEqual(list((self.repo / ".git/github-transport-receipts").glob("*/dry-run.json")), [])
+
     def test_dangling_symbolic_record_never_creates_its_unrelated_target(self):
         name, oid = self.record()
         self.git("push", "-q", "origin", f"{name}:{name}")
@@ -384,7 +488,7 @@ class TransportTests(unittest.TestCase):
         self.assertEqual(len(calls), 1)
         self.assertEqual(self.git("for-each-ref", "refs/heads/unrelated"), "")
 
-    def test_native_main_fetches_the_exact_checkout_using_original_objects_only_as_data(self):
+    def test_native_main_fetches_exact_checkout_without_aliasing_receiver_as_data_cache(self):
         native = self.github()
         before = self.git("rev-parse", "HEAD"), (self.repo / "source").read_bytes()
         actual, calls = transport.run, []
@@ -398,7 +502,9 @@ class TransportTests(unittest.TestCase):
             else:
                 self.assertEqual(list(map(str, argv)), ["agh", "repo", "fetch", "example/cg",
                     str(self.repo), "--ref", self.base, "--into", "refs/agh/fetched-main",
-                    "--checkout-closure", "--checkout-cache", str(self.repo)])
+                    "--checkout-closure"])
+                self.assertNotIn("--checkout-cache", argv,
+                                 "receiver reuse belongs to native agh, not a self-aliasing DATA hint")
                 self.git("update-ref", "refs/agh/fetched-main", self.base)
             return subprocess.CompletedProcess(argv, 0, "{}", "")
 
@@ -409,6 +515,69 @@ class TransportTests(unittest.TestCase):
         self.assertEqual(len(calls), 2)
         self.assertEqual(self.git("rev-parse", "refs/remotes/origin/main"), self.base)
         self.assertEqual((self.git("rev-parse", "HEAD"), (self.repo / "source").read_bytes()), before)
+
+    def test_source_resume_reuses_only_the_fresh_authenticated_checkout(self):
+        native = self.github()
+        (self.repo / "source").write_text("new main\n")
+        self.git("commit", "-qam", "new main")
+        new_main = self.git("rev-parse", "HEAD")
+        tracking = "refs/remotes/origin/main"
+        self.git("update-ref", tracking, self.base)
+        self.git("update-ref", "refs/agh/fetched-main", self.base)
+        actual = transport.run
+
+        def agh(argv, **kwargs):
+            if argv[0] != "agh":
+                return actual(argv, **kwargs)
+            self.assertEqual(list(map(str, argv)),
+                             ["agh", "repo", "check-local", "example/cg", str(self.repo)])
+            return subprocess.CompletedProcess(argv, 0, "{}", "")
+
+        response = dict(ref="refs/heads/main", object=dict(sha=new_main))
+        with patch.object(native, "api", return_value=response) as request, \
+                patch.object(transport, "run", side_effect=agh):
+            self.assertEqual(native.fetch_main("origin", reuse_checkout=True), new_main)
+        request.assert_called_once_with("git/ref/heads/main")
+        self.assertEqual(self.git("rev-parse", tracking), new_main)
+        self.assertEqual(self.git("rev-parse", "refs/agh/fetched-main"), self.base)
+
+    def test_source_resume_fetches_exact_main_if_its_selected_blob_is_missing(self):
+        native = self.github()
+        blob = self.git("rev-parse", f"{self.base}:source")
+        object_file = self.repo / ".git/objects" / blob[:2] / blob[2:]
+        data = object_file.read_bytes()
+        object_file.unlink()
+        actual = transport.run
+        calls = []
+
+        def agh(argv, **kwargs):
+            if argv[0] != "agh":
+                return actual(argv, **kwargs)
+            calls.append(argv[2])
+            if argv[2] != "check-local":
+                self.assertEqual(list(map(str, argv)), ["agh", "repo", "fetch", "example/cg",
+                    str(self.repo), "--ref", self.base, "--into", "refs/agh/fetched-main",
+                    "--checkout-closure"])
+                object_file.write_bytes(data)
+                self.git("update-ref", "refs/agh/fetched-main", self.base)
+            return subprocess.CompletedProcess(argv, 0, "{}", "")
+
+        with patch.object(native, "main", return_value=self.base), \
+                patch.object(transport, "run", side_effect=agh):
+            self.assertEqual(native.fetch_main("origin", reuse_checkout=True), self.base)
+        self.assertEqual(calls, ["check-local", "fetch"])
+        self.assertEqual(self.git("cat-file", "-p", blob), "base")
+
+    def test_source_resume_requires_ancestor_commits_but_not_ancestor_blob_bodies(self):
+        (self.repo / "source").write_text("new main\n")
+        self.git("commit", "-qam", "new main")
+        commit = self.git("rev-parse", "HEAD")
+        blob = self.git("rev-parse", f"{self.base}:source")
+        (self.repo / ".git/objects" / blob[:2] / blob[2:]).unlink()
+        self.assertTrue(self.local.has_local_checkout(commit))
+        self.git("commit-graph", "write", "--reachable")
+        (self.repo / ".git/objects" / self.base[:2] / self.base[2:]).unlink()
+        self.assertFalse(self.local.has_local_checkout(commit))
 
     def test_native_main_stale_checkout_or_refusal_cannot_import_or_fall_back(self):
         native = self.github()

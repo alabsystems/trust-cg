@@ -139,6 +139,12 @@ impl OwnedEntryStack {
         }
     }
 
+    #[cfg(feature = "source-defined-call")]
+    pub(crate) fn mapped_extent(&self) -> Result<(usize, usize), EntryStackError> {
+        let (base, _, end) = self.extent()?;
+        Ok((base, end))
+    }
+
     pub(super) fn check_readonly_eight(
         &self,
         row: &super::readonly_data::ReadonlyEightBorrow<'_>,
@@ -217,7 +223,17 @@ impl Drop for OwnedEntryStack {
 
 /// Private requirement paired only by the consuming source/byte owner. These
 /// are conditional ABI requirements, never a storage allocation or proof grade.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum EntryAbi {
+    Scalar,
+    #[cfg(feature = "source-defined-call")]
+    ContextOutput,
+    #[cfg(feature = "source-defined-call")]
+    FourPointerStatus,
+}
+
 pub(crate) struct SourceEntryStackRequirement {
+    abi: EntryAbi,
     private_bytes: usize,
     pub(crate) module_digest: trust_ir::proof::ProofDigest,
     pub(crate) code_digest: trust_ir::proof::ProofDigest,
@@ -229,6 +245,48 @@ pub(crate) struct SourceEntryStackRequirement {
 }
 
 impl SourceEntryStackRequirement {
+    #[cfg(feature = "source-defined-call")]
+    pub(crate) fn from_replayed_void_entry(
+        owner: &trust_cg_verify::read_only_replay::ReplayedVoidMemoryCompilation,
+    ) -> Result<Self, EntryStackError> {
+        use sha2::Digest;
+        let value = Self {
+            abi: EntryAbi::ContextOutput,
+            private_bytes: 0,
+            module_digest: owner.module().stable_digest(),
+            code_digest: trust_ir::proof::ProofDigest::sha256(
+                sha2::Sha256::digest(owner.final_bytes()).into(),
+            ),
+            function: owner.function().index(),
+            image_digest: None,
+            image_len: 0,
+            entry_offset: 0,
+            argument_count: 2,
+        };
+        value.check()?;
+        Ok(value)
+    }
+    #[cfg(feature = "source-defined-call")]
+    pub(crate) fn from_replayed_word_status_entry(
+        owner: &trust_cg_verify::read_only_replay::ReplayedWordStatusCompilation,
+    ) -> Result<Self, EntryStackError> {
+        use sha2::Digest;
+        let value = Self {
+            abi: EntryAbi::FourPointerStatus,
+            private_bytes: 0,
+            module_digest: owner.module().stable_digest(),
+            code_digest: trust_ir::proof::ProofDigest::sha256(
+                sha2::Sha256::digest(owner.final_bytes()).into(),
+            ),
+            function: owner.function().index(),
+            image_digest: None,
+            image_len: 0,
+            entry_offset: 0,
+            argument_count: 4,
+        };
+        value.check()?;
+        Ok(value)
+    }
     pub(crate) fn private_bytes(&self) -> usize {
         self.private_bytes
     }
@@ -259,6 +317,7 @@ impl SourceEntryStackRequirement {
             ));
         }
         let value = Self {
+            abi: EntryAbi::Scalar,
             private_bytes: bytes.statistics().private_stack_bytes,
             module_digest,
             code_digest,
@@ -289,6 +348,7 @@ impl SourceEntryStackRequirement {
                 EntryStackError::Source("selected aggregate entry range is missing".into())
             })?;
         let value = Self {
+            abi: EntryAbi::Scalar,
             private_bytes: owner.required_private_stack_bytes(),
             module_digest: endpoints.module().stable_digest(),
             code_digest: caller.linked_digest(),
@@ -310,6 +370,7 @@ impl SourceEntryStackRequirement {
         peer: &trust_cg_verify::aarch64_affine_lowering::ConditionalPeerEntryRequirement,
     ) -> Result<Self, EntryStackError> {
         let requirement = Self {
+            abi: EntryAbi::Scalar,
             private_bytes: peer.required_private_stack_bytes(),
             module_digest: peer.module_digest(),
             code_digest: peer.final_code_digest(),
@@ -324,7 +385,14 @@ impl SourceEntryStackRequirement {
     }
 
     fn check(&self) -> Result<(), EntryStackError> {
-        if self.argument_count > 1
+        let valid_arity = match self.abi {
+            EntryAbi::Scalar => self.argument_count <= 1,
+            #[cfg(feature = "source-defined-call")]
+            EntryAbi::ContextOutput => self.argument_count == 2,
+            #[cfg(feature = "source-defined-call")]
+            EntryAbi::FourPointerStatus => self.argument_count == 4,
+        };
+        if !valid_arity
             || self.private_bytes > MAX_STACK_BYTES
             || self.module_digest.is_zero()
             || self.code_digest.is_zero()
@@ -379,6 +447,162 @@ fn disjoint_image_extent(
 }
 
 impl EntryStackInvocation<'_> {
+    #[cfg(feature = "source-defined-call")]
+    pub(crate) fn actual_entry_sp(&self) -> usize {
+        self.sp
+    }
+    /// The only caller is the sealed source/bytes/real-memory consumer. No
+    /// scalar adapter or arbitrary pointer-signature descriptor can enter.
+    #[cfg(feature = "source-defined-call")]
+    pub(crate) unsafe fn invoke_context_output(
+        self,
+        target: *const u8,
+        context: &super::context_output::OwnedEntryContext<[u64]>,
+        output: &mut super::context_output::OwnedEntryOutput,
+        image: (usize, usize),
+    ) -> Result<(), EntryStackError> {
+        use super::context_output::disjoint;
+        if self.requirement.abi != EntryAbi::ContextOutput
+            || self.requirement.argument_count != 2
+            || self.stack.identity != self.allocation
+            || self.stack.next_invocation
+                != self
+                    .nonce
+                    .checked_add(1)
+                    .ok_or(EntryStackError::StaleInvocation)?
+            || self.thread != std::thread::current().id()
+            || self.stack.extent()?.1 != self.sp
+        {
+            return Err(EntryStackError::StaleInvocation);
+        }
+        self.requirement.check()?;
+        if target.is_null() || target.addr() != image.0 || !target.addr().is_multiple_of(4) {
+            return Err(EntryStackError::Source(
+                "void adapter target is not the exact installed entry".into(),
+            ));
+        }
+        let input = context.extent()?;
+        let out = output.extent()?;
+        let stack = self.stack.mapped_extent()?;
+        for (a, b) in [
+            (input, out),
+            (input, stack),
+            (out, stack),
+            (input, image),
+            (out, image),
+            (stack, image),
+        ] {
+            disjoint(a, b)?;
+        }
+        let mut host = HostContext { saved_sp: 0 };
+        let start = std::ptr::addr_of_mut!(host).addr();
+        let host_extent = (
+            start,
+            start
+                .checked_add(std::mem::size_of::<HostContext>())
+                .ok_or(EntryStackError::Extent)?,
+        );
+        for extent in [input, out, stack, image] {
+            disjoint(host_extent, extent)?;
+        }
+        #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+        {
+            context_output_adapter::check_actual()?;
+            let signals = signal_mask::BlockedSignals::enter()?;
+            // Actual pointers retain their original Rust allocation provenance;
+            // no integer descriptor supplies either pointer or permission.
+            let input_ptr = context.value().as_ptr().cast::<u8>();
+            let output_ptr = output.words_mut().as_mut_ptr().cast::<u8>();
+            // SAFETY: the opaque consumer retains the actual source license,
+            // complete original replay and every derived initialized read /
+            // exclusive write. All mappings, host context and execution lease
+            // stay alive and pairwise disjoint throughout this checked adapter.
+            unsafe {
+                context_output_adapter::invoke(target, &mut host, self.sp, input_ptr, output_ptr);
+            }
+            signals.restore()?;
+            if host.saved_sp == 0 || !host.saved_sp.is_multiple_of(ALIGNMENT) {
+                return Err(EntryStackError::Adapter);
+            }
+            Ok(())
+        }
+        #[cfg(not(all(target_arch = "aarch64", target_os = "macos")))]
+        Err(EntryStackError::UnsupportedHost)
+    }
+    /// The source/machine/image owner retains all four original typed roles.
+    /// No external address or permission descriptor can call this adapter.
+    #[cfg(feature = "source-defined-call")]
+    pub(crate) unsafe fn invoke_four_pointer_status(
+        self,
+        target: *const u8,
+        inputs: &[super::context_output::OwnedEntryContext<[u64]>; 2],
+        outputs: &mut [super::context_output::OwnedEntryOutput; 2],
+        image: (usize, usize),
+    ) -> Result<u64, EntryStackError> {
+        use super::context_output::disjoint;
+        if self.requirement.abi != EntryAbi::FourPointerStatus
+            || self.requirement.argument_count != 4
+            || self.stack.identity != self.allocation
+            || self.stack.next_invocation
+                != self
+                    .nonce
+                    .checked_add(1)
+                    .ok_or(EntryStackError::StaleInvocation)?
+            || self.thread != std::thread::current().id()
+            || self.stack.extent()?.1 != self.sp
+        {
+            return Err(EntryStackError::StaleInvocation);
+        }
+        self.requirement.check()?;
+        if target.is_null() || target.addr() != image.0 || !target.addr().is_multiple_of(4) {
+            return Err(EntryStackError::Source(
+                "status adapter target differs from exact installed entry".into(),
+            ));
+        }
+        let extents = [
+            inputs[0].extent()?,
+            inputs[1].extent()?,
+            outputs[0].extent()?,
+            outputs[1].extent()?,
+            self.stack.mapped_extent()?,
+            image,
+        ];
+        for (i, &a) in extents.iter().enumerate() {
+            for &b in &extents[..i] {
+                disjoint(a, b)?;
+            }
+        }
+        let mut host = HostContext { saved_sp: 0 };
+        let start = std::ptr::addr_of_mut!(host).addr();
+        let end = start
+            .checked_add(std::mem::size_of::<HostContext>())
+            .ok_or(EntryStackError::Extent)?;
+        for extent in extents {
+            disjoint((start, end), extent)?;
+        }
+        #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+        {
+            four_pointer_status_adapter::check_actual()?;
+            let signals = signal_mask::BlockedSignals::enter()?;
+            let i0 = inputs[0].value().as_ptr().cast::<u8>();
+            let i1 = inputs[1].value().as_ptr().cast::<u8>();
+            let o0 = outputs[0].words_mut().as_mut_ptr().cast::<u8>();
+            let o1 = outputs[1].words_mut().as_mut_ptr().cast::<u8>();
+            // SAFETY: the sealed consumer holds original source/complete replay,
+            // exact installed bytes/execution lease, four initialized distinct
+            // allocations, private stack and signal exclusion across the call.
+            let status = unsafe {
+                four_pointer_status_adapter::invoke(target, &mut host, self.sp, i0, i1, o0, o1)
+            };
+            signals.restore()?;
+            if host.saved_sp == 0 || !host.saved_sp.is_multiple_of(ALIGNMENT) {
+                return Err(EntryStackError::Adapter);
+            }
+            Ok(status)
+        }
+        #[cfg(not(all(target_arch = "aarch64", target_os = "macos")))]
+        Err(EntryStackError::UnsupportedHost)
+    }
     /// Bind the actual complete installed image to this invocation. The image
     /// must remain immutable/alive under the consumer's execution lease through
     /// invoke. Check the entire extent, not just whether entry lies in stack.
@@ -478,7 +702,7 @@ impl<'owner> EntryStackInvocation<'owner> {
         argument: Option<u64>,
     ) -> Result<u64, EntryStackError> {
         let actual = usize::from(argument.is_some());
-        if self.requirement.argument_count != actual {
+        if self.requirement.abi != EntryAbi::Scalar || self.requirement.argument_count != actual {
             return Err(EntryStackError::ArgumentCount {
                 expected: self.requirement.argument_count,
                 actual,
@@ -562,6 +786,21 @@ impl<'owner> EntryStackInvocation<'owner> {
 #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
 #[path = "entry_stack/signal_mask.rs"]
 mod signal_mask;
+
+#[cfg(all(
+    feature = "source-defined-call",
+    target_arch = "aarch64",
+    target_os = "macos"
+))]
+#[path = "entry_stack/adapter_context_output.rs"]
+mod context_output_adapter;
+#[cfg(all(
+    feature = "source-defined-call",
+    target_arch = "aarch64",
+    target_os = "macos"
+))]
+#[path = "entry_stack/adapter_four_pointer_status.rs"]
+mod four_pointer_status_adapter;
 
 #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
 mod adapter {

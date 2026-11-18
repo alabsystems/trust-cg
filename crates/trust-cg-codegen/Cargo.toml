@@ -111,6 +111,14 @@ trust-ir-conformance = { workspace = true }
 # gain it.
 rmp-serde = { workspace = true }
 
+[[test]]
+name = "core_owned_context_output"
+required-features = ["source-defined-call"]
+
+[[test]]
+name = "core_owned_word_observation"
+required-features = ["source-defined-call"]
+
 [[bench]]
 name = "compile_bench"
 harness = false

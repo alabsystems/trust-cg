@@ -611,11 +611,14 @@ mod tests {
     ///   generic `Invoke` lowering share): 2 sites;
     /// * every file's symbol-operand uses (`::Symbol`, `::ExactModuleSymbol`,
     ///   whatever names the enum, `.as_symbol`, `.as_exact_module_symbol`)
-    ///   are pinned per file. Only the two selectors have any: AArch64's are
+    ///   are pinned per file. The selectors construct them: AArch64's are
     ///   the source callee (by name or exact), the source symbol and TLS
     ///   address forms, `_Unwind_Resume`, the two libcall helpers and the
     ///   operand-lowering match; x86-64's the same shapes on its own
-    ///   operands. A use in any other file (the adapter, `va_list.rs`, ...)
+    ///   operands. `aggregate_call_transport.rs` has two comparisons against
+    ///   the retained source callee: one checks the selected instruction and
+    ///   one checks its converted machine instruction. They emit no calls.
+    ///   A use in any other file (the adapter, `va_list.rs`, ...)
     ///   fails until it is classified and pinned;
     /// * no non-test file splices source in with `include!` (the scanner
     ///   refuses it, since it does not read the included text).
@@ -708,6 +711,9 @@ mod tests {
 
     /// Every non-test file's symbol-operand uses (files without any are
     /// absent; see [`emitting_sites_draw_runtime_names_from_this_list`]).
-    const PINNED_SYMBOL_OPERAND_MENTIONS: [(&str, usize); 2] =
-        [("isel.rs", 19), ("x86_64_isel.rs", 10)];
+    const PINNED_SYMBOL_OPERAND_MENTIONS: [(&str, usize); 3] = [
+        ("aggregate_call_transport.rs", 2),
+        ("isel.rs", 19),
+        ("x86_64_isel.rs", 10),
+    ];
 }

@@ -435,12 +435,44 @@ impl SVal {
         }
     }
     #[inline]
-    fn to_eval(self) -> EvalResult {
+    pub(crate) fn to_eval(self) -> EvalResult {
         match self {
             SVal::Bv(v) => EvalResult::Bv(v),
             SVal::Bv128(v) => EvalResult::Bv128(v),
             SVal::Bool(b) => EvalResult::Bool(b),
             SVal::Poison => EvalResult::Poison,
+        }
+    }
+}
+
+/// How [`FlatProg::eval_lanes`] stores one tape node's value in an untagged
+/// `u64` lane: the payload of a `Bv`, or a `Bool` as 0/1.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum LaneKind {
+    Bv,
+    Bool,
+}
+
+impl LaneKind {
+    /// The `SVal` a stored lane holds. Inverse of [`LaneKind::encode`] on
+    /// every value `encode` stores.
+    #[inline(always)]
+    pub(crate) fn decode(self, payload: u64) -> SVal {
+        match self {
+            LaneKind::Bv => SVal::Bv(payload),
+            LaneKind::Bool => SVal::Bool(payload != 0),
+        }
+    }
+
+    /// `(payload, true)` when `value` is of this kind (stored losslessly),
+    /// else `(0, false)`: a `Bv128`, a `Poison`, or the other kind cannot be
+    /// stored.
+    #[inline(always)]
+    fn encode(self, value: SVal) -> (u64, bool) {
+        match (self, value) {
+            (LaneKind::Bv, SVal::Bv(x)) => (x, true),
+            (LaneKind::Bool, SVal::Bool(b)) => (b as u64, true),
+            _ => (0, false),
         }
     }
 }
@@ -1113,295 +1145,437 @@ impl FlatProg {
     /// Evaluate the tape front-to-back into `scratch` (cleared then filled, one
     /// `SVal` per op), returning the root as an [`EvalResult`]. `scratch` is a
     /// per-sample-loop scratch buffer reused across samples (zero per-sample
-    /// allocation). Each arm is a 1:1 transcription of the matching
-    /// `SmtExpr::try_eval` arm.
+    /// allocation). Each node is evaluated by [`eval_flat_op`], whose arms are
+    /// 1:1 transcriptions of the matching `SmtExpr::try_eval` arms.
     pub fn eval(&self, env: &EvalEnv, scratch: &mut Vec<SVal>) -> EvalResult {
         scratch.clear();
         for op in &self.ops {
-            let v = match *op {
-                FlatOp::Const(v) => SVal::Bv(v),
-                FlatOp::Const128(v) => SVal::Bv128(v),
-                FlatOp::BoolConst(b) => SVal::Bool(b),
-                FlatOp::Var(slot, w) => SVal::Bv(mask(env.value_at(slot), w)),
-                FlatOp::Add(a, b, w) => {
-                    if w > 64 {
-                        SVal::Bv128(mask128(
-                            scratch[a].as_u128().wrapping_add(scratch[b].as_u128()),
-                            w,
-                        ))
-                    } else {
-                        SVal::Bv(mask(
-                            scratch[a].as_u64().wrapping_add(scratch[b].as_u64()),
-                            w,
-                        ))
-                    }
-                }
-                FlatOp::Sub(a, b, w) => {
-                    if w > 64 {
-                        SVal::Bv128(mask128(
-                            scratch[a].as_u128().wrapping_sub(scratch[b].as_u128()),
-                            w,
-                        ))
-                    } else {
-                        SVal::Bv(mask(
-                            scratch[a].as_u64().wrapping_sub(scratch[b].as_u64()),
-                            w,
-                        ))
-                    }
-                }
-                FlatOp::Mul(a, b, w) => {
-                    if w > 64 {
-                        SVal::Bv128(mask128(
-                            scratch[a].as_u128().wrapping_mul(scratch[b].as_u128()),
-                            w,
-                        ))
-                    } else {
-                        SVal::Bv(mask(
-                            scratch[a].as_u64().wrapping_mul(scratch[b].as_u64()),
-                            w,
-                        ))
-                    }
-                }
-                FlatOp::And(a, b, w) => {
-                    if w > 64 {
-                        SVal::Bv128(mask128(scratch[a].as_u128() & scratch[b].as_u128(), w))
-                    } else {
-                        SVal::Bv(mask(scratch[a].as_u64() & scratch[b].as_u64(), w))
-                    }
-                }
-                FlatOp::Or(a, b, w) => {
-                    if w > 64 {
-                        SVal::Bv128(mask128(scratch[a].as_u128() | scratch[b].as_u128(), w))
-                    } else {
-                        SVal::Bv(mask(scratch[a].as_u64() | scratch[b].as_u64(), w))
-                    }
-                }
-                FlatOp::Xor(a, b, w) => {
-                    if w > 64 {
-                        SVal::Bv128(mask128(scratch[a].as_u128() ^ scratch[b].as_u128(), w))
-                    } else {
-                        SVal::Bv(mask(scratch[a].as_u64() ^ scratch[b].as_u64(), w))
-                    }
-                }
-                FlatOp::Shl(a, b, w) => {
-                    if w > 64 {
-                        let av = scratch[a].as_u128();
-                        let bv = scratch[b].as_u128();
-                        if bv >= w as u128 {
-                            SVal::Bv128(0)
-                        } else {
-                            SVal::Bv128(mask128(av << bv, w))
-                        }
-                    } else {
-                        let av = scratch[a].as_u64();
-                        let bv = scratch[b].as_u64();
-                        if bv >= w as u64 {
-                            SVal::Bv(0)
-                        } else {
-                            SVal::Bv(mask(av << bv, w))
-                        }
-                    }
-                }
-                FlatOp::Lshr(a, b, w) => {
-                    if w > 64 {
-                        let av = scratch[a].as_u128();
-                        let bv = scratch[b].as_u128();
-                        if bv >= w as u128 {
-                            SVal::Bv128(0)
-                        } else {
-                            SVal::Bv128(mask128(av >> bv, w))
-                        }
-                    } else {
-                        let av = scratch[a].as_u64();
-                        let bv = scratch[b].as_u64();
-                        if bv >= w as u64 {
-                            SVal::Bv(0)
-                        } else {
-                            SVal::Bv(mask(av >> bv, w))
-                        }
-                    }
-                }
-                FlatOp::Ashr(a, b, w) => {
-                    if w > 64 {
-                        let av = sign_extend128(scratch[a].as_u128(), w);
-                        let bv = scratch[b].as_u128();
-                        if bv >= w as u128 {
-                            if av < 0 {
-                                SVal::Bv128(mask128(u128::MAX, w))
-                            } else {
-                                SVal::Bv128(0)
-                            }
-                        } else {
-                            SVal::Bv128(mask128((av >> bv) as u128, w))
-                        }
-                    } else {
-                        let av = sign_extend(scratch[a].as_u64(), w);
-                        let bv = scratch[b].as_u64();
-                        if bv >= w as u64 {
-                            if av < 0 {
-                                SVal::Bv(mask(u64::MAX, w))
-                            } else {
-                                SVal::Bv(0)
-                            }
-                        } else {
-                            SVal::Bv(mask((av >> bv) as u64, w))
-                        }
-                    }
-                }
-                FlatOp::SDiv(a, b, w) => {
-                    // Mirrors try_eval BvSDiv: 128-bit i128 path for width > 64
-                    // (double-width x86 IDIV dividend) and the u64/i64 path
-                    // otherwise, incl. the exact b==0 sentinels and the
-                    // INT_MIN/-1 overflow gates keyed on w>=128 / w==64.
-                    if w > 64 {
-                        let a = sign_extend128(scratch[a].as_u128(), w);
-                        let b = sign_extend128(scratch[b].as_u128(), w);
-                        if b == 0 {
-                            SVal::Bv128(0)
-                        } else if a == i128::MIN && b == -1 && w >= 128 {
-                            SVal::Bv128(mask128(a as u128, w))
-                        } else {
-                            SVal::Bv128(mask128(a.wrapping_div(b) as u128, w))
-                        }
-                    } else {
-                        let a = sign_extend(scratch[a].as_u64(), w);
-                        let b = sign_extend(scratch[b].as_u64(), w);
-                        if b == 0 {
-                            SVal::Bv(0)
-                        } else if a == i64::MIN && b == -1 && w == 64 {
-                            SVal::Bv(mask(a as u64, w))
-                        } else {
-                            SVal::Bv(mask(a.wrapping_div(b) as u64, w))
-                        }
-                    }
-                }
-                FlatOp::UDiv(a, b, w) => {
-                    if w > 64 {
-                        let a = scratch[a].as_u128();
-                        let b = scratch[b].as_u128();
-                        SVal::Bv128(a.checked_div(b).map(|q| mask128(q, w)).unwrap_or(0))
-                    } else {
-                        let a = scratch[a].as_u64();
-                        let b = scratch[b].as_u64();
-                        SVal::Bv(a.checked_div(b).map(|q| mask(q, w)).unwrap_or(0))
-                    }
-                }
-                FlatOp::URem(a, b, w) => {
-                    // No width > 64 branch (compile fails closed for that); mirrors
-                    // try_eval BvURem: b==0 -> the (masked) dividend.
-                    let a = scratch[a].as_u64();
-                    let b = scratch[b].as_u64();
-                    if b == 0 {
-                        SVal::Bv(mask(a, w))
-                    } else {
-                        SVal::Bv(mask(a % b, w))
-                    }
-                }
-                FlatOp::Neg(a, w) => {
-                    if w > 64 {
-                        SVal::Bv128(mask128((!scratch[a].as_u128()).wrapping_add(1), w))
-                    } else {
-                        SVal::Bv(mask((!scratch[a].as_u64()).wrapping_add(1), w))
-                    }
-                }
-                FlatOp::Trap(g, val) => {
-                    let gv = scratch[g];
-                    if matches!(gv, SVal::Poison) || gv.as_u128() == 0 {
-                        SVal::Poison
-                    } else {
-                        scratch[val]
-                    }
-                }
-                FlatOp::Eq(a, b) => SVal::Bool(scratch[a] == scratch[b]),
-                FlatOp::Not(a) => SVal::Bool(!scratch[a].as_bool()),
-                FlatOp::Slt(a, b, w) => SVal::Bool(if w > 64 {
-                    sign_extend128(scratch[a].as_u128(), w)
-                        < sign_extend128(scratch[b].as_u128(), w)
-                } else {
-                    sign_extend(scratch[a].as_u64(), w) < sign_extend(scratch[b].as_u64(), w)
-                }),
-                FlatOp::Sge(a, b, w) => SVal::Bool(if w > 64 {
-                    sign_extend128(scratch[a].as_u128(), w)
-                        >= sign_extend128(scratch[b].as_u128(), w)
-                } else {
-                    sign_extend(scratch[a].as_u64(), w) >= sign_extend(scratch[b].as_u64(), w)
-                }),
-                FlatOp::Sgt(a, b, w) => SVal::Bool(if w > 64 {
-                    sign_extend128(scratch[a].as_u128(), w)
-                        > sign_extend128(scratch[b].as_u128(), w)
-                } else {
-                    sign_extend(scratch[a].as_u64(), w) > sign_extend(scratch[b].as_u64(), w)
-                }),
-                FlatOp::Sle(a, b, w) => SVal::Bool(if w > 64 {
-                    sign_extend128(scratch[a].as_u128(), w)
-                        <= sign_extend128(scratch[b].as_u128(), w)
-                } else {
-                    sign_extend(scratch[a].as_u64(), w) <= sign_extend(scratch[b].as_u64(), w)
-                }),
-                // u128 compares: identical for <=64-bit operands, and no
-                // longer silently truncating 65-128-bit ones (see CExpr::Ult).
-                FlatOp::Uge(a, b) => SVal::Bool(scratch[a].as_u128() >= scratch[b].as_u128()),
-                FlatOp::Ult(a, b) => SVal::Bool(scratch[a].as_u128() < scratch[b].as_u128()),
-                FlatOp::Ugt(a, b) => SVal::Bool(scratch[a].as_u128() > scratch[b].as_u128()),
-                FlatOp::Ule(a, b) => SVal::Bool(scratch[a].as_u128() <= scratch[b].as_u128()),
-                FlatOp::BAnd(a, b) => SVal::Bool(scratch[a].as_bool() && scratch[b].as_bool()),
-                FlatOp::BOr(a, b) => SVal::Bool(scratch[a].as_bool() || scratch[b].as_bool()),
-                FlatOp::Ite(c, t, el) => {
-                    if scratch[c].as_bool() {
-                        scratch[t]
-                    } else {
-                        scratch[el]
-                    }
-                }
-                FlatOp::Extract(o, low, width) => {
-                    let v = scratch[o].as_u128();
-                    let extracted = (v >> low) & mask128(u128::MAX, width);
-                    if width > 64 {
-                        SVal::Bv128(extracted)
-                    } else {
-                        SVal::Bv(extracted as u64)
-                    }
-                }
-                FlatOp::Concat(hi, lo, lo_width, width) => {
-                    let hv = scratch[hi].as_u128();
-                    let lv = scratch[lo].as_u128();
-                    let result = mask128((hv << lo_width) | lv, width);
-                    if width <= 64 {
-                        SVal::Bv(result as u64)
-                    } else {
-                        SVal::Bv128(result)
-                    }
-                }
-                FlatOp::ZExt(o, width) => {
-                    let v = scratch[o].as_u128();
-                    if width > 64 {
-                        SVal::Bv128(mask128(v, width))
-                    } else {
-                        SVal::Bv(mask(v as u64, width))
-                    }
-                }
-                FlatOp::SExt(o, src_width, width) => {
-                    if width > 64 {
-                        let v = scratch[o].as_u128();
-                        SVal::Bv128(mask128(sign_extend128(v, src_width) as u128, width))
-                    } else {
-                        let v = scratch[o].as_u64();
-                        SVal::Bv(mask(sign_extend(v, src_width) as u64, width))
-                    }
-                }
-                FlatOp::MemLoad(address, load_bits, signed, result_width) => {
-                    let raw = mask(mem_load_mix(scratch[address].as_u64()), load_bits);
-                    let value = if signed {
-                        mask(sign_extend(raw, load_bits) as u64, result_width)
-                    } else {
-                        mask(raw, result_width)
-                    };
-                    SVal::Bv(value)
-                }
-            };
+            let v = eval_flat_op(*op, |i| scratch[i], |slot| env.value_at(slot));
             scratch.push(v);
         }
         scratch[self.root].to_eval()
+    }
+
+    /// The [`LaneKind`] of every node of this tape, read from one scalar
+    /// evaluation at `env`, or `None` when some node there holds a value that
+    /// is not a `Bv` or a `Bool` (a `Bv128`, or `Poison`). The kinds are an
+    /// encoding choice for [`FlatProg::eval_lanes`], not a claim about other
+    /// inputs: `eval_lanes` checks every value it computes against them.
+    pub(crate) fn lane_kinds(&self, env: &EvalEnv) -> Option<Vec<LaneKind>> {
+        let mut scratch = Vec::with_capacity(self.ops.len());
+        self.eval(env, &mut scratch);
+        scratch
+            .iter()
+            .map(|value| match value {
+                SVal::Bv(_) => Some(LaneKind::Bv),
+                SVal::Bool(_) => Some(LaneKind::Bool),
+                SVal::Bv128(_) | SVal::Poison => None,
+            })
+            .collect()
+    }
+
+    /// Evaluate the tape for `lanes` independent variable bindings at once,
+    /// on untagged `u64` lanes.
+    ///
+    /// `vars` is slot-major: input slot `s` of lane `l` is
+    /// `vars[s * stride + l]`, the value [`EvalEnv::value_at`]`(s)` returns in
+    /// the scalar [`FlatProg::eval`] for that lane's environment. `cols` is a
+    /// reused buffer, also slot-major (node `i` of lane `l` at
+    /// `cols[i * stride + l]`). `kinds` comes from [`FlatProg::lane_kinds`].
+    ///
+    /// Node `i` of each lane is stored as the payload of an `SVal` of kind
+    /// `kinds[i]`: a `Bv(x)` as `x`, a `Bool(b)` as `b as u64`. Each node is
+    /// computed by the same `eval_flat_op` call the scalar evaluator makes,
+    /// on operands decoded back to exactly those `SVal`s (`Bv(x)`, and
+    /// `Bool(p != 0)`, which is `Bool(b)` for a stored `b as u64`), so a lane
+    /// holds what [`FlatProg::eval`] computes for its bindings, provided
+    /// every value is stored without loss. That is checked, not assumed: a
+    /// computed value whose variant is not its node's kind (any `Bv128`, any
+    /// `Poison`, or the other of `Bv`/`Bool`) cannot be stored, and the call
+    /// returns `None` so the caller falls back to the scalar evaluator.
+    ///
+    /// Only the loop order differs from the scalar evaluator: node-outer,
+    /// lane-inner. Every node of every lane `< lanes` is written before it is
+    /// read, so stale buffer contents are never observed. On `Some`, the
+    /// slice is the root node's lanes `0..lanes`; [`LaneKind::decode`] turns a
+    /// lane back into the `SVal` the scalar evaluator holds at the root.
+    pub(crate) fn eval_lanes<'c>(
+        &self,
+        kinds: &[LaneKind],
+        vars: &[u64],
+        stride: usize,
+        lanes: usize,
+        cols: &'c mut Vec<u64>,
+    ) -> Option<&'c [u64]> {
+        assert!(
+            lanes <= stride && kinds.len() == self.ops.len(),
+            "eval_lanes: {lanes} lanes, stride {stride}, {} kinds for {} nodes",
+            kinds.len(),
+            self.ops.len()
+        );
+        let need = self.ops.len() * stride;
+        if cols.len() < need {
+            cols.resize(need, 0);
+        }
+        for (i, op) in self.ops.iter().enumerate() {
+            let (done, rest) = cols.split_at_mut(i * stride);
+            let out = &mut rest[..lanes];
+            let done: &[u64] = done;
+            let kind = kinds[i];
+            let mut lossless = true;
+            // The outer match only selects which copy of the lane loop runs,
+            // so the node kind is dispatched once per node instead of once
+            // per lane. Every arm runs the same statement, the same
+            // `eval_flat_op` call on the same node, so the outer match
+            // cannot change a value.
+            macro_rules! lanes {
+                ($node:expr $(, $operand:ident)*) => {{
+                    let node = $node;
+                    // Each operand's lanes and kind, read once per node. An
+                    // operand index outside this list still reads the whole
+                    // buffer below, so the list only selects a faster read.
+                    $(let $operand = (
+                        $operand,
+                        kinds[$operand],
+                        &done[$operand * stride..$operand * stride + lanes],
+                    );)*
+                    for (l, slot) in out.iter_mut().enumerate() {
+                        let value = eval_flat_op(
+                            node,
+                            |k| {
+                                $(if k == $operand.0 {
+                                    return $operand.1.decode($operand.2[l]);
+                                })*
+                                kinds[k].decode(done[k * stride + l])
+                            },
+                            |s| vars[s * stride + l],
+                        );
+                        let (payload, stored) = kind.encode(value);
+                        *slot = payload;
+                        lossless &= stored;
+                    }
+                }};
+            }
+            // Each arm passes `eval_flat_op` the node it matched, rebuilt
+            // field for field, so the node is a value whose variant the
+            // compiler sees, not a load from the tape repeated per lane.
+            match *op {
+                FlatOp::Const(p) => lanes!(FlatOp::Const(p)),
+                FlatOp::Const128(p) => lanes!(FlatOp::Const128(p)),
+                FlatOp::BoolConst(p) => lanes!(FlatOp::BoolConst(p)),
+                FlatOp::Var(p, q) => lanes!(FlatOp::Var(p, q)),
+                FlatOp::Add(p, q, r) => lanes!(FlatOp::Add(p, q, r), p, q),
+                FlatOp::Sub(p, q, r) => lanes!(FlatOp::Sub(p, q, r), p, q),
+                FlatOp::Mul(p, q, r) => lanes!(FlatOp::Mul(p, q, r), p, q),
+                FlatOp::And(p, q, r) => lanes!(FlatOp::And(p, q, r), p, q),
+                FlatOp::Or(p, q, r) => lanes!(FlatOp::Or(p, q, r), p, q),
+                FlatOp::Xor(p, q, r) => lanes!(FlatOp::Xor(p, q, r), p, q),
+                FlatOp::Shl(p, q, r) => lanes!(FlatOp::Shl(p, q, r), p, q),
+                FlatOp::Lshr(p, q, r) => lanes!(FlatOp::Lshr(p, q, r), p, q),
+                FlatOp::Ashr(p, q, r) => lanes!(FlatOp::Ashr(p, q, r), p, q),
+                FlatOp::SDiv(p, q, r) => lanes!(FlatOp::SDiv(p, q, r), p, q),
+                FlatOp::UDiv(p, q, r) => lanes!(FlatOp::UDiv(p, q, r), p, q),
+                FlatOp::URem(p, q, r) => lanes!(FlatOp::URem(p, q, r), p, q),
+                FlatOp::Neg(p, q) => lanes!(FlatOp::Neg(p, q), p),
+                FlatOp::Trap(p, q) => lanes!(FlatOp::Trap(p, q), p, q),
+                FlatOp::Eq(p, q) => lanes!(FlatOp::Eq(p, q), p, q),
+                FlatOp::Not(p) => lanes!(FlatOp::Not(p), p),
+                FlatOp::Slt(p, q, r) => lanes!(FlatOp::Slt(p, q, r), p, q),
+                FlatOp::Sge(p, q, r) => lanes!(FlatOp::Sge(p, q, r), p, q),
+                FlatOp::Uge(p, q) => lanes!(FlatOp::Uge(p, q), p, q),
+                FlatOp::Sgt(p, q, r) => lanes!(FlatOp::Sgt(p, q, r), p, q),
+                FlatOp::Sle(p, q, r) => lanes!(FlatOp::Sle(p, q, r), p, q),
+                FlatOp::Ult(p, q) => lanes!(FlatOp::Ult(p, q), p, q),
+                FlatOp::Ugt(p, q) => lanes!(FlatOp::Ugt(p, q), p, q),
+                FlatOp::Ule(p, q) => lanes!(FlatOp::Ule(p, q), p, q),
+                FlatOp::BAnd(p, q) => lanes!(FlatOp::BAnd(p, q), p, q),
+                FlatOp::BOr(p, q) => lanes!(FlatOp::BOr(p, q), p, q),
+                FlatOp::Ite(p, q, r) => lanes!(FlatOp::Ite(p, q, r), p, q, r),
+                FlatOp::Extract(p, q, r) => lanes!(FlatOp::Extract(p, q, r), p),
+                FlatOp::Concat(p, q, r, s) => lanes!(FlatOp::Concat(p, q, r, s), p, q),
+                FlatOp::ZExt(p, q) => lanes!(FlatOp::ZExt(p, q), p),
+                FlatOp::SExt(p, q, r) => lanes!(FlatOp::SExt(p, q, r), p),
+                FlatOp::MemLoad(p, q, r, s) => lanes!(FlatOp::MemLoad(p, q, r, s), p),
+            }
+            if !lossless {
+                return None;
+            }
+        }
+        Some(&cols[self.root * stride..self.root * stride + lanes])
+    }
+
+    /// The root node's index, for indexing [`FlatProg::lane_kinds`].
+    pub(crate) fn root_index(&self) -> usize {
+        self.root
+    }
+}
+
+/// One [`FlatProg`] tape node: its value from the values of the earlier nodes
+/// (`get(i)` is node `i`) and the variable bindings (`var(slot)` is input
+/// `slot`). This is the single statement of the tape semantics: the scalar
+/// [`FlatProg::eval`] and the lane-blocked [`FlatProg::eval_lanes`] both call
+/// it, so they cannot compute different values for the same bindings. Each arm
+/// is a 1:1 transcription of the matching `SmtExpr::try_eval` arm.
+#[inline(always)]
+fn eval_flat_op(op: FlatOp, get: impl Fn(usize) -> SVal, var: impl Fn(usize) -> u64) -> SVal {
+    match op {
+        FlatOp::Const(v) => SVal::Bv(v),
+        FlatOp::Const128(v) => SVal::Bv128(v),
+        FlatOp::BoolConst(b) => SVal::Bool(b),
+        FlatOp::Var(slot, w) => SVal::Bv(mask(var(slot), w)),
+        FlatOp::Add(a, b, w) => {
+            if w > 64 {
+                SVal::Bv128(mask128(get(a).as_u128().wrapping_add(get(b).as_u128()), w))
+            } else {
+                SVal::Bv(mask(get(a).as_u64().wrapping_add(get(b).as_u64()), w))
+            }
+        }
+        FlatOp::Sub(a, b, w) => {
+            if w > 64 {
+                SVal::Bv128(mask128(get(a).as_u128().wrapping_sub(get(b).as_u128()), w))
+            } else {
+                SVal::Bv(mask(get(a).as_u64().wrapping_sub(get(b).as_u64()), w))
+            }
+        }
+        FlatOp::Mul(a, b, w) => {
+            if w > 64 {
+                SVal::Bv128(mask128(get(a).as_u128().wrapping_mul(get(b).as_u128()), w))
+            } else {
+                SVal::Bv(mask(get(a).as_u64().wrapping_mul(get(b).as_u64()), w))
+            }
+        }
+        FlatOp::And(a, b, w) => {
+            if w > 64 {
+                SVal::Bv128(mask128(get(a).as_u128() & get(b).as_u128(), w))
+            } else {
+                SVal::Bv(mask(get(a).as_u64() & get(b).as_u64(), w))
+            }
+        }
+        FlatOp::Or(a, b, w) => {
+            if w > 64 {
+                SVal::Bv128(mask128(get(a).as_u128() | get(b).as_u128(), w))
+            } else {
+                SVal::Bv(mask(get(a).as_u64() | get(b).as_u64(), w))
+            }
+        }
+        FlatOp::Xor(a, b, w) => {
+            if w > 64 {
+                SVal::Bv128(mask128(get(a).as_u128() ^ get(b).as_u128(), w))
+            } else {
+                SVal::Bv(mask(get(a).as_u64() ^ get(b).as_u64(), w))
+            }
+        }
+        FlatOp::Shl(a, b, w) => {
+            if w > 64 {
+                let av = get(a).as_u128();
+                let bv = get(b).as_u128();
+                if bv >= w as u128 {
+                    SVal::Bv128(0)
+                } else {
+                    SVal::Bv128(mask128(av << bv, w))
+                }
+            } else {
+                let av = get(a).as_u64();
+                let bv = get(b).as_u64();
+                if bv >= w as u64 {
+                    SVal::Bv(0)
+                } else {
+                    SVal::Bv(mask(av << bv, w))
+                }
+            }
+        }
+        FlatOp::Lshr(a, b, w) => {
+            if w > 64 {
+                let av = get(a).as_u128();
+                let bv = get(b).as_u128();
+                if bv >= w as u128 {
+                    SVal::Bv128(0)
+                } else {
+                    SVal::Bv128(mask128(av >> bv, w))
+                }
+            } else {
+                let av = get(a).as_u64();
+                let bv = get(b).as_u64();
+                if bv >= w as u64 {
+                    SVal::Bv(0)
+                } else {
+                    SVal::Bv(mask(av >> bv, w))
+                }
+            }
+        }
+        FlatOp::Ashr(a, b, w) => {
+            if w > 64 {
+                let av = sign_extend128(get(a).as_u128(), w);
+                let bv = get(b).as_u128();
+                if bv >= w as u128 {
+                    if av < 0 {
+                        SVal::Bv128(mask128(u128::MAX, w))
+                    } else {
+                        SVal::Bv128(0)
+                    }
+                } else {
+                    SVal::Bv128(mask128((av >> bv) as u128, w))
+                }
+            } else {
+                let av = sign_extend(get(a).as_u64(), w);
+                let bv = get(b).as_u64();
+                if bv >= w as u64 {
+                    if av < 0 {
+                        SVal::Bv(mask(u64::MAX, w))
+                    } else {
+                        SVal::Bv(0)
+                    }
+                } else {
+                    SVal::Bv(mask((av >> bv) as u64, w))
+                }
+            }
+        }
+        FlatOp::SDiv(a, b, w) => {
+            // Mirrors try_eval BvSDiv: 128-bit i128 path for width > 64
+            // (double-width x86 IDIV dividend) and the u64/i64 path
+            // otherwise, incl. the exact b==0 sentinels and the
+            // INT_MIN/-1 overflow gates keyed on w>=128 / w==64.
+            if w > 64 {
+                let a = sign_extend128(get(a).as_u128(), w);
+                let b = sign_extend128(get(b).as_u128(), w);
+                if b == 0 {
+                    SVal::Bv128(0)
+                } else if a == i128::MIN && b == -1 && w >= 128 {
+                    SVal::Bv128(mask128(a as u128, w))
+                } else {
+                    SVal::Bv128(mask128(a.wrapping_div(b) as u128, w))
+                }
+            } else {
+                let a = sign_extend(get(a).as_u64(), w);
+                let b = sign_extend(get(b).as_u64(), w);
+                if b == 0 {
+                    SVal::Bv(0)
+                } else if a == i64::MIN && b == -1 && w == 64 {
+                    SVal::Bv(mask(a as u64, w))
+                } else {
+                    SVal::Bv(mask(a.wrapping_div(b) as u64, w))
+                }
+            }
+        }
+        FlatOp::UDiv(a, b, w) => {
+            if w > 64 {
+                let a = get(a).as_u128();
+                let b = get(b).as_u128();
+                SVal::Bv128(a.checked_div(b).map(|q| mask128(q, w)).unwrap_or(0))
+            } else {
+                let a = get(a).as_u64();
+                let b = get(b).as_u64();
+                SVal::Bv(a.checked_div(b).map(|q| mask(q, w)).unwrap_or(0))
+            }
+        }
+        FlatOp::URem(a, b, w) => {
+            // No width > 64 branch (compile fails closed for that); mirrors
+            // try_eval BvURem: b==0 -> the (masked) dividend.
+            let a = get(a).as_u64();
+            let b = get(b).as_u64();
+            if b == 0 {
+                SVal::Bv(mask(a, w))
+            } else {
+                SVal::Bv(mask(a % b, w))
+            }
+        }
+        FlatOp::Neg(a, w) => {
+            if w > 64 {
+                SVal::Bv128(mask128((!get(a).as_u128()).wrapping_add(1), w))
+            } else {
+                SVal::Bv(mask((!get(a).as_u64()).wrapping_add(1), w))
+            }
+        }
+        FlatOp::Trap(g, val) => {
+            let gv = get(g);
+            if matches!(gv, SVal::Poison) || gv.as_u128() == 0 {
+                SVal::Poison
+            } else {
+                get(val)
+            }
+        }
+        FlatOp::Eq(a, b) => SVal::Bool(get(a) == get(b)),
+        FlatOp::Not(a) => SVal::Bool(!get(a).as_bool()),
+        FlatOp::Slt(a, b, w) => SVal::Bool(if w > 64 {
+            sign_extend128(get(a).as_u128(), w) < sign_extend128(get(b).as_u128(), w)
+        } else {
+            sign_extend(get(a).as_u64(), w) < sign_extend(get(b).as_u64(), w)
+        }),
+        FlatOp::Sge(a, b, w) => SVal::Bool(if w > 64 {
+            sign_extend128(get(a).as_u128(), w) >= sign_extend128(get(b).as_u128(), w)
+        } else {
+            sign_extend(get(a).as_u64(), w) >= sign_extend(get(b).as_u64(), w)
+        }),
+        FlatOp::Sgt(a, b, w) => SVal::Bool(if w > 64 {
+            sign_extend128(get(a).as_u128(), w) > sign_extend128(get(b).as_u128(), w)
+        } else {
+            sign_extend(get(a).as_u64(), w) > sign_extend(get(b).as_u64(), w)
+        }),
+        FlatOp::Sle(a, b, w) => SVal::Bool(if w > 64 {
+            sign_extend128(get(a).as_u128(), w) <= sign_extend128(get(b).as_u128(), w)
+        } else {
+            sign_extend(get(a).as_u64(), w) <= sign_extend(get(b).as_u64(), w)
+        }),
+        // u128 compares: identical for <=64-bit operands, and no
+        // longer silently truncating 65-128-bit ones (see CExpr::Ult).
+        FlatOp::Uge(a, b) => SVal::Bool(get(a).as_u128() >= get(b).as_u128()),
+        FlatOp::Ult(a, b) => SVal::Bool(get(a).as_u128() < get(b).as_u128()),
+        FlatOp::Ugt(a, b) => SVal::Bool(get(a).as_u128() > get(b).as_u128()),
+        FlatOp::Ule(a, b) => SVal::Bool(get(a).as_u128() <= get(b).as_u128()),
+        FlatOp::BAnd(a, b) => SVal::Bool(get(a).as_bool() && get(b).as_bool()),
+        FlatOp::BOr(a, b) => SVal::Bool(get(a).as_bool() || get(b).as_bool()),
+        FlatOp::Ite(c, t, el) => {
+            if get(c).as_bool() {
+                get(t)
+            } else {
+                get(el)
+            }
+        }
+        FlatOp::Extract(o, low, width) => {
+            let v = get(o).as_u128();
+            let extracted = (v >> low) & mask128(u128::MAX, width);
+            if width > 64 {
+                SVal::Bv128(extracted)
+            } else {
+                SVal::Bv(extracted as u64)
+            }
+        }
+        FlatOp::Concat(hi, lo, lo_width, width) => {
+            let hv = get(hi).as_u128();
+            let lv = get(lo).as_u128();
+            let result = mask128((hv << lo_width) | lv, width);
+            if width <= 64 {
+                SVal::Bv(result as u64)
+            } else {
+                SVal::Bv128(result)
+            }
+        }
+        FlatOp::ZExt(o, width) => {
+            let v = get(o).as_u128();
+            if width > 64 {
+                SVal::Bv128(mask128(v, width))
+            } else {
+                SVal::Bv(mask(v as u64, width))
+            }
+        }
+        FlatOp::SExt(o, src_width, width) => {
+            if width > 64 {
+                let v = get(o).as_u128();
+                SVal::Bv128(mask128(sign_extend128(v, src_width) as u128, width))
+            } else {
+                let v = get(o).as_u64();
+                SVal::Bv(mask(sign_extend(v, src_width) as u64, width))
+            }
+        }
+        FlatOp::MemLoad(address, load_bits, signed, result_width) => {
+            let raw = mask(mem_load_mix(get(address).as_u64()), load_bits);
+            let value = if signed {
+                mask(sign_extend(raw, load_bits) as u64, result_width)
+            } else {
+                mask(raw, result_width)
+            };
+            SVal::Bv(value)
+        }
     }
 }
 

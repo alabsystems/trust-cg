@@ -2095,6 +2095,10 @@ pub enum CoreModuleClosureError {
         "function identity materialized in {function:?} names missing or ambiguous function id {target}"
     )]
     InvalidMaterializedFunctionTarget { function: String, target: u32 },
+    #[error(
+        "identity-Core v1 rejects nominal Constant::FnItem({target}) in function {function:?}; nominal identity is not a materialized code address"
+    )]
+    NominalFunctionItemUnsupported { function: String, target: u32 },
     #[error("identity-Core v1 rejects raw SymbolAddr {symbol:?} in function {function:?}")]
     SymbolAddressUnsupported { function: String, symbol: String },
     #[error("module symbol {symbol:?} must be nonempty, bounded, trimmed, and control-free")]
@@ -4686,7 +4690,11 @@ fn validate_core_constant_binding(
 
     match constant {
         Constant::Ext(e) => e.unreachable(),
-        Constant::FnDef(target) | Constant::FnItem(target) => validate_function_target(*target),
+        Constant::FnDef(target) => validate_function_target(*target),
+        Constant::FnItem(target) => Err(CoreModuleClosureError::NominalFunctionItemUnsupported {
+            function: function.name.clone(),
+            target: target.index(),
+        }),
         Constant::Closure { func, captures } => {
             validate_function_target(*func)?;
             for capture in captures {
@@ -8213,6 +8221,38 @@ mod tests {
                 CoreAdmissionError::MaterializedModuleLocalFunctionIdentityUnsupported { count: 1 }
             )
         ));
+    }
+
+    #[test]
+    fn core_constant_binding_keeps_nominal_items_distinct_from_external_code_addresses() {
+        let mut module = self_contained_module();
+        let id = FuncId::new(1);
+        module.functions.push(Function::new(
+            id,
+            "external_target",
+            FuncTyId::new(0),
+            trust_ir::BlockId::new(0),
+        ));
+        let functions = ModuleFunctionCatalog::new(&module);
+        let owner = &module.functions[0];
+        validate_core_constant_binding(&Constant::FnDef(id), owner, &functions).unwrap();
+        for value in [
+            Constant::FnItem(id),
+            Constant::Aggregate(vec![Constant::Int(7), Constant::FnItem(id)]),
+            Constant::Splat {
+                elem: Box::new(Constant::FnItem(id)),
+                len: u64::MAX,
+            },
+            Constant::Closure {
+                func: id,
+                captures: vec![Constant::FnItem(id)],
+            },
+        ] {
+            assert!(matches!(
+                validate_core_constant_binding(&value, owner, &functions),
+                Err(CoreModuleClosureError::NominalFunctionItemUnsupported { target: 1, .. })
+            ));
+        }
     }
 
     #[test]

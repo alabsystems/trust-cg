@@ -48,6 +48,16 @@ fn shared_register_bits_preserve_all_sib_and_modrm_bytes() {
                     ),
                     expected
                 );
+
+                // Direct construction may set bits outside the documented
+                // field widths. Preserve the observable byte for those inputs.
+                let mode = scale_bits + 4;
+                let raw = ModRM {
+                    mode,
+                    reg: index,
+                    rm: base,
+                };
+                assert_eq!(raw.encode(), (mode << 6) | (index << 3) | base);
             }
             assert_eq!(
                 u16::from(ModRM::reg_reg(index, base).encode()),

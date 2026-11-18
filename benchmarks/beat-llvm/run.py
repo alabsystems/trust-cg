@@ -286,8 +286,11 @@ RELIABLE_MIN_S = 0.05
 RELIABLE_SPREAD_MAX = 0.25
 
 
-def run(cmd, env=None, timeout=None, capture=True):
-    return subprocess.run(cmd, capture_output=capture, text=True, env=env, timeout=timeout)
+def run(cmd, env=None, timeout=None, capture=True, *, inherit_resources=False):
+    environment = os.environ if env is None else env
+    inherited = rss_capture.resource_fds(environment) if inherit_resources else ()
+    return subprocess.run(cmd, capture_output=capture, text=True, env=env, timeout=timeout,
+                          pass_fds=inherited)
 
 
 def parse_perf_stats(text):
@@ -464,7 +467,7 @@ class Harness:
                         f"{self.driver['targo']} --unverified build --release)\n"
                         f"  Refusing (measuring a stale backend attributes results to the wrong tree). "
                         f"Use --allow-stale-dylib to override; the row is NOT evidence.")
-        rustc_v = run([self.rustc, "--version"], env=self.env).stdout.strip()
+        rustc_v = run([self.rustc, "--version"], env=self.env, inherit_resources=True).stdout.strip()
         ncpu = os.cpu_count() or 1
         load1 = os.getloadavg()[0]
         thr = self.args.load_threshold if self.args.load_threshold is not None else ncpu / 2.0
@@ -606,9 +609,11 @@ class Harness:
         env = dict(self.env)
         if extra_env:
             env.update(extra_env)
+        inherited = rss_capture.resource_fds(env)
         t0 = time.monotonic()
         r = subprocess.run(self.compile_cmd(src, out, opt, bridge),
-                           capture_output=True, text=True, env=env, timeout=COMPILE_TIMEOUT)
+                           capture_output=True, text=True, env=env, timeout=COMPILE_TIMEOUT,
+                           pass_fds=inherited)
         dt = time.monotonic() - t0
         if bridge:
             self.note_bridge_stderr(Path(src).stem, f"O{opt}", r.stderr)
@@ -731,10 +736,11 @@ class Harness:
             self.compile_cmd(probe_src, probe_out, "3", bridge=True))
         target_args = TRUST_TOOLCHAIN.target_arguments(self.driver, self.args.target)
         cpus = run([self.rustc, "--print", "target-cpus", *target_args],
-                   env=self.env)
+                   env=self.env, inherit_resources=True)
         policy["llvm_default_target_cpu"] = (hostinfo.parse_default_target_cpu(cpus.stdout)
                                              if cpus.returncode == 0 else None)
-        cfg = run([self.rustc, "--print", "cfg", *target_args], env=self.env)
+        cfg = run([self.rustc, "--print", "cfg", *target_args],
+                  env=self.env, inherit_resources=True)
         policy["llvm_default_target_features"] = (hostinfo.parse_cfg_target_features(cfg.stdout)
                                                   if cfg.returncode == 0 else None)
         return policy
@@ -799,7 +805,7 @@ class Harness:
         if extra_env:
             env.update(extra_env)
         sample = rss_capture.measure(self.compile_cmd(src, out, opt, bridge), env=env,
-                                     timeout=COMPILE_TIMEOUT)
+                                     timeout=COMPILE_TIMEOUT, inherit_resources=True)
         if bridge:
             self.note_bridge_stderr(Path(src).stem, f"rss-O{opt}", sample.stderr)
         return rss_record(sample, sample.peak_rss_bytes if sample.returncode == 0 else None)
@@ -835,6 +841,7 @@ class Harness:
         (bytes None, with the reason) when that compile fails or when its
         image's section bytes differ from the timed compile's binary: the map
         must describe the binary the other metrics measured."""
+        inherited = rss_capture.resource_fds(self.env)
         directory = Path(tempfile.mkdtemp(prefix=f"size-{stem}-{lane}-", dir=self.workdir))
         out = directory / f"{stem}_{lane}"
         map_path = directory / "link.map"
@@ -842,7 +849,7 @@ class Harness:
         record = {"method": "linker map", "link_map_args": emitted_size.link_map_args("<map>")}
         try:
             r = subprocess.run(cmd, capture_output=True, text=True, env=self.env,
-                               timeout=COMPILE_TIMEOUT, cwd=directory)
+                               timeout=COMPILE_TIMEOUT, cwd=directory, pass_fds=inherited)
             if bridge:
                 self.note_bridge_stderr(stem, f"size-O{opt}", r.stderr)
             if r.returncode != 0:
@@ -1214,7 +1221,8 @@ class Harness:
             env = dict(self.env)
             env["TCG_PERF_STATS"] = "1"
             r = subprocess.run(self.compile_cmd(src, out, "3", bridge=True),
-                               capture_output=True, text=True, env=env, timeout=COMPILE_TIMEOUT)
+                               capture_output=True, text=True, env=env, timeout=COMPILE_TIMEOUT,
+                               pass_fds=rss_capture.resource_fds(env))
             print(f"## {src.stem}")
             if r.returncode != 0:
                 errl = [l for l in r.stderr.splitlines() if l.startswith("error")]
@@ -1759,4 +1767,8 @@ def parse_args():
 
 
 if __name__ == "__main__":
-    Harness(parse_args()).main()
+    try:
+        Harness(parse_args()).main()
+    except rss_capture.ResourceRefusal as error:
+        print(f"beat-llvm: FATAL: {error}", file=sys.stderr)
+        raise SystemExit(2)

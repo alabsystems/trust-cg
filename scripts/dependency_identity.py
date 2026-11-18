@@ -248,15 +248,23 @@ def home_directory(environment: Mapping[str, str]) -> Path:
     return Path(pwd.getpwuid(os.getuid()).pw_dir)
 
 
-def cargo_home_from(environment: Mapping[str, str], cwd: Path = ROOT) -> tuple[Path, str]:
-    """Cargo's home for a command started in cwd, resolved as Cargo does
-    (`home::cargo_home_with_cwd`): a non-empty CARGO_HOME, else
-    `home_directory()/.cargo`, either joined to cwd when relative. This is
-    the one resolver the dependency record and the Cargo config audit share."""
-    configured = environment.get("CARGO_HOME")
+def cargo_home_from(
+    environment: Mapping[str, str], cwd: Path = ROOT, *, native_targo: bool = False,
+) -> tuple[Path, str]:
+    """The selected frontend's home for a command started in `cwd`.
+
+    Native Targo imports TARGO_HOME only when CARGO_HOME is absent. An
+    explicitly empty CARGO_HOME suppresses that import and selects HOME/.cargo.
+    Stock Cargo ignores TARGO_HOME. Relative paths are relative to the actual
+    command directory; this selection does not identify or authorize a tool.
+    """
+    selected = "CARGO_HOME"
+    if selected not in environment and native_targo:
+        selected = "TARGO_HOME"
+    configured = environment.get(selected)
     if configured:
         path = Path(configured)
-        return (path if path.is_absolute() else cwd / path), "CARGO_HOME"
+        return (path if path.is_absolute() else cwd / path), selected
     home = home_directory(environment)
     return (home if home.is_absolute() else cwd / home) / ".cargo", "default"
 
@@ -530,7 +538,9 @@ def summary_lines(identity: Mapping) -> list[str]:
 def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0], allow_abbrev=False)
     parser.add_argument("--lock", type=Path, default=ROOT / "Cargo.lock", help="lockfile to record (default: this checkout's Cargo.lock)")
-    parser.add_argument("--cargo-home", type=Path, help="Cargo home (default: $CARGO_HOME, else $HOME/.cargo)")
+    parser.add_argument("--cargo-home", type=Path, help="explicit cache home; overrides environment selection")
+    parser.add_argument("--home-context", choices=("targo", "cargo"), default="targo",
+                        help="selected frontend home semantics (default: targo; never inferred from a filename)")
     parser.add_argument("--git", default="git", help="git executable used to query the Cargo Git databases")
     parser.add_argument("--no-tree-hash", action="store_true", help="skip the checkout tree SHA-256 (recording only)")
     parser.add_argument("--json", action="store_true", help="print the identity record as JSON")
@@ -540,7 +550,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     )
     args = parser.parse_args(argv)
     if args.cargo_home is None:
-        cargo_home, origin = cargo_home_from(os.environ, Path.cwd())
+        cargo_home, origin = cargo_home_from(os.environ, Path.cwd(), native_targo=args.home_context == "targo")
     else:
         cargo_home, origin = args.cargo_home.absolute(), "argument"
     identity = collect(args.lock, cargo_home, git=args.git, hash_trees=not args.no_tree_hash, cargo_home_source=origin)

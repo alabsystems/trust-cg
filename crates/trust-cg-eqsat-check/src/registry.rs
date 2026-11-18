@@ -297,6 +297,51 @@ impl Registry {
     pub(crate) fn rule(&self, name: &str) -> Option<&Rule> {
         self.by_name.get(name).and_then(|&i| self.rules.get(i))
     }
+
+    fn of(rules: Vec<Rule>) -> Registry {
+        let by_name = rules
+            .iter()
+            .enumerate()
+            .map(|(i, rule)| (rule.name.clone(), i))
+            .collect();
+        Registry { rules, by_name }
+    }
+
+    /// The rules `admit(name, statement digest)` accepts, in this
+    /// registry's order. A derivation that names a rule left out is refused
+    /// as naming an unknown rule.
+    pub fn restricted(&self, admit: impl Fn(&str, &[u8; 32]) -> bool) -> Registry {
+        Registry::of(
+            self.rules
+                .iter()
+                .filter(|rule| admit(&rule.name, &rule.digest))
+                .cloned()
+                .collect(),
+        )
+    }
+
+    /// This registry followed by the rules of `other` it does not hold. A
+    /// rule of `other` whose name this registry uses is taken once when it
+    /// is the same statement (equal statement digest); a name the two give
+    /// to different statements is refused (line 0: no file line names it).
+    pub fn merged(&self, other: &Registry) -> Result<Registry, RegistryError> {
+        let mut rules = self.rules.clone();
+        for rule in &other.rules {
+            match self.rule(&rule.name) {
+                None => rules.push(rule.clone()),
+                Some(ours) if ours.digest == rule.digest => {}
+                Some(_) => {
+                    return Err(RegistryError {
+                        line: 0,
+                        rule: Some(rule.name.clone()),
+                        message: "the two registries give the name to different statements"
+                            .to_owned(),
+                    });
+                }
+            }
+        }
+        Ok(Registry::of(rules))
+    }
 }
 
 // ---------------------------------------------------------------- tokens

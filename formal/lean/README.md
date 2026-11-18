@@ -95,6 +95,12 @@ forward simulation needs (ledger X-LEAN-P3, and the start of X-LEAN-P1 in
   decode to `none`. Aliases (CMP, TST, MOV, CSET, LSL #k, SXTW, SMULL, ...) are
   not constructors: they denote canonical class instructions, so the round trips
   cover them.
+  MOVN, MOVZ and MOVK share the Trust-compiled word packer in
+  [`MoveWideBits.lean`](Trust/A64/MoveWideBits.lean) with production Rust.
+  `encode_moveWide_toNat` proves equality with the architectural layout.
+  The ADD/SUB immediate family uses
+  [`AddSubImmBits.lean`](Trust/A64/AddSubImmBits.lean) in both encoders.
+  `encode_addSubImm_toNat` connects that word to the existing decoder proofs.
 - [`Trust/A64/Bitmask.lean`](Trust/A64/Bitmask.lean): the Arm ARM
   `DecodeBitMasks`, and `bitmaskValid_iff_decodeBitMasks` (kernel evaluation
   over every `N`, `imms`, `immr`) showing the decoder's logical-immediate
@@ -240,6 +246,10 @@ The x86 model also admits full-width `movabsRI` mask loads (REX.W + B8+r +
 imm64), with an all-register/all-immediate round-trip theorem, exact destination
 replacement, frame preservation and ten-byte PC advance. `Model.MovabsGolden`
 binds 96 vectors to the production encoder through `lean_encode_golden_binding`.
+The Lean model and Rust encoder use the same Trust-compiled two-byte prefix
+from `Model.RegisterBits`. The model proves its REX.W+B and opcode bytes for
+all 16 registers. The Rust encoder selects this form after checking whether
+the immediate fits the shorter zero-extending 32-bit move.
 Run `scripts/check_movabs_model.py` through build-slot for the focused model,
 residency, axiom and backend checks. This does not add shift-immediate decoding
 or prove complete SWAR instruction execution, and does not attest the compiler.

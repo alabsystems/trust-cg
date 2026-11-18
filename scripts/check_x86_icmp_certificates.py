@@ -4,6 +4,7 @@
     scripts/check_x86_icmp_certificates.py                 # the gate
     scripts/check_x86_icmp_certificates.py --skip-missing-toolchain
     scripts/check_x86_icmp_certificates.py tools-path      # obtain the rule's AY and Clean only
+    scripts/check_x86_icmp_certificates.py recertify-ay --candidate-ay-rev SHA --candidate-ay-version VERSION
     scripts/check_x86_icmp_certificates.py --queries DIR   # re-run a supplied dump: never a PASS
 
 trust-ir's per-cell rule for x86-64 vector compares (`docs/dialects.md`,
@@ -48,12 +49,14 @@ is parsed, and no ground is re-derived here.
    else `$HOME/.cache`: the one user-cache rule of scripts/private_cache.py
    and trust-cg, so an empty or relative XDG_CACHE_HOME is ignored, and with
    neither absolute there is no default and the gate fails
-   `<tool>-cache-not-private`). A cold build runs under the machine-wide admission gate
-   of the rule's Clean, `scripts/heavy_gate.sh run
+   `<tool>-cache-not-private`). A cold build requires build-slot CPU admission
+   as well as the memory gate of the rule's Clean, `scripts/heavy_gate.sh run
    auto:x86-icmp-<tool>-build-cold:40` exported from
    `clean.rev` (the actual C6 Clean cold build peaked at 26.58 GiB), so it waits
-   for, and is counted against, every heavy job on the host; certification
-   starts only after both binaries exist. A build still running (or still
+   for its memory reservation. Ordinary CPU admission preserves frontend
+   refusals; --tool-build-admission exclusive explicitly selects quiet-machine
+   admission after acquiring memory, never an automatic retry or downgrade.
+   Certification starts only after both binaries exist. A build still running (or still
    queued) after `BUILD_TIMEOUT_SECONDS`, or one the gate is interrupted
    during, is stopped with its whole process tree (`run_admitted_build`), so
    no build outlives the admission that counted it. The binary's sha256 is
@@ -121,8 +124,18 @@ one it exits 4 and says `SUPPLIED-DUMP`, never `PASS`, and its report records
 `queries.source = "supplied"`; `tools-path` refuses `--queries` (it obtains
 the compiled rule's tools).
 
+`recertify-ay` prepares an AY succession before either repository's pin moves.
+It regenerates the current compiled rule and queries, still requires that rule
+to match the current AY pin, and changes only the solver build used to re-run
+those exact cells. Proof arguments, checker, coverage and verdict checks stay
+the compiled rule's. It emits a distinct candidate receipt and exits 5 on
+success, never a gate PASS. It changes no pin, rule, query or certificate table.
+A later ordinary gate must still pass under the adopted rule and cohort.
+Supplied queries cannot produce this receipt.
+
 Exit status: 0 pass; 1 a finding; 2 usage; 3 explicitly skipped; 4 a supplied
-dump re-run without a finding (not a pass).
+dump re-run without a finding (not a pass); 5 candidate AY re-certified on the
+current compiled queries (not a gate pass).
 
 What a pass is, and what it trusts. A pass is an SMT proof that AY `ay.rev`
 produced for each cell's exact query, which the Carcara Alethe checker inside
@@ -199,6 +212,7 @@ def _load_resource_transport():
 
 pin_resources = _load_resource_transport()
 SCHEMA = "trust-cg.x86-icmp-certificates.v2"
+RECERTIFICATION_SCHEMA = "trust-cg.x86-icmp-ay-recertification.v1"
 QUERY_MANIFEST_SCHEMA = "trust-cg.x86-icmp-cell-queries.v2"
 CACHE_SCHEMAS = {"ay": "trust-cg.ay-cli-build.v3", "clean": "trust-cg.clean-cli-build.v2"}
 EXPORT_SCHEMAS = {"ay": "trust-cg.ay-unverified-export.v1", "clean": "trust-cg.clean-unverified-export.v1"}
@@ -211,6 +225,7 @@ AY_CACHE_SCHEMA = CACHE_SCHEMAS["ay"]
 SOURCE_ENVIRONMENT = {"ay": "AY_SOURCE_DIR", "clean": "CLEAN_SOURCE_DIR"}
 EXAMPLE = "x86_icmp_certificate_queries"
 EXIT_PASS, EXIT_FAIL, EXIT_USAGE, EXIT_SKIPPED, EXIT_SUPPLIED = 0, 1, 2, 3, 4
+EXIT_RECERTIFIED = 5
 GROUNDS = ("instruction-model", "certificate", "fail-closed")
 # The machine-wide reservation of one cold tool build: a cold Clean checker
 # build peaked at 9.79 GB here against 8 reserved (heavy_gate: UNDER-RESERVED),
@@ -437,6 +452,19 @@ def require_rule_ay(ay_rev: str, rule: dict, trust_ir_rev: str) -> None:
                       f"AY {rule['ay'].rev}; re-certify under the new AY and move the rule, or keep the pins equal")
 
 
+def recertification_rule(args, compiled_rule: dict) -> dict:
+    """Only the proposed solver's source identity changes. Its bytes are
+    obtained and checked by the ordinary by-revision build/cache recipe;
+    they are not claimed to be bytes listed in the current compiled rule."""
+    revision, version = args.candidate_ay_rev, args.candidate_ay_version
+    if not isinstance(revision, str) or not SHA1.fullmatch(revision):
+        raise Finding("candidate-ay-unreadable", "candidate AY needs an exact lowercase 40-hex revision")
+    if not isinstance(version, str) or not SEMVER.fullmatch(version):
+        raise Finding("candidate-ay-unreadable", "candidate AY needs an exact package version")
+    return dict(compiled_rule, ay=compiled_rule["ay"]._replace(
+        rev=revision, version=version, certifying_sha256=()))
+
+
 # ---------------------------------------------------------------------------
 # AY and Clean: exactly the revisions the rule names, built once per revision.
 # ---------------------------------------------------------------------------
@@ -617,16 +645,27 @@ def export_tree(repo: Path, rev: str, destination: Path, paths: tuple[str, ...] 
 Admission = Callable[[Tool, str, Path], list]
 
 
-def heavy_gate_admission(clean: Tool, clean_source: Optional[Path]) -> Admission:
-    """The machine-wide admission of a cold tool build: the rule's Clean's own
+def heavy_gate_admission(clean: Tool, clean_source: Optional[Path],
+                         cpu_mode: str = "ordinary") -> Admission:
+    """CPU admission plus the rule's Clean's own historical memory gate.
     `scripts/heavy_gate.sh run auto:x86-icmp-<tool>-build-cold:40 <label> --`, exported by object from
     `clean.rev` into the build's work directory (the script and the weights
     file it sources). Its state (`/tmp/heavy_gate`) is machine-wide, so the
     build is counted against every heavy job on the host, and the script comes
     from the source the gate already builds its checker from. Separate cold-only
-    classes learn from actual completed builds; cache hits cannot age out peaks."""
+    classes learn from actual completed builds; cache hits cannot age out peaks.
+    The historical script need not acquire a build-slot CPU lease, so that
+    admission is explicit. Ordinary mode lets build-slot coordinate the
+    structured memory wrapper and preserves native frontend refusals. Explicit
+    exclusive mode acquires memory before waiting for its quiet CPU reservation,
+    never as a fallback after an ordinary refusal."""
 
     def admit(tool: Tool, label: str, work: Path) -> list:
+        if cpu_mode not in {"ordinary", "exclusive"}:
+            raise Finding("tool-build-admission-invalid", "expected ordinary or exclusive CPU admission")
+        machine_gate = shutil.which("build-slot")
+        if machine_gate is None:
+            raise MissingInput("build-slot-missing", "cold tool builds require machine-wide build-slot CPU admission")
         repo = source_with("clean", clean.rev, clean_source)
         probe = subprocess.run(["git", "-C", str(repo), "cat-file", "-e", f"{clean.rev}:scripts/heavy_gate.sh"],
                                capture_output=True)
@@ -638,7 +677,10 @@ def heavy_gate_admission(clean: Tool, clean_source: Optional[Path]) -> Admission
         script = gate / "scripts" / "heavy_gate.sh"
         phase = "resume" if label.startswith(f"x86-icmp-{tool.package}-resume-") else "cold"
         weight = f"auto:x86-icmp-{tool.package}-build-{phase}:{TOOL_BUILD_FALLBACK_GB[tool.package]}"
-        return [str(script), "run", weight, label, "--"]
+        memory = [str(script), "run", weight, label, "--"]
+        if cpu_mode == "exclusive":
+            return [*memory, machine_gate, "--exclusive", "--cpus", "2", "--mem-gb", "40", "--"]
+        return [machine_gate, "--cpus", "2", "--mem-gb", "40", "--", *memory]
 
     return admit
 
@@ -960,7 +1002,7 @@ def build_tool(tool: Tool, cache_dir: Path, slot: Path, binary: Path, identity_f
         admission_work = (Path(tempfile.mkdtemp(prefix="resume-admission-", dir=work))
                           if resume_work is not None else work)
         prefix = admission(tool, label, admission_work)
-        log(f"building: {' '.join(command)} (in {src}; admitted by {' '.join(prefix[:4]) or 'nothing'}; "
+        log(f"building: {' '.join(command)} (in {src}; admitted by {' '.join(prefix) or 'nothing'}; "
             "no proof claim for the build)")
         build_log = work / "build.log"
         if resume_work is not None:
@@ -997,7 +1039,7 @@ def build_tool(tool: Tool, cache_dir: Path, slot: Path, binary: Path, identity_f
             "schema": tool.cache_schema, "rev": rev, "version": tool.version, "sha256": digest, "banner": banner,
             "source": str(repo), "targo": str(targo),
             "recipe": {"command": command[1:], "cargo_config": cargo_config, "env": recipe_env},
-            "admission": prefix[1:4] if prefix else [],
+            "admission": prefix,
             "built_at": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
             "build_seconds": round(time.monotonic() - started, 1),
         }
@@ -1027,7 +1069,11 @@ def build_tool(tool: Tool, cache_dir: Path, slot: Path, binary: Path, identity_f
 # ---------------------------------------------------------------------------
 
 def dump_queries(out: Path) -> None:
-    command = [str(ROOT / "scripts" / "trust_cargo.sh"), "run", "--locked", "-p", "trust-cg-verify",
+    machine_gate = shutil.which("build-slot")
+    if machine_gate is None:
+        raise MissingInput("build-slot-missing", "query generation can compile; machine-wide build-slot is required")
+    command = [machine_gate, "--cpus", "2", "--mem-gb", "40", "--",
+               str(ROOT / "scripts" / "trust_cargo.sh"), "run", "--locked", "-p", "trust-cg-verify",
                "--example", EXAMPLE, "--", str(out)]
     log(f"regenerating the cell queries and the rule: {' '.join(command[1:])}")
     # This can compile the example before dumping. Keep the existing argv and
@@ -1219,6 +1265,13 @@ def certify_cell(cell: dict, queries: Path, work: Path, ay: Path, clean: Path, r
     query_path = queries / cell["query_file"]
     proof_path = work / f"{name}.alethe"
     row = {"cell": f"{cell['shape']} {cell['cond']}", "query_sha256": cell["query_sha256"], "findings": []}
+    # Bind the checker to the exact query whose digest coverage admitted,
+    # even if a solver changes its input file while producing its proof.
+    query_bytes = query_path.read_bytes()
+    if sha256_bytes(query_bytes) != cell["query_sha256"]:
+        row["findings"].append(("query-changed-during-run", "query changed before solver invocation"))
+        return row
+    problem = query_bytes.decode("utf-8")
     started = time.monotonic()
     try:
         solved = subprocess.run([str(ay), *fill(rule["ay_args"], query=str(query_path), proof=str(proof_path))],
@@ -1246,7 +1299,7 @@ def certify_cell(cell: dict, queries: Path, work: Path, ay: Path, clean: Path, r
                                       "accepts without checking"))
     certificate = work / f"{name}.cert.json"
     certificate.write_text(json.dumps({"type": "alethe_certificate", "version": "1.0",
-                                       "problem": query_path.read_text(), "proof": proof}))
+                                       "problem": problem, "proof": proof}))
     started = time.monotonic()
     try:
         checked = subprocess.run([str(clean), *fill(rule["clean_args"], certificate=str(certificate))],
@@ -1268,6 +1321,8 @@ def certify_cell(cell: dict, queries: Path, work: Path, ay: Path, clean: Path, r
         row["findings"].append(("clean-not-fully-verified",
                                 f"exit 0, but stdout does not report `Proof status: {rule['clean_proof_status']}` "
                                 f"cleanly; {'; '.join(status)}"))
+    if sha256_file(query_path) != cell["query_sha256"]:
+        row["findings"].append(("query-changed-during-run", "solver/checker query bookends differ"))
     if not keep:
         proof_path.unlink(missing_ok=True)
         certificate.unlink(missing_ok=True)
@@ -1312,7 +1367,8 @@ def load_manifest(args, work: Path) -> tuple[Path, dict]:
 def obtain_tools(args, rule: dict, report: dict) -> tuple[dict, list[MissingInput]]:
     """Both of the rule's tools, Clean first (its export also supplies the
     admission gate), each as `{path, identity}`; absent inputs are collected."""
-    admission = heavy_gate_admission(rule["clean"], args.clean_source)
+    admission = heavy_gate_admission(rule["clean"], args.clean_source,
+                                     getattr(args, "tool_build_admission", "ordinary"))
     tools: dict = {}
     missing: list[MissingInput] = []
     for tool, cache_dir, source in ((rule["clean"], args.clean_cache_dir, args.clean_source),
@@ -1337,11 +1393,15 @@ def obtain_tools(args, rule: dict, report: dict) -> tuple[dict, list[MissingInpu
 
 
 def run_gate(args) -> tuple[int, dict]:
-    report: dict = {"schema": SCHEMA, "findings": [], "missing": [], "cells": [],
+    recertify = getattr(args, "command", "check") == "recertify-ay"
+    report: dict = {"schema": RECERTIFICATION_SCHEMA if recertify else SCHEMA,
+                    "findings": [], "missing": [], "cells": [],
                     "queries": ({"source": "supplied", "path": str(args.queries)} if args.queries
                                 else {"source": "regenerated"})}
     started = time.monotonic()
     try:
+        if recertify and args.queries:
+            raise Finding("candidate-queries-supplied", "AY succession requires freshly regenerated compiled queries")
         pinned = lock_pins()
         report.update(pinned)
         with tempfile.TemporaryDirectory(prefix="x86-icmp-certificates-") as temporary:
@@ -1357,6 +1417,9 @@ def run_gate(args) -> tuple[int, dict]:
             log(f"rule (trust_ir::CHC_X86_ICMP_CERTIFICATE_RULE, trust-ir {manifest.get('trust_ir_build')}): "
                 f"AY {rule['ay'].rev} ({rule['ay'].version}), Clean {rule['clean'].rev} ({rule['clean'].version})")
             require_rule_ay(pinned["ay_rev"], rule, pinned["trust_ir_rev"])
+            if recertify:
+                rule = recertification_rule(args, rule)
+                report["candidate_rule"] = rule_summary(rule)
             tools, missing = obtain_tools(args, rule, report)
             if missing:
                 return missing_inputs(missing, args, report)
@@ -1414,6 +1477,14 @@ def run_gate(args) -> tuple[int, dict]:
             log(f"SUPPLIED-DUMP (not a PASS): {summary}; the rule, grounds and pins were read from "
                 f"{args.queries / 'manifest.json'}, not regenerated from the compiled trust-ir")
             return EXIT_SUPPLIED, report
+        if recertify:
+            # Keep report['rule'] as the actual compiled authority. This is
+            # evidence to prepare its successor, never a claim it has moved.
+            report["recertified_ay"] = dict(rule_summary(rule)["ay"],
+                                            certifying_sha256=[report["ay"]["sha256"]])
+            report["gate_passed"] = False
+            log(f"AY-RECERTIFIED (not a gate PASS): {summary}; pins and compiled rule unchanged")
+            return EXIT_RECERTIFIED, report
         log(f"PASS: {summary}")
         return EXIT_PASS, report
     except Finding as finding:
@@ -1469,9 +1540,9 @@ def tools_path(args) -> int:
 
 def main(argv: Optional[list[str]] = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n", 1)[0], allow_abbrev=False)
-    parser.add_argument("command", nargs="?", default="check", choices=("check", "tools-path"),
-                        help="check (the gate, default) or tools-path (obtain the rule's AY and Clean and print "
-                             "their identities)")
+    parser.add_argument("command", nargs="?", default="check", choices=("check", "tools-path", "recertify-ay"),
+                        help="check (the gate, default), tools-path (obtain the compiled rule's tools), or "
+                             "recertify-ay (prepare a solver successor without moving pins or passing the gate)")
     parser.add_argument("--cache-dir", type=Path, default=None,
                         help="AY build cache, one slot per revision/recipe (default: <cache>/trust-cg/ay-cli, where <cache> "
                              "is an absolute $XDG_CACHE_HOME, else $HOME/.cache)")
@@ -1492,11 +1563,25 @@ def main(argv: Optional[list[str]] = None) -> int:
                         help="an ABSENT toolchain input is a stated SKIP (exit 3) instead of a failure")
     parser.add_argument("--jobs", type=int, default=4, help="cells certified concurrently (default: %(default)s)")
     parser.add_argument("--keep-build", action="store_true", help="keep each cold build's export and target directory")
+    parser.add_argument("--tool-build-admission", choices=("ordinary", "exclusive"), default="ordinary",
+                        help="CPU admission for each cold tool build; exclusive explicitly waits for a quiet "
+                             "machine and reserves all slots; no automatic fallback on frontend refusal")
+    parser.add_argument("--candidate-ay-rev", help="proposed exact AY revision; only with recertify-ay")
+    parser.add_argument("--candidate-ay-version", help="proposed AY package version; only with recertify-ay")
     parser.add_argument("--resume-tool-build", action="append", default=[], metavar="TOOL=/ABS/WORK",
                         help="revalidate a retained exact export and rerun its normal build in the same private target")
     parser.add_argument("--keep-work", default=None, help="write queries, proofs and certificates here and keep them")
     parser.add_argument("--json-out", type=Path, default=None, help="write the run's report as JSON")
     args = parser.parse_args(argv)
+    if args.command == "recertify-ay":
+        if args.queries:
+            parser.error("recertify-ay requires regenerated compiled queries; --queries is not allowed")
+        if not args.candidate_ay_rev or not args.candidate_ay_version:
+            parser.error("recertify-ay requires --candidate-ay-rev and --candidate-ay-version")
+        if not SHA1.fullmatch(args.candidate_ay_rev) or not SEMVER.fullmatch(args.candidate_ay_version):
+            parser.error("candidate AY requires an exact 40-hex revision and package version")
+    elif args.candidate_ay_rev is not None or args.candidate_ay_version is not None:
+        parser.error("candidate AY options require recertify-ay")
     resumes = {}
     for entry in args.resume_tool_build:
         tool, separator, path = entry.partition("=")

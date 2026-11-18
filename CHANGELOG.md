@@ -6,6 +6,17 @@ All notable public changes to trust-cg are recorded here. The project follows
 
 ## [Unreleased]
 
+- Add Tier S to `trust-cg-eqsat` (`saturate`): equality saturation of a
+  bounded region of total operators under declared stages and count budgets,
+  extraction that prices a shared node once and never returns a region
+  costlier than its input, and a derivation for every result; and
+  `check_region` to `trust-cg-eqsat-check`, which replays a region derivation
+  and refuses a pinned reduction rewritten through an order-free node, an
+  order-free node implemented at two orders and a pinned order the input does
+  not name (PKG-U4). Library only: nothing turns a function into a region, and
+  no rule carries a discharge record yet. Contract:
+  `docs/eqsat-tier-s.md`.
+
 - Add `trust-cg-eqsat`, an eager acyclic e-graph over trust-ir function
   bodies that records a derivation for every rewrite, and
   `trust-cg-eqsat-check`, an independent checker that replays derivations

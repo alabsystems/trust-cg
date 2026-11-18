@@ -110,6 +110,11 @@ impl Interner {
         id
     }
 
+    /// The number of terms held; their ids are `0..len()`.
+    pub(crate) fn len(&self) -> usize {
+        self.nodes.len()
+    }
+
     pub(crate) fn node(&self, id: TermId) -> Option<&Node> {
         self.nodes.get(id).map(|(n, _)| n)
     }

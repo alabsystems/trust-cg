@@ -417,13 +417,19 @@ pub(crate) enum OpDesc {
     Cmp(Pred, Sty),
     Cast(CastK, Sty, Sty),
     Select(Sty),
+    /// A reduction whose order is pinned in the operator
+    /// (docs/eqsat-tier-s.md section 2.2): `Pinned(order, T)`, one operand
+    /// of type `T`, result `T`. A Tier S region operator only: the body
+    /// reader never makes one, no rule can name one, and the version-1
+    /// decoder refuses its opdesc.
+    Pinned(u32, Sty),
 }
 
 impl OpDesc {
     pub(crate) const fn arity(self) -> usize {
         match self {
             OpDesc::Bin(..) | OpDesc::Cmp(..) => 2,
-            OpDesc::Un(..) | OpDesc::Cast(..) => 1,
+            OpDesc::Un(..) | OpDesc::Cast(..) | OpDesc::Pinned(..) => 1,
             OpDesc::Select(_) => 3,
         }
     }
@@ -432,7 +438,7 @@ impl OpDesc {
     pub(crate) fn operand_tys(self) -> Vec<Sty> {
         match self {
             OpDesc::Bin(_, t) | OpDesc::Cmp(_, t) => vec![t, t],
-            OpDesc::Un(_, t) => vec![t],
+            OpDesc::Un(_, t) | OpDesc::Pinned(_, t) => vec![t],
             OpDesc::Cast(_, s, _) => vec![s],
             OpDesc::Select(t) => vec![Sty::Bool, t, t],
         }
@@ -440,7 +446,7 @@ impl OpDesc {
 
     pub(crate) const fn result_ty(self) -> Sty {
         match self {
-            OpDesc::Bin(_, t) | OpDesc::Un(_, t) | OpDesc::Select(t) => t,
+            OpDesc::Bin(_, t) | OpDesc::Un(_, t) | OpDesc::Select(t) | OpDesc::Pinned(_, t) => t,
             OpDesc::Cmp(..) => Sty::Bool,
             OpDesc::Cast(_, _, d) => d,
         }
@@ -458,7 +464,7 @@ impl OpDesc {
                     !t.is_bool() || k.admits_bool()
                 }
             }
-            OpDesc::Un(_, t) => !t.is_bool(),
+            OpDesc::Un(_, t) | OpDesc::Pinned(_, t) => !t.is_bool(),
             OpDesc::Cmp(p, t) => !t.is_bool() || p.admits_bool(),
             OpDesc::Cast(_, s, d) => !s.is_bool() && !d.is_bool(),
             OpDesc::Select(_) => true,
@@ -469,9 +475,11 @@ impl OpDesc {
     /// type of this module.
     pub(crate) fn admitted(self, ctx: Ctx) -> bool {
         let types_ok = match self {
-            OpDesc::Bin(_, t) | OpDesc::Un(_, t) | OpDesc::Cmp(_, t) | OpDesc::Select(t) => {
-                ctx.width(t).is_some()
-            }
+            OpDesc::Bin(_, t)
+            | OpDesc::Un(_, t)
+            | OpDesc::Cmp(_, t)
+            | OpDesc::Select(t)
+            | OpDesc::Pinned(_, t) => ctx.width(t).is_some(),
             OpDesc::Cast(_, s, d) => ctx.width(s).is_some() && ctx.width(d).is_some(),
         };
         types_ok && self.admitted_category()
@@ -485,6 +493,7 @@ impl OpDesc {
             OpDesc::Cmp(p, t) => format!("icmp.{}.{}", p.name(), t.name()),
             OpDesc::Cast(k, s, d) => format!("{}.{}.{}", k.name(), s.name(), d.name()),
             OpDesc::Select(t) => format!("select.{}", t.name()),
+            OpDesc::Pinned(order, t) => format!("pinned.{order}.{}", t.name()),
         }
     }
 }
